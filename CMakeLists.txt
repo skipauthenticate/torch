@@ -49,7 +49,14 @@ if(TORCH_FUZZ)
   add_compile_options(-fsanitize=fuzzer-no-link)
 endif()
 
-add_library(torch_core STATIC src/formats/types.cpp src/gguf/gguf.cpp)
+# Host code: no CUDA, so it builds and is unit-tested on any machine.
+add_library(torch_core STATIC
+  src/core/budget.cpp
+  src/formats/types.cpp
+  src/gguf/gguf.cpp
+  src/model/config.cpp
+  src/runtime/direct_io.cpp
+  src/runtime/ple_rows.cpp)
 target_include_directories(torch_core PUBLIC src)
 target_link_libraries(torch_core PUBLIC torch_warnings)
 
@@ -58,7 +65,6 @@ target_include_directories(torch PRIVATE ${PROJECT_BINARY_DIR}/generated)
 target_link_libraries(torch PRIVATE torch_core)
 
 if(TORCH_CUDA)
-  # No CUDA sources yet: M2 adds the kernels and the runtime here.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 87)  # Jetson AGX Orin only
   endif()
@@ -66,6 +72,33 @@ if(TORCH_CUDA)
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   find_package(CUDAToolkit REQUIRED)
+
+  # The GPU engine: kernels (src/kernels/<operation>/), weights, the forward pass and the expert store.
+  add_library(torch_engine STATIC
+    src/kernels/gemv/gemv.cu
+    src/kernels/attention/attention.cu
+    src/kernels/deltanet/deltanet.cu
+    src/kernels/hc/hc.cu
+    src/kernels/moe/moe.cu
+    src/kernels/norm/norm.cu
+    src/kernels/ple/ple.cu
+    src/model/model.cpp
+    src/model/weights.cpp
+    src/runtime/expert_store.cpp)
+  target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
+  # nvcc warns (445) about C++20 template lambdas whose template parameter appears only in the body, which is the
+  # with_type() dispatch pattern of src/formats/types.h.
+  target_compile_options(torch_engine PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=445>)
+
+  target_sources(torch PRIVATE tools/run.cpp)
+  target_link_libraries(torch PRIVATE torch_engine)
+  target_compile_definitions(torch PRIVATE TORCH_ENGINE)
+
+  # Microbenchmarks: not tests, run by hand on the Orin (docs/development.md).
+  add_executable(torch_bench_memory bench/memory_bandwidth.cu)
+  target_link_libraries(torch_bench_memory PRIVATE torch_core CUDA::cudart)
+  add_executable(torch_bench_ssd bench/ssd_reads.cpp)
+  target_link_libraries(torch_bench_ssd PRIVATE torch_warnings)
 endif()
 
 if(TORCH_TESTS)

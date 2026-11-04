@@ -5,9 +5,11 @@ An inference engine for one model on one device: **Qwen3.8-Flash-Next** on the *
 Supporting a single device lets every kernel, memory decision and default be tuned for the Orin's unified memory,
 small L2 cache and 16 streaming multiprocessors, with no compromises for other hardware.
 
-> **Status: early development (milestone M1).** The GGUF reader, the CPU reference dequantization of the model's 13
-> formats and `torch inspect` are done and tested; the engine does not run a model yet. The [roadmap](docs/roadmap.md)
-> lists what each milestone delivers; the [performance model](docs/performance.md) lists what we expect to measure.
+> **Status: early development (milestone M2).** The engine runs the model on the Orin one token at a time, eagerly:
+> `torch run` matches the reference's greedy tokens on all 160 positions of the parity prompts, with output that does
+> not depend on which experts are resident. It is not fast yet (7.8 tok/s; speed is M3), and contexts are limited to
+> 2,048 tokens until M6. The [roadmap](docs/roadmap.md) lists what each milestone delivers; the
+> [performance model](docs/performance.md) lists what has been measured and what we expect.
 
 ## Goals
 

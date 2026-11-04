@@ -7,6 +7,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Milestone M2, a correct forward pass:
+  - The model on the GPU, one token at a time: kernels for every layer operation (`src/kernels/`), each with a
+    parity test against a scalar CPU reference; the forward pass (`src/model/model.cpp`).
+  - The memory budget, planned from MemAvailable with a 6 GiB floor and printed at start (`src/core/budget.h`).
+  - Weights and resident experts in one mapped pinned arena filled by `O_DIRECT` reads of at most 128 KiB; misses
+    read synchronously into staging slots behind one pointer table, so output does not depend on residency
+    (`src/runtime/`).
+  - `torch run` (`--resident`, `--logits`, `--json`, `--profile`); `TORCH_DUMP` and `TORCH_DUMP_DIR` stage dumps.
+  - Model parity against a committed reference (`tests/model/`), gated on greedy top-1 agreement and mean KL.
+  - Microbenchmarks for GPU reads by memory type and SSD reads by queue depth (`bench/`).
 - Milestone M1, foundations:
   - CMake build with the options `TORCH_CUDA`, `TORCH_TESTS`, `TORCH_WERROR`, `TORCH_SANITIZE` and `TORCH_FUZZ`;
     `torch --version` prints the version and git commit.

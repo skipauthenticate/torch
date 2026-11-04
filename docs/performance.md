@@ -82,15 +82,26 @@ sessions that extend the previous sequence do not prefill again (architecture de
 
 ## Measured so far
 
-On the development Orin, 2026-11-03 (M2 microbenchmarks):
+On the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz), 2026-11-03 and 2026-11-04 [M2]:
 
-- GPU streaming read: 155.4 GB/s from device memory and 158.2 GB/s from mapped pinned memory at 1 GiB; 150.8 and
-  154.0 GB/s at 4 GiB.
-- SSD `O_DIRECT` reads of 2 MiB at queue depth 4: 5.81 GB/s, 1.40 ms mean. Queue depths 1 and 2 were unreliable and
-  are to be re-measured.
-- SSD reads of 4 KiB at queue depth 1: 0.084 ms mean.
+- GPU streaming read (`torch_bench_memory`, 1 GiB buffers): 153.6-155.4 GB/s from device memory, 158.2-159.0 GB/s
+  from mapped pinned memory and 157.8 GB/s from registered memory; 150.8 and 154.0 GB/s at 4 GiB. The ~180 GB/s
+  used in the tables above comes from earlier measurements on this board; M3 re-measures the ceiling.
+- SSD `O_DIRECT` random reads (`torch_bench_ssd`, issued as 128 KiB preads, as the engine reads), 2026-11-04:
 
-M3 adds the first decode numbers.
+  | Read | Depth 1 | Depth 4 | Depth 16 |
+  | --- | ---: | ---: | ---: |
+  | 2 MiB: median ms, GB/s | 1.56, 1.33 | 3.41, 2.62 | 5.98, 5.39 |
+  | 4 KiB: median ms | 0.093 | 0.093 | 0.101 |
+
+  Single reads larger than the SSD's 128 KiB transfer limit (WD_BLACK SN850X) sometimes left one request
+  uncompleted until the driver's 30 s timeout (11 of 3,000 reads at depth 1); 128 KiB reads never did.
+- Free memory: MemAvailable was 24-29 GiB while other software used the board and 50-51 GiB with it idle. With 51
+  GiB the budget keeps 437-439 of 512 experts per layer resident (85%) and loads in 16-20 s.
+- Eager decode (M2, one token per step, one host round trip per layer): 7.77 tok/s, 128.8 ms per token, generating
+  64 tokens after a 5-token prompt at 85% expert hits. Per token: 41.5 ms waiting for the GPU up to each router,
+  71.8 ms reading the ~71 missed experts (about 1 ms each), 12.7 ms other host work. With every expert read from the
+  SSD, a token takes 0.42-0.55 s.
 
 ## Targets
 
