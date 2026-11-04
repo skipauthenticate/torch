@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install clang-format==19.1.7
+      - run: git ls-files '*.h' '*.cpp' '*.cu' '*.cuh' | xargs clang-format --dry-run -Werror
+
+  host-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, cc: gcc-13, cxx: g++-13, sanitize: OFF, type: Release }
+          - { os: ubuntu-24.04, cc: clang-18, cxx: clang++-18, sanitize: ON, type: Debug }
+          - { os: macos-14, cc: clang, cxx: clang++, sanitize: OFF, type: Release }
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v5
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libclang-rt-18-dev
+      - if: runner.os == 'macOS'
+        run: brew install ninja
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+      - run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DTORCH_CUDA=OFF
+          -DTORCH_WERROR=ON -DTORCH_SANITIZE=${{ matrix.sanitize }}
+      - run: cmake --build build
+      - run: ctest --test-dir build -L unit --output-on-failure
+
+  fixtures-reproducible:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/fixtures/requirements.txt
+      - run: python tests/fixtures/make_fixtures.py --out "$RUNNER_TEMP/fixtures"
+      - run: |
+          cmp "$RUNNER_TEMP/fixtures/quant_blocks.bin" tests/fixtures/quant_blocks.bin
+          cmp "$RUNNER_TEMP/fixtures/tiny.gguf" tests/fixtures/tiny.gguf
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libclang-rt-18-dev
+      - run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTORCH_CUDA=OFF
+          -DTORCH_FUZZ=ON -DTORCH_SANITIZE=ON
+      - run: cmake --build build --target gguf_fuzz
+      # The seed is the fixture; new inputs go to a scratch corpus, not into the repository.
+      - run: |
+          mkdir -p "$RUNNER_TEMP/corpus"
+          cp tests/fixtures/tiny.gguf "$RUNNER_TEMP/corpus/"
+          ./build/tests/gguf_fuzz -max_total_time=60 "$RUNNER_TEMP/corpus"
+
+  wording:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: python3 tools/check_wording.py
+      - run: git log --format=%B | python3 tools/check_wording.py --stdin
+      # The history before 2026-11-04 was replaced by one clean root commit; a branch that still carries it must not
+      # merge it back.
+      - run: "! git cat-file -e a0baa2c6c286329eb1d5fdd50fbfb3a33583977b^{commit}"
