@@ -1,0 +1,22 @@
+# Build output
+/build*/
+/out/
+compile_commands.json
+
+# Model files and run output (never committed)
+*.gguf
+!/tests/fixtures/tiny.gguf
+/models/
+/runs/
+/results/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/

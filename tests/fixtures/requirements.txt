@@ -1,0 +1,3 @@
+# Generates tests/fixtures/ (make_fixtures.py). numpy is the only dependency, pinned so CI regenerates byte-identical
+# fixtures.
+numpy==2.3.5

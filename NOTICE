@@ -1,0 +1,13 @@
+Torch
+Copyright (c) 2026 the Torch contributors
+Licensed under the MIT License (see LICENSE).
+
+This project includes the following third-party work.
+
+src/formats/codebooks.h holds lookup tables under the MIT License; its copyright and permission notice are in that
+file.
+
+Model files (not part of this repository; downloaded by the user)
+  - Qwen3.8-Flash-Next-GSQ-RCO-GGUF by ISTA DASLab: Apache License 2.0 according to its model card.
+  - Qwen3.8-Flash-Next by Qwen: license "other" according to its model card; it governs the draft-layer file this
+    project derives from it. See docs/model-files.md.
