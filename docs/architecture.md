@@ -37,10 +37,10 @@ image and video tokens, `ple.image_token_id` 248056 [file]; the engine serves te
 | Storage | NVMe SSD | Weights that do not fit are read from here. 2 MiB reads take 1.40 ms mean at queue depth 4, 5.8 GB/s [M2] |
 
 CPU and GPU share the same DRAM. There is no PCIe copy: "loading to the GPU" means choosing an allocation the GPU
-reads at full speed. Resident experts live in `cudaMalloc` memory or in mapped pinned memory (`cudaHostAlloc`),
-whichever M2's microbenchmark shows the GPU reads within 5% of the other. Staging slots for SSD reads must be mapped
-pinned memory, because the CPU writes them. If mapped memory reads at full speed, every slot is mapped and a miss
-read lands in its slot with no second copy.
+reads at full speed. Staging slots for SSD reads must be mapped pinned memory (`cudaHostAlloc`), because the CPU
+writes them. The GPU reads mapped pinned memory as fast as `cudaMalloc` memory: 158.2 against 155.4 GB/s with 1 GiB
+buffers, 154.0 against 150.8 GB/s with 4 GiB (`bench/memory_bandwidth.cu`, 2026-11-03). So all weights, every
+resident expert and every staging slot live in mapped pinned memory, filled by `O_DIRECT` reads with no second copy.
 
 ## The model
 
@@ -127,10 +127,13 @@ measures the per-column cost.
 So every matrix-vector kernel (dense, shared expert, hyper-connection, head, routed expert) takes 1 to 4 columns with
 the activations in registers, and 5 to 16 columns (verify windows and copy windows) go through int8 tensor-core tiles
 (`mma.sync.m16n8k16`, sm_87): 16 weight rows, dequantized to int8 in registers, share each activation fragment held
-in shared memory. Both paths compute one canonical order per format: per 16- or 32-element sub-block an exact
-`int32` dot product, times the integer sub-scale in `int32`, summed over the 256-element block in `int32`, times `d`
-in F32, and blocks accumulated in index order in F32. Integer sums are exact in any order, so the two paths and every
-window width give bitwise-identical logits. That identity is a CI gate on the Orin.
+in shared memory. Both paths compute one canonical order per format. A row is split into 32-element units, the size
+of an activation block: a unit's dot product is an exact `int32` sum, multiplied by the unit's integer sub-scales in
+`int32`, then by the weight and activation scales in F32 (`src/kernels/gemv/dot_q8.cuh` has the formula per format).
+The F32 unit results are added in one fixed order: lane l of a row's warp sums units l, l + 32, l + 64, ..., and the
+32 lane sums are added in a fixed butterfly. Integer sums are exact in any order and every kernel adds the F32 unit
+results in that order, so the two paths and every window width give bitwise-identical logits. That identity is a CI
+gate on the Orin.
 
 ### 3. Experts grouped across the window
 
@@ -281,9 +284,9 @@ asks for.
   grouping, and across residency (a run with every expert resident and one with half of them give identical logits:
   goal 4).
 - **Model parity**: next-token log-probabilities on fixed prompts against the committed reference log-probabilities
-  (a second implementation of the model on the same file): top-1 agreement over 16 or more tokens with a near-tie
-  rule, and a maximum log-probability gap on the shared top-5 that M2 fixes from measurement (the prototype engine
-  measured a gap of ~0.6 against its reference on the Q2_0 file).
+  (a second implementation of the model on the same file): greedy top-1 agreement at every position with a near-tie
+  rule, and a mean per-position KL divergence within twice the reference's own spread between two runs with
+  different numerics. M2 fixed the values (development.md, "Model parity").
 - **Speculation is invisible**: greedy output with speculation on equals greedy output with it off, token for token,
   on every benchmark prompt; M4 adds a distribution test for sampled output.
 - **Long context**: needle retrieval at 32K, 128K and 256K.
