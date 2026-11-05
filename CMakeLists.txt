@@ -21,10 +21,13 @@ option(TORCH_FUZZ "Build the fuzz targets (Clang with libFuzzer)" OFF)
 option(TORCH_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(TORCH_WERROR "Treat warnings as errors" OFF)
 
-execute_process(COMMAND git rev-parse --short=12 HEAD
-                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-                OUTPUT_VARIABLE TORCH_GIT_SHA
-                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# A tree copied without .git can pass the commit with -DTORCH_GIT_SHA=<sha>.
+if(NOT TORCH_GIT_SHA)
+  execute_process(COMMAND git rev-parse --short=12 HEAD
+                  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+                  OUTPUT_VARIABLE TORCH_GIT_SHA
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
 if(NOT TORCH_GIT_SHA)
   set(TORCH_GIT_SHA unknown)
 endif()
@@ -52,10 +55,12 @@ endif()
 # Host code: no CUDA, so it builds and is unit-tested on any machine.
 add_library(torch_core STATIC
   src/core/budget.cpp
+  src/core/placement.cpp
   src/formats/types.cpp
   src/gguf/gguf.cpp
   src/model/config.cpp
   src/runtime/direct_io.cpp
+  src/runtime/hedged_reads.cpp
   src/runtime/ple_rows.cpp)
 target_include_directories(torch_core PUBLIC src)
 target_link_libraries(torch_core PUBLIC torch_warnings)
@@ -82,8 +87,10 @@ if(TORCH_CUDA)
     src/kernels/moe/moe.cu
     src/kernels/norm/norm.cu
     src/kernels/ple/ple.cu
+    src/kernels/sampling/argmax.cu
     src/model/model.cpp
     src/model/weights.cpp
+    src/runtime/expert_gate.cu
     src/runtime/expert_store.cpp)
   target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
   # nvcc warns (445) about C++20 template lambdas whose template parameter appears only in the body, which is the
@@ -97,6 +104,13 @@ if(TORCH_CUDA)
   # Microbenchmarks: not tests, run by hand on the Orin (docs/development.md).
   add_executable(torch_bench_memory bench/memory_bandwidth.cu)
   target_link_libraries(torch_bench_memory PRIVATE torch_core CUDA::cudart)
+  add_executable(torch_bench_graph_gaps bench/graph_gaps.cu)
+  target_link_libraries(torch_bench_graph_gaps PRIVATE torch_core CUDA::cudart)
+  add_executable(torch_bench_miss_roundtrip bench/miss_roundtrip.cu)
+  target_link_libraries(torch_bench_miss_roundtrip PRIVATE torch_core CUDA::cudart)
+  add_executable(torch_bench_kernels bench/kernels.cu)
+  target_include_directories(torch_bench_kernels PRIVATE ${PROJECT_BINARY_DIR}/generated)
+  target_link_libraries(torch_bench_kernels PRIVATE torch_engine)
   add_executable(torch_bench_ssd bench/ssd_reads.cpp)
   target_link_libraries(torch_bench_ssd PRIVATE torch_warnings)
 endif()

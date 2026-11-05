@@ -5,10 +5,10 @@ An inference engine for one model on one device: **Qwen3.8-Flash-Next** on the *
 Supporting a single device lets every kernel, memory decision and default be tuned for the Orin's unified memory,
 small L2 cache and 16 streaming multiprocessors, with no compromises for other hardware.
 
-> **Status: early development (milestone M2).** The engine runs the model on the Orin one token at a time, eagerly:
-> `torch run` matches the reference's greedy tokens on all 160 positions of the parity prompts, with output that does
-> not depend on which experts are resident. It is not fast yet (7.8 tok/s; speed is M3), and contexts are limited to
-> 2,048 tokens until M6. The [roadmap](docs/roadmap.md) lists what each milestone delivers; the
+> **Status: early development (milestone M3).** The engine decodes one token at a time, each token one CUDA graph,
+> at 25.4 tok/s on code review, 25.7 on prose and 24.3 on repetitive text on the Orin (2026-11-04), with output that
+> does not depend on which experts are resident and matches the reference within the parity gate. Speculative
+> decoding is next (M4), and contexts are limited to 2,048 tokens until M6. The [roadmap](docs/roadmap.md) lists what each milestone delivers; the
 > [performance model](docs/performance.md) lists what has been measured and what we expect.
 
 ## Goals

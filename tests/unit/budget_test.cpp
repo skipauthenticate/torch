@@ -1,4 +1,5 @@
-// Checks the memory budget: how many experts fit, the refusals, and reading MemAvailable.
+// Checks the memory budget: the room it leaves for experts, the refusal below the floor, the table, and reading
+// MemAvailable.
 #include "core/budget.h"
 
 #include <string>
@@ -21,23 +22,19 @@ bool throws(auto&& f) {
 
 void check_plan() {
     const std::vector<Reservation> r = {{"weights", 4 * kGiB}, {"state", kGiB}};
-    // 30 GiB available, 6 kept free, 5 reserved: 19 GiB for experts of 100 MiB each (one per layer).
-    const Budget b = plan_budget(30 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, std::nullopt);
-    CHECK(b.resident == 194);
+    // 30 GiB available, 6 kept free, 5 reserved: 19 GiB of room for experts.
+    Budget b = plan_budget(30 * kGiB, 6 * kGiB, r);
     CHECK(b.reserved() == 5 * kGiB);
-    CHECK(b.left() == 19 * kGiB - 194 * 100 * kMiB);
-    CHECK(b.table().find("resident experts: 194 of 512 per layer") != std::string::npos);
-
-    // Never more than the layer has.
-    CHECK(plan_budget(300 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, std::nullopt).resident == 512);
-    // A forced count that fits, and ones that do not.
-    CHECK(plan_budget(30 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, 0).resident == 0);
-    CHECK(plan_budget(30 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, 194).resident == 194);
-    CHECK(throws([&] { plan_budget(30 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, 195); }));
-    CHECK(throws([&] { plan_budget(30 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, 513); }));
-    // Below the floor before any expert.
-    CHECK(throws([&] { plan_budget(10 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, std::nullopt); }));
-    CHECK(plan_budget(11 * kGiB, 6 * kGiB, r, 100 * kMiB, 512, std::nullopt).resident == 0);
+    CHECK(b.room() == 19 * kGiB);
+    b.resident = 100, b.experts = 400, b.resident_bytes = 10 * kGiB, b.placement = "test";
+    CHECK(b.left() == 9 * kGiB);
+    CHECK(b.table().find("resident experts: 100 of 400 (25.0%)") != std::string::npos);
+    CHECK(b.table().find("after loading") == std::string::npos);
+    b.available_after_load = 12 * kGiB, b.added = 20, b.added_bytes = 2 * kGiB;
+    CHECK(b.table().find("floor + 1.5 GiB: 20 (30.0% resident)") != std::string::npos);
+    // Below the floor before any expert; exactly at it leaves no room.
+    CHECK(throws([&] { plan_budget(10 * kGiB, 6 * kGiB, r); }));
+    CHECK(plan_budget(11 * kGiB, 6 * kGiB, r).room() == 0);
 }
 
 void check_meminfo() {

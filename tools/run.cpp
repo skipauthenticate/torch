@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -15,6 +17,7 @@
 
 #include "core/budget.h"
 #include "core/error.h"
+#include "core/placement.h"
 #include "model/model.h"
 
 namespace torch {
@@ -26,14 +29,18 @@ constexpr const char* kUsage =
     "Feeds the tokens one at a time, then generates greedily, printing each step's top log-probabilities.\n"
     "Shard 2 (the n-gram table) is found next to shard 1 by its split name.\n"
     "\n"
-    "  --tokens LIST   comma-separated prompt token ids\n"
+    "  --tokens LIST   comma-separated prompt token ids, or @FILE to read them from FILE\n"
     "  -n N            tokens to generate after the prompt (default 16)\n"
     "  --top K         log-probabilities to print per step (default 5)\n"
     "  --context N     tokens the KV cache holds (default and maximum 2048)\n"
-    "  --resident K    experts per layer to keep resident (default: as many as fit in memory)\n"
+    "  --resident K    keep exactly experts 0 to K - 1 of every layer resident (residency tests)\n"
+    "  --placement F   keep the experts most routed in route-count file F resident (default: every layer's first\n"
+    "                  experts, as many as fit in memory)\n"
+    "  --route-counts F  after the run, add how often each expert was routed to route-count file F\n"
     "  --logits FILE   write every step's raw F32 logits to FILE\n"
     "  --json FILE     write every step's top log-probabilities to FILE, one JSON object per line\n"
-    "  --profile       print where decode time went: PLE rows, routing waits, expert reads, the rest\n";
+    "  --profile       print where decode time went: PLE rows, the GPU, expert reads, launches\n"
+    "  --quiet         no per-step lines, and no logits copied to the host (for timing)\n";
 
 using Clock = std::chrono::steady_clock;
 
@@ -103,7 +110,8 @@ int run(int argc, char** argv) {
     std::optional<std::filesystem::path> shard1;
     std::vector<int32_t> prompt;
     int generate = 16, top = 5;
-    bool profile = false;
+    bool profile = false, quiet = false;
+    std::filesystem::path route_counts_path;
     model::Options options;
     std::FILE* logits_file = nullptr;
     std::FILE* json_file = nullptr;
@@ -116,7 +124,18 @@ int run(int argc, char** argv) {
                 return argv[++i];
             };
             if (arg == "--tokens") {
-                prompt = parse_tokens(value());
+                const std::string list = value();
+                if (list.starts_with("@")) {  // --tokens @FILE: the ids from a file, as bench/workloads/ writes them
+                    std::ifstream in(list.substr(1));
+                    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    while (!text.empty() && (text.back() == '\n' || text.back() == ' '))
+                        text.pop_back();
+                    if (!in && text.empty())
+                        throw Error("Cannot read token ids from " + list.substr(1) + ".");
+                    prompt = parse_tokens(text);
+                } else {
+                    prompt = parse_tokens(list);
+                }
             } else if (arg == "-n") {
                 generate = parse_count(value(), "-n", 0);
             } else if (arg == "--top") {
@@ -125,6 +144,10 @@ int run(int argc, char** argv) {
                 options.context = parse_count(value(), "--context", 1);
             } else if (arg == "--resident") {
                 options.resident = parse_count(value(), "--resident", 0);
+            } else if (arg == "--placement") {
+                options.placement = value();
+            } else if (arg == "--route-counts") {
+                route_counts_path = value();
             } else if (arg == "--logits") {
                 const char* path = value();
                 if (!(logits_file = std::fopen(path, "wb")))
@@ -135,6 +158,8 @@ int run(int argc, char** argv) {
                     throw Error(std::string("Cannot write ") + path + ".");
             } else if (arg == "--profile") {
                 profile = true;
+            } else if (arg == "--quiet") {
+                quiet = true;
             } else if (arg == "--help" || arg == "-h") {
                 std::fputs(kUsage, stdout);
                 return 0;
@@ -151,6 +176,9 @@ int run(int argc, char** argv) {
         }
         options.shard1 = *shard1;
         options.shard2 = second_shard(*shard1);
+        if (quiet && (logits_file || json_file))
+            throw Error("--quiet copies no logits, so it cannot be combined with --logits or --json.");
+        options.logits = !quiet;
 
         const auto load_start = Clock::now();
         model::Model m(options);
@@ -164,8 +192,7 @@ int run(int argc, char** argv) {
         int decoded = 0;
         for (size_t i = 0; i < sequence.size(); ++i) {
             const auto start = Clock::now();
-            const std::span<const float> logits = m.decode(sequence[i]);
-            if (logits.empty())
+            if (!m.decode(sequence[i]))
                 throw Error(m.error());
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
             const bool generating = i + 1 >= prompt.size();
@@ -173,41 +200,60 @@ int run(int argc, char** argv) {
                 decode_ms += ms;
                 ++decoded;
             }
-            const std::vector<Top> best = top_k(logits, top);
-            std::printf("pos %4zu  in %6d  ->", i, sequence[i]);
-            for (const Top& t : best)
-                std::printf("  %6d %8.4f", t.token, t.logprob);
-            std::printf("   (%.1f ms)\n", ms);
-            if (logits_file)
-                std::fwrite(logits.data(), sizeof(float), logits.size(), logits_file);
-            if (json_file) {
-                std::fprintf(json_file, "{\"pos\": %zu, \"token\": %d, \"top\": [", i, sequence[i]);
-                for (size_t j = 0; j < best.size(); ++j)
-                    std::fprintf(json_file, "%s[%d, %.7g]", j ? ", " : "", best[j].token, best[j].logprob);
-                std::fprintf(json_file, "]}\n");
+            if (!quiet) {
+                const std::span<const float> logits = m.logits();
+                const std::vector<Top> best = top_k(logits, top);
+                std::printf("pos %4zu  in %6d  ->", i, sequence[i]);
+                for (const Top& t : best)
+                    std::printf("  %6d %8.4f", t.token, t.logprob);
+                std::printf("   (%.1f ms)\n", ms);
+                if (logits_file)
+                    std::fwrite(logits.data(), sizeof(float), logits.size(), logits_file);
+                if (json_file) {
+                    std::fprintf(json_file, "{\"pos\": %zu, \"token\": %d, \"top\": [", i, sequence[i]);
+                    for (size_t j = 0; j < best.size(); ++j)
+                        std::fprintf(json_file, "%s[%d, %.7g]", j ? ", " : "", best[j].token, best[j].logprob);
+                    std::fprintf(json_file, "]}\n");
+                }
             }
             if (generating && sequence.size() < prompt.size() + static_cast<size_t>(generate))
-                sequence.push_back(best[0].token);
+                sequence.push_back(m.argmax());  // greedy: the GPU's argmax, ties to the lowest id
         }
 
+        if (quiet) {  // the generated ids, so a run's output can be compared and hashed
+            std::printf("generated tokens:");
+            for (size_t i = prompt.size(); i < sequence.size(); ++i)
+                std::printf("%s%d", i == prompt.size() ? " " : ",", sequence[i]);
+            std::printf("\n");
+        }
         const model::ExpertStats s = m.expert_stats();
         std::printf("\nprompt %zu tokens, generated %d", prompt.size(), decoded);
         if (decoded > 0)
             std::printf(": %.2f tok/s (%.1f ms per token)", 1000.0 * decoded / decode_ms, decode_ms / decoded);
-        std::printf(
-            "\nexperts: %d resident per layer; %llu routed hits, %llu misses (%.1f%% hits)\n", s.resident,
-            static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.misses),
-            100.0 * static_cast<double>(s.hits) / static_cast<double>(std::max<uint64_t>(s.hits + s.misses, 1)));
+        std::printf("\nexperts: %d of %d resident; %llu routed hits, %llu misses (%.1f%% hits); %llu hedged reads\n",
+                    s.resident, s.experts, static_cast<unsigned long long>(s.hits),
+                    static_cast<unsigned long long>(s.misses),
+                    100.0 * static_cast<double>(s.hits) / static_cast<double>(std::max<uint64_t>(s.hits + s.misses, 1)),
+                    static_cast<unsigned long long>(s.hedged));
         std::printf("MemAvailable at the end %.2f GiB\n",
                     static_cast<double>(mem_available()) / static_cast<double>(kGiB));
+        if (!route_counts_path.empty()) {
+            RouteCounts counts = m.route_counts();
+            if (std::filesystem::exists(route_counts_path))
+                counts.add(RouteCounts::read(route_counts_path));
+            counts.write(route_counts_path);
+            std::printf("route counts added to %s\n", route_counts_path.string().c_str());
+        }
         if (profile) {
             const model::DecodeTimes t = m.decode_times();
             const double steps = static_cast<double>(std::max<size_t>(sequence.size(), 1));
             std::printf(
-                "decode time per token over %zu steps: %.2f ms; PLE rows %.2f, routing waits %.2f, expert reads "
-                "%.2f, final wait %.2f, other host work %.2f\n",
-                sequence.size(), t.total / steps, t.ple / steps, t.routing / steps, t.expert_reads / steps,
-                t.finish / steps, (t.total - t.ple - t.routing - t.expert_reads - t.finish) / steps);
+                "decode time per token over %zu steps: %.2f ms; PLE rows %.2f (slowest %.1f, %llu over 5 ms, %llu "
+                "hedged), "
+                "waiting for the GPU %.2f (expert reads during it %.2f), launches and other host work %.2f\n",
+                sequence.size(), t.total / steps, t.ple / steps, t.ple_max, static_cast<unsigned long long>(t.ple_slow),
+                static_cast<unsigned long long>(t.ple_hedged), t.gpu / steps, t.expert_reads / steps,
+                (t.total - t.ple - t.gpu) / steps);
         }
     } catch (const Error& e) {
         std::fflush(stdout);

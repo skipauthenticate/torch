@@ -5,9 +5,9 @@
 // with no bounce copy (architecture decision 8). Tensors keep the file's bytes exactly, except the one F16 vector
 // (the PLE convolution taps), which is converted to F32 at load because the kernel multiplies it with F32 activations.
 //
-// The arena holds the non-expert tensors and experts 0 to resident - 1 of every layer's three expert tensors. The
-// other experts are read on demand by runtime::ExpertStore. Indexer tensors are not loaded: below indexer_top_k tokens
-// sparse attention selects every cell, and milestone M2 is limited to that context.
+// The arena holds the non-expert tensors. The routed experts are placed by runtime::ExpertStore. Indexer tensors are
+// not loaded: below indexer_top_k tokens sparse attention selects every cell, and decode is limited to that context
+// until M6.
 #pragma once
 
 #include <cstdint>
@@ -36,9 +36,8 @@ struct Matrix {
 struct ExpertTensor {
     Type type = Type::F32;
     int rows = 0, cols = 0;
-    uint64_t slice_bytes = 0;           // one expert
-    uint64_t file_offset = 0;           // of expert 0 in shard 1
-    const uint8_t* resident = nullptr;  // expert 0 in the arena; expert e < resident at resident + e * slice_bytes
+    uint64_t slice_bytes = 0;  // one expert
+    uint64_t file_offset = 0;  // of expert 0 in shard 1
 };
 
 struct Layer {
@@ -79,15 +78,12 @@ class WeightLoader;  // weights.cpp
 
 class Weights {
 public:
-    // Bytes the arena needs for everything except the resident experts, and for one expert of every layer (gate, up
-    // and down). The memory budget is planned from these before anything is allocated.
+    // Bytes the arena needs. The memory budget is planned from this before anything is allocated.
     static uint64_t base_bytes(const Config& config, const gguf::File& shard1);
-    static uint64_t expert_bytes(const Config& config, const gguf::File& shard1);
 
-    // Allocates the arena and reads the weights into it, `resident` experts per layer. Throws Error when a tensor is
-    // missing, has an unexpected shape or format, or cannot be read.
-    Weights(const Config& config, const gguf::File& shard1, const runtime::DirectFile& file, int resident,
-            runtime::ReadPool& pool);
+    // Allocates the arena and reads the weights into it. Throws Error when a tensor is missing, has an unexpected
+    // shape or format, or cannot be read.
+    Weights(const Config& config, const gguf::File& shard1, const runtime::DirectFile& file, runtime::ReadPool& pool);
     Weights(const Weights&) = delete;
     Weights& operator=(const Weights&) = delete;
     ~Weights();

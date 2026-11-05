@@ -1,5 +1,5 @@
-// Parity of the Gated DeltaNet kernels (src/kernels/deltanet) with a scalar double reference: conv_silu and gdn_step
-// over consecutive tokens (state carries over), and gdn_gates.
+// Parity of the Gated DeltaNet kernels (src/kernels/deltanet) with a scalar double reference: conv_silu_l2 and gdn_step
+// (with its gates) over consecutive tokens, so state carries over.
 #include "kernels/deltanet/deltanet.h"
 
 #include <algorithm>
@@ -18,7 +18,8 @@ namespace {
 constexpr double kTolerance = 1e-5;
 
 void check_conv(int tokens) {
-    const int channels = 16 * 128 * 2 + 48 * 128;  // q, k and v of the model
+    const int normed = 16 * 128 * 2, channels = normed + 48 * 128;  // q, k and v of the model
+    constexpr float kEps = 1e-6f;
     std::vector<float> state = test::random_floats(static_cast<size_t>(3) * channels, -1, 1, 1);
     const std::vector<float> w = test::random_floats(static_cast<size_t>(4) * channels, -1, 1, 2);
     DeviceBuffer<float> dstate(state), dw(w), dx(channels), dout(channels);
@@ -27,7 +28,7 @@ void check_conv(int tokens) {
     for (int t = 0; t < tokens; ++t) {
         const std::vector<float> x = test::random_floats(channels, -2, 2, 10 + t);
         dx.upload(x);
-        kernels::conv_silu(dstate.get(), dx.get(), dw.get(), dout.get(), channels, nullptr);
+        kernels::conv_silu_l2(dstate.get(), dx.get(), dw.get(), dout.get(), channels, normed, kEps, nullptr);
         std::vector<double> want(channels), mag(channels);
         for (int c = 0; c < channels; ++c) {
             const double taps[4] = {state_want[c], state_want[channels + c], state_want[2 * channels + c], x[c]};
@@ -42,9 +43,22 @@ void check_conv(int tokens) {
             state_want[channels + c] = taps[2];
             state_want[2 * channels + c] = taps[3];
         }
+        // q and k: each head of 128 divided by its L2 norm; an input's error carries over scaled by 1 / norm, and the
+        // norm's own rounding is relative to the output.
+        for (int head = 0; head < normed / 128; ++head) {
+            double sum = 0;
+            for (int i = 0; i < 128; ++i)
+                sum += want[head * 128 + i] * want[head * 128 + i];
+            const double norm = std::sqrt(sum + kEps);
+            for (int i = 0; i < 128; ++i) {
+                const int c = head * 128 + i;
+                want[c] /= norm;
+                mag[c] = mag[c] / norm + std::fabs(want[c]) + 1e-30;
+            }
+        }
         worst = std::max(worst, test::worst_relative(dout.download(), want, mag));
     }
-    CHECK(test::report("conv_silu 10240 channels, 6 tokens", worst, kTolerance));
+    CHECK(test::report("conv_silu_l2 10240 channels, 6 tokens", worst, kTolerance));
     const std::vector<float> got = dstate.download();
     bool same = true;
     for (size_t i = 0; i < got.size(); ++i)
@@ -53,53 +67,50 @@ void check_conv(int tokens) {
     std::printf("%-40s %s\n", "  conv state shifted exactly", same ? "ok" : "FAIL");
 }
 
-void check_gates() {
-    const int heads = 48;
-    const std::vector<float> beta = test::random_floats(heads, -4, 4, 3), alpha = test::random_floats(heads, -3, 3, 4);
-    const std::vector<float> dt = test::random_floats(heads, -1, 1, 5), a = test::random_floats(heads, -2, -0.1f, 6);
-    std::vector<double> want_beta(heads), want_alpha(heads), mag_beta(heads), mag_alpha(heads);
-    for (int h = 0; h < heads; ++h) {
-        want_beta[h] = test::sigmoid(beta[h]);
-        want_alpha[h] = test::softplus(double{alpha[h]} + dt[h]) * a[h];
-        mag_beta[h] = want_beta[h];
-        mag_alpha[h] = std::fabs(want_alpha[h]);
-    }
-    DeviceBuffer<float> dbeta(beta), dalpha(alpha), ddt(dt), da(a);
-    kernels::gdn_gates(dbeta.get(), dalpha.get(), ddt.get(), da.get(), heads, nullptr);
-    CHECK(test::report("gdn_gates beta", test::worst_relative(dbeta.download(), want_beta, mag_beta), kTolerance));
-    CHECK(test::report("gdn_gates alpha", test::worst_relative(dalpha.download(), want_alpha, mag_alpha), kTolerance));
-}
-
 void check_step(int tokens) {
     constexpr int kD = 128, kKeyHeads = 16, kValueHeads = 48;
     const float scale = 1.0f / std::sqrt(static_cast<float>(kD));
     std::vector<float> state = test::random_floats(static_cast<size_t>(kValueHeads) * kD * kD, -0.5f, 0.5f, 7);
     std::vector<double> want_state(state.begin(), state.end());
     DeviceBuffer<float> dstate(state), dq(static_cast<size_t>(kKeyHeads) * kD), dk(static_cast<size_t>(kKeyHeads) * kD),
-        dv(static_cast<size_t>(kValueHeads) * kD), dg(kValueHeads), dbeta(kValueHeads),
-        dout(static_cast<size_t>(kValueHeads) * kD);
+        dv(static_cast<size_t>(kValueHeads) * kD), dalpha(kValueHeads), dbeta(kValueHeads), ddt(kValueHeads),
+        da(kValueHeads), dout(static_cast<size_t>(kValueHeads) * kD);
+    const std::vector<float> dt = test::random_floats(kValueHeads, -1, 0, 5),
+                             a = test::random_floats(kValueHeads, -1, -0.1f, 6);
+    ddt.upload(dt);
+    da.upload(a);
+    double worst_gates = 0;
     double worst = 0;
     for (int t = 0; t < tokens; ++t) {
         const uint32_t seed = 100 + 10 * t;
         const std::vector<float> q = test::random_floats(static_cast<size_t>(kKeyHeads) * kD, -0.1f, 0.1f, seed);
         const std::vector<float> k = test::random_floats(static_cast<size_t>(kKeyHeads) * kD, -0.1f, 0.1f, seed + 1);
         const std::vector<float> v = test::random_floats(static_cast<size_t>(kValueHeads) * kD, -1, 1, seed + 2);
-        const std::vector<float> g = test::random_floats(kValueHeads, -0.5f, -0.05f, seed + 3);
-        const std::vector<float> beta = test::random_floats(kValueHeads, 0.1f, 0.9f, seed + 4);
+        // Raw gates: g = softplus(alpha + dt) * a lands in [-0.7, -0.01], beta = sigmoid(raw) in [0.12, 0.88].
+        const std::vector<float> alpha = test::random_floats(kValueHeads, -1, 0, seed + 3);
+        const std::vector<float> beta_raw = test::random_floats(kValueHeads, -2, 2, seed + 4);
         dq.upload(q);
         dk.upload(k);
         dv.upload(v);
-        dg.upload(g);
-        dbeta.upload(beta);
-        kernels::gdn_step(dstate.get(), dq.get(), dk.get(), dv.get(), dg.get(), dbeta.get(), dout.get(), kKeyHeads,
-                          kValueHeads, scale, nullptr);
+        dalpha.upload(alpha);
+        dbeta.upload(beta_raw);
+        kernels::gdn_step(dstate.get(), dq.get(), dk.get(), dv.get(), dalpha.get(), dbeta.get(), ddt.get(), da.get(),
+                          dout.get(), kKeyHeads, kValueHeads, scale, nullptr);
+        std::vector<double> g(kValueHeads), beta(kValueHeads), g_mag(kValueHeads);
+        for (int h = 0; h < kValueHeads; ++h) {
+            g[h] = test::softplus(double{alpha[h]} + dt[h]) * a[h];
+            beta[h] = test::sigmoid(beta_raw[h]);
+            g_mag[h] = std::fabs(g[h]);
+        }
+        worst_gates = std::max({worst_gates, test::worst_relative(dalpha.download(), g, g_mag),
+                                test::worst_relative(dbeta.download(), beta, beta)});
 
         std::vector<double> want(static_cast<size_t>(kValueHeads) * kD), mag(want.size());
         for (int h = 0; h < kValueHeads; ++h) {
             const float* qh = q.data() + (h % kKeyHeads) * kD;  // tiled, not interleaved
             const float* kh = k.data() + (h % kKeyHeads) * kD;
             double* s = want_state.data() + static_cast<size_t>(h) * kD * kD;
-            const double eg = std::exp(double{g[h]});
+            const double eg = std::exp(g[h]);
             for (int j = 0; j < kD; ++j) {
                 double kv = 0;
                 for (int i = 0; i < kD; ++i)
@@ -117,6 +128,7 @@ void check_step(int tokens) {
         }
         worst = std::max(worst, test::worst_relative(dout.download(), want, mag));
     }
+    CHECK(test::report("gdn_step gates stored back", worst_gates, kTolerance));
     CHECK(test::report("gdn_step 48 x 128 x 128, 4 tokens", worst, kTolerance));
     // the state is compared against the largest magnitude of its head: its entries are sums of cancelling terms
     const std::vector<float> got = dstate.download();
@@ -135,7 +147,6 @@ void check_step(int tokens) {
 int main() {
     try {
         check_conv(6);
-        check_gates();
         check_step(4);
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

@@ -30,9 +30,9 @@ CUDA, which is what CI runs. See [docs/development.md](docs/development.md) for 
    kernel must compute the same result as the reference kernel, and the parity test must say so; a multi-column kernel
    must be bitwise identical to the one-column kernel. Speculative decoding must not change greedy output.
 2. **Measure it.** A change to a kernel reports its achieved GB/s before and after (`bench/` has the
-   microbenchmarks). A change to decode reports tok/s on the three benchmark workloads
-   ([docs/benchmarking.md](docs/benchmarking.md)) and commits the result file `torch bench` writes under
-   `bench/results/`.
+   microbenchmarks; `bench/kernels.cu` times every kernel of a token). A change to decode reports tok/s on the three
+   benchmark workloads ([docs/benchmarking.md](docs/benchmarking.md)) and commits the result file
+   `bench/run_workloads.py` writes under `bench/results/`.
 3. **Test it.** New code comes with tests: unit tests for host code, a parity test against the CPU reference for
    every kernel.
 4. **Keep it readable.** Follow the code style below. A reviewer should understand a kernel from its header comment
@@ -58,6 +58,9 @@ CUDA, which is what CI runs. See [docs/development.md](docs/development.md) for 
   launch").
 - The description says what changed, why, how it was tested, and the measurements (before and after).
 - Commits have clear messages; we squash on merge.
+- A milestone merges only after `tools/check_orin.sh` passes on an Orin: the unit, kernel parity and model parity
+  tests, byte-identical output from the CUDA graph and kernel by kernel and at every residency, and the kernel
+  harness against the decode gates (`bench/kernel_gates.py`).
 - Model weights, raw benchmark outputs and other large files are never committed; `bench/results/*.json` is the
   exception.
 

@@ -1,6 +1,7 @@
 // Parity of the attention kernels (src/kernels/attention) with a scalar double reference: rope_neox, store_kv (bit
-// for bit against the CPU F16 conversion) and attention_decode at position 0, a middle position and the last one of
-// the cache, with the model's grouped-query layout (24 query heads, 2 KV heads, 256 dimensions).
+// for bit against the CPU F16 conversion) and attention_decode at positions around the 128-row chunk boundaries, a
+// middle position and the last one of the cache, with the model's grouped-query layout (24 query heads, 2 KV heads, 256
+// dimensions).
 #include "kernels/attention/attention.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 
 #include "../unit/check.h"
 #include "device.h"
+#include "kernels/norm/norm.h"
 #include "reference.h"
 
 using namespace torch;
@@ -70,9 +72,10 @@ void check_attention(int pos_value, const std::vector<uint16_t>& kc, const std::
     const float scale = 1.0f / 16.0f;
     DeviceBuffer<float> dqg(qg), dout(static_cast<size_t>(kHeads) * kD);
     DeviceBuffer<uint16_t> dkc(kc), dvc(vc);
+    DeviceBuffer<float> dscratch(static_cast<size_t>(kernels::attention_scratch_floats(kHeads, kMaxCtx)));
     DeviceBuffer<int32_t> dpos(std::vector<int32_t>{pos_value});
-    kernels::attention_decode(dqg.get(), dqg.get() + kD, 2 * kD, dkc.get(), dvc.get(), dout.get(), dpos.get(), kHeads,
-                              kKvHeads, scale, kMaxCtx, nullptr);
+    kernels::attention_decode(dqg.get(), dqg.get() + kD, 2 * kD, dkc.get(), dvc.get(), dout.get(), dscratch.get(),
+                              dpos.get(), kHeads, kKvHeads, scale, kMaxCtx, nullptr);
     std::vector<double> want(static_cast<size_t>(kHeads) * kD), mag(want.size());
     for (int h = 0; h < kHeads; ++h) {
         const int kv = h / (kHeads / kKvHeads);
@@ -105,6 +108,31 @@ void check_attention(int pos_value, const std::vector<uint16_t>& kc, const std::
     CHECK(test::report(what.c_str(), test::worst_relative(dout.download(), want, mag), 2e-5));
 }
 
+// The fused launch must equal rms_norm (q, then k), rope_neox (q, then k) and store_kv in sequence bit for bit.
+void check_fused(int pos_value) {
+    const int n_rot = 64;
+    const float base = 1e7f, eps = 1e-6f;
+    const std::vector<float> q = test::random_floats(static_cast<size_t>(kHeads) * 2 * kD, -2, 2, 40),
+                             k = test::random_floats(kRowLen, -2, 2, 41), v = test::random_floats(kRowLen, -2, 2, 42),
+                             wq = test::random_floats(kD, 0.5f, 1.5f, 43), wk = test::random_floats(kD, 0.5f, 1.5f, 44);
+    const std::vector<uint16_t> cache(static_cast<size_t>(kMaxCtx) * kRowLen, 0x1234);
+    DeviceBuffer<int32_t> pos(std::vector<int32_t>{pos_value});
+    DeviceBuffer<float> dwq(wq), dwk(wk), q1(q), k1(k), v1(v), q2(q), k2(k);
+    DeviceBuffer<uint16_t> kc1(cache), vc1(cache), kc2(cache), vc2(cache);
+    kernels::rms_norm(q1.get(), 2 * kD, dwq.get(), 0, nullptr, 0, q1.get(), 2 * kD, kD, kHeads, eps, nullptr);
+    kernels::rms_norm(k1.get(), kD, dwk.get(), 0, nullptr, 0, k1.get(), kD, kD, kKvHeads, eps, nullptr);
+    kernels::rope_neox(q1.get(), 2 * kD, kHeads, n_rot, pos.get(), base, nullptr);
+    kernels::rope_neox(k1.get(), kD, kKvHeads, n_rot, pos.get(), base, nullptr);
+    kernels::store_kv(k1.get(), v1.get(), kc1.get(), vc1.get(), kRowLen, pos.get(), nullptr);
+    kernels::qk_norm_rope_store(q2.get(), 2 * kD, dwq.get(), k2.get(), dwk.get(), v1.get(), kc2.get(), vc2.get(),
+                                kHeads, kKvHeads, n_rot, pos.get(), base, eps, nullptr);
+    const bool same = q1.download() == q2.download() && k1.download() == k2.download() &&
+                      kc1.download() == kc2.download() && vc1.download() == vc2.download();
+    CHECK(same);
+    std::printf("%-40s %s\n", ("qk_norm_rope_store bitwise pos " + std::to_string(pos_value)).c_str(),
+                same ? "ok" : "FAIL");
+}
+
 }  // namespace
 
 int main() {
@@ -112,6 +140,8 @@ int main() {
         for (int pos : {0, 11, 300})
             check_rope(pos);
         check_store_kv();
+        for (int pos : {0, 3, 1800, kMaxCtx - 1})
+            check_fused(pos);
         std::vector<uint16_t> kc(static_cast<size_t>(kMaxCtx) * kRowLen), vc(kc.size());
         const std::vector<float> k = test::random_floats(kc.size(), -1, 1, 30),
                                  v = test::random_floats(kc.size(), -1, 1, 31);
@@ -121,7 +151,8 @@ int main() {
         }
         // [q | gate] per head, as the projection lays it out
         const std::vector<float> qg = test::random_floats(static_cast<size_t>(kHeads) * 2 * kD, -1, 1, 32);
-        for (int pos : {0, 777, kMaxCtx - 1})
+        // 127, 128, 129 and 255, 256, 257 straddle the 128-row chunks; 1920 starts the last one
+        for (int pos : {0, 1, 63, 127, 128, 129, 255, 256, 257, 777, 1800, 1920, kMaxCtx - 1})
             check_attention(pos, kc, vc, qg);
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

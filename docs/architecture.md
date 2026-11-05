@@ -7,8 +7,8 @@ This document explains what the engine does and why. [performance.md](performanc
 around, [roadmap.md](roadmap.md) the order in which it is built, and [model-files.md](model-files.md) the files it
 reads.
 
-Numbers marked **[file]** were read from the GGUF headers at revision `ed59f920` on 2026-11-03. **[M2]** was measured on
-the owner's Orin by this project's benchmarks (2026-11-03). **[est]** is arithmetic that a later milestone replaces with
+Numbers marked **[file]** were read from the GGUF headers at revision `ed59f920` on 2026-11-03. **[M2]** and **[M3]**
+were measured on the owner's Orin by this project's benchmarks (2026-11-03 and 2026-11-04). **[est]** is arithmetic that a later milestone replaces with
 a measurement.
 
 ## Goals
@@ -116,7 +116,11 @@ experts between windows, never during one. A 4,096-token conversation then runs 
 
 At start the engine prints its budget: each reservation, the number of experts resident, and the free-memory floor it
 keeps; it refuses to start below the floor, so the operating system never runs short of memory. Weights are read
-with `O_DIRECT`, so the page cache does not compete for the same memory.
+with `O_DIRECT`, so the page cache does not compete for the same memory. The reservations are estimates, and loading
+40 GiB also frees page cache and idle memory that MemAvailable did not count at start (on the development Orin
+MemAvailable fell 37.5 GiB for a planned 45 GiB [M3]), so after loading the engine reads MemAvailable again and makes
+the next-ranked experts resident until it is down to the floor plus 1.5 GiB (except with `--resident`, which tests use
+to fix residency exactly).
 
 ### 2. Columns: 1 to 4 in registers, 5 to 16 on int8 tensor cores, one reduction order
 
@@ -163,15 +167,21 @@ state over k operand rows in the original FMA order, bitwise identical to a fres
 rejected (~1.3 ms [est]). The convolution history, the
 PLE hash history and the indexer tail are snapshotted the same way.
 
-### 6. CUDA graphs in per-layer segments, with a pointer table for experts
+### 6. One CUDA graph per token, with experts placed on the GPU
 
-The verify pass for a window width is captured once and replayed. It is a chain of per-layer graph segments rather
-than one graph, because a replayed graph cannot wait for host I/O: after a layer's router runs, the host reads the
-routing from mapped memory, and only when a routed expert is not resident does it wait for that expert's read into a
-staging slot before launching the next segment (decision 8). A device table maps every (layer, expert) pair to its
-current slot, resident or staging, so the expert kernel is the same whatever the residency (goal 4); the table is
-written before the segment that reads it. The host's work per window is choosing T, launching the segments, and
-reading back the accepted tokens.
+A token (and from M4 a verify window of each width) is recorded once as a CUDA graph and replayed. A replayed graph
+cannot wait for the host, so expert placement happens on the GPU: a device map gives every (layer, expert) pair the
+addresses of its three matrices, or null when the expert is not resident, and after each router a gate kernel writes
+the layer's expert pointer table from it. When a routed expert is absent, the gate kernel posts the layer's misses to
+a mailbox in mapped pinned memory and waits for the expert store's I/O thread, which reads them into staging slots
+and publishes a sequence number; then it points the table at the staged bytes (decision 8). The expert kernels read
+every expert through the table, so they run the same code on the same bytes whatever the residency (goal 4).
+Sequence numbers only grow, so nothing needs resetting between replays.
+
+Measured on the Orin [M3]: the GPU-to-host-and-back round trip is 7.6 us without a read (bench/miss_roundtrip.cu),
+against 21.2 us median and 144 us p99 for a host synchronization per layer; a replayed graph costs about 1.1 us per
+kernel (bench/graph_gaps.cu), so the token's host work fell from 64 ms (launching ~2,000 kernels one by one) to 0.6
+ms. The host's work per token is the embedding row, the PLE rows, one graph launch and one wait.
 
 ### 7. Speculation the hardware can afford
 
@@ -196,27 +206,35 @@ reading back the accepted tokens.
 The experts (46.8 GiB) do not all fit next to the operating system, the KV cache and other software, so the engine
 keeps as many resident as the budget allows and reads the rest from the SSD:
 
-- **Placement is a ranking.** A profile ranks all 24,576 (layer, expert) pairs; the top ones are resident at start.
+- **Placement is a ranking.** Route counts recorded while decoding held-out calibration prompts rank all 24,576
+  (layer, expert) pairs, and the most-routed are resident at start, across all layers, until the budget's room is full
+  (core/placement.h). Each resident matrix sits in a slot of its own layer's exact size. Measured [M3]: with the same
+  85% of experts resident, ranking by counts from 800 calibration tokens raised a held-out prompt's hits from 85.4%
+  to 95.0% and its decode from 8.65 to 12.48 tok/s.
 - **Prompt-informed warming.** After prefill, the experts the prompt routed to most are swapped in before decoding:
   a summary or a copy of the prompt uses the same experts as the prompt. A profile learned on one workload serves the
   others worse [est]; the engine reports hit rate per workload. Misses dominate below ~99% hits.
 - **Misses are computed by the same kernel.** The missing expert is read into a staging slot in mapped pinned memory
-  (2 MB `O_DIRECT` reads of a 4 KiB-aligned superset, since GGUF aligns tensors to 32 bytes; several reads in flight)
-  and the kernel reads the slot through the pointer table (decision 6). Output does not depend on residency (goal 4).
+  (`O_DIRECT` reads of a 4 KiB-aligned superset in 128 KiB pieces, since GGUF aligns tensors to 32 bytes; 16 reads in
+  flight) and the kernel reads the slot through the pointer table (decision 6). Output does not depend on residency
+  (goal 4). The development Orin's SSD occasionally leaves one read uncompleted until the NVMe driver's 30 s timeout
+  (about once in 240,000 reads of 128 KiB); a miss read still pending after 50 ms is therefore issued again into a
+  spare buffer and the first copy is used, and the late read's buffer stays out of use until it completes.
 - **Prefetch is lossless and measured.** An unpredicted miss costs its layer's segment the SSD latency. Reads start
   before the router runs, from predictors that only move bytes: prompt-informed warming, the draft chain's own routing
   for the drafted positions, and the previous windows' experts. A predictor that moves bytes without raising the hit
   rate only costs bandwidth, so the engine reports each predictor's hit rate separately from residency and keeps only
   what measures well.
-- **The SSD was measured in M2**: 1.40 ms mean per 2 MiB read at queue depth 4, 5.8 GB/s [M2]; queue depth 1 is to be
-  re-measured.
+- **The SSD**: random 2 MiB reads issued as 128 KiB pieces take 1.56 ms median at queue depth 1 and reach 5.4 GB/s at
+  depth 16 [M2]; a miss of a whole expert (three matrices, 1.5-2.7 MB) costs ~1 ms on the critical path.
 
 ### 9. PLE rows from the SSD, read ahead
 
 A token needs 16 rows of 90 bytes, one per head, each in a different 4 KiB page: 16 random reads. PLE lookups depend
 only on token ids, so the rows for drafted tokens are read while the window is verified, and a RAM cache (0.25 GiB)
 holds hot rows. A 4 KiB read is ~0.09 ms [M2]; sixteen on the critical path, with the occasional slow one, would stall a
-window. The token embedding (0.31 GiB, one 1,360-byte row per token) can later move to the same path; it is worth ~150
+window. Until then (M3) the 16 reads are issued in parallel before each token, 0.3 ms per token, and hedged like the
+expert reads: one 4 KiB read stalled for 30 s in an M3 benchmark run, which a read issued again after 50 ms avoids. The token embedding (0.31 GiB, one 1,360-byte row per token) can later move to the same path; it is worth ~150
 experts.
 
 ### 10. Long context at the reference's precision
@@ -271,6 +289,9 @@ asks for.
 - No fast-math, no flush-to-zero; `__fmaf_rn` and `__fmul_rn` where the order of operations matters; no
   floating-point atomics. One canonical reduction order per format (decision 2). A token's accumulation order never
   depends on the window width, on which tokens share its expert group, or on which block ran a work item.
+- Decode attention splits the positions into fixed 128-row chunks: each chunk's maximum score, sum of exponentials
+  and weighted sum of values are merged in ascending chunk order (kernels/attention/attention.h), so the result does
+  not depend on which block finished first.
 - Ties in argmax, router top-10 and indexer top-512 go to the lowest index.
 - The same model, tokens and settings give the same greedy output on every run, with any residency and any window
   policy. Sampled output is reproducible for a fixed seed and window policy, and has the same distribution for any.

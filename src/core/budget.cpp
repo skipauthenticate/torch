@@ -37,38 +37,33 @@ std::string Budget::table() const {
     std::string out = "memory budget\n" + line("MemAvailable at start", available);
     for (const Reservation& r : reservations)
         out += line(r.name, r.bytes);
-    char experts[96];
-    std::snprintf(experts, sizeof experts, "resident experts: %d of %d per layer (%.1f%%)", resident, experts_per_layer,
-                  100.0 * resident / std::max(experts_per_layer, 1));
-    out += line(experts, resident_bytes());
+    char label[96];
+    std::snprintf(label, sizeof label, "resident experts: %d of %d (%.1f%%)", resident, experts,
+                  100.0 * resident / std::max(experts, 1));
+    out += line(label, resident_bytes);
+    if (!placement.empty())
+        out += "    " + placement + "\n";
     out += line("free-memory floor", floor);
     out += line("left over", left());
+    if (available_after_load > 0) {
+        out += line("MemAvailable after loading", available_after_load);
+        std::snprintf(label, sizeof label, "experts added to fill it to the floor + %.1f GiB: %d (%.1f%% resident)",
+                      static_cast<double>(kTopUpMargin) / static_cast<double>(kGiB), added,
+                      100.0 * (resident + added) / std::max(experts, 1));
+        out += line(label, added_bytes);
+    }
     return out;
 }
 
-Budget plan_budget(uint64_t available, uint64_t floor, std::vector<Reservation> reservations, uint64_t expert_bytes,
-                   int experts_per_layer, std::optional<int> forced) {
+Budget plan_budget(uint64_t available, uint64_t floor, std::vector<Reservation> reservations) {
     Budget b;
     b.available = available;
     b.floor = floor;
     b.reservations = std::move(reservations);
-    b.expert_bytes = expert_bytes;
-    b.experts_per_layer = experts_per_layer;
     const uint64_t needed = floor + b.reserved();
     if (available < needed)
         throw Error("The engine needs " + gib(needed) + " of free memory before any expert is resident but only " +
                     gib(available) + " is available; stop other programs or shorten the context.");
-    const uint64_t room = available - needed;
-    const uint64_t fit = expert_bytes == 0 ? static_cast<uint64_t>(experts_per_layer) : room / expert_bytes;
-    const int most = static_cast<int>(std::min<uint64_t>(fit, static_cast<uint64_t>(experts_per_layer)));
-    if (forced) {
-        if (*forced < 0 || *forced > experts_per_layer)
-            throw Error("--resident must be between 0 and " + std::to_string(experts_per_layer) + ".");
-        if (*forced > most)
-            throw Error("Only " + std::to_string(most) + " experts per layer fit in free memory, not " +
-                        std::to_string(*forced) + "; ask for fewer with --resident.");
-    }
-    b.resident = forced.value_or(most);
     return b;
 }
 

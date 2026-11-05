@@ -17,8 +17,7 @@ namespace torch::model {
 // the bytes; with an arena it also records the page-aligned reads that fill it.
 class WeightLoader {
 public:
-    WeightLoader(const gguf::File& f, uint8_t* arena, int resident, int n_expert)
-        : f_(f), arena_(arena), resident_(resident), n_expert_(n_expert) {}
+    WeightLoader(const gguf::File& f, uint8_t* arena, int n_expert) : f_(f), arena_(arena), n_expert_(n_expert) {}
 
     uint64_t used() const noexcept { return used_; }
 
@@ -61,19 +60,14 @@ public:
         return out;
     }
 
-    // A [cols, rows, n_expert] tensor; experts 0 to resident - 1 are read into the arena.
+    // A [cols, rows, n_expert] tensor: its layout only; runtime::ExpertStore reads the experts.
     ExpertTensor experts(const std::string& name, int64_t cols, int64_t rows) {
         const gguf::TensorInfo& t = tensor(name, {cols, rows, n_expert_});
         const Type type = static_cast<Type>(t.type);
         if (!kernels::gemv_q8_supports(type))
             throw Error("Expert tensor " + name + " is " + std::string(type_info(t.type)->name) +
                         ", which the expert kernels do not read; use the supported model file.");
-        ExpertTensor e{
-            type,   static_cast<int>(rows), static_cast<int>(cols), t.slice_bytes(), f_.data_offset() + t.offset,
-            nullptr};
-        if (resident_ > 0)
-            e.resident = place(t, e.slice_bytes * static_cast<uint64_t>(resident_));
-        return e;
+        return {type, static_cast<int>(rows), static_cast<int>(cols), t.slice_bytes(), f_.data_offset() + t.offset};
     }
 
 private:
@@ -114,7 +108,6 @@ private:
 
     const gguf::File& f_;
     uint8_t* arena_;
-    int resident_;
     int64_t n_expert_;
     uint64_t used_ = 0;
 };
@@ -190,30 +183,15 @@ void Weights::bind(WeightLoader& w, const Config& c) {
 }
 
 uint64_t Weights::base_bytes(const Config& config, const gguf::File& shard1) {
-    WeightLoader dry(shard1, nullptr, 0, config.n_expert);
+    WeightLoader dry(shard1, nullptr, config.n_expert);
     Weights w;
     w.bind(dry, config);
-    // A resident expert tensor starts and ends inside a page: two more pages each.
-    return dry.used() + uint64_t{3} * static_cast<uint64_t>(config.n_layer) * 2 * runtime::kPage;
+    return dry.used();
 }
 
-uint64_t Weights::expert_bytes(const Config& config, const gguf::File& shard1) {
-    uint64_t sum = 0;
-    for (int il = 0; il < config.n_layer; ++il) {
-        for (const char* kind : {"gate", "up", "down"}) {
-            const std::string name = "blk." + std::to_string(il) + ".ffn_" + kind + "_exps.weight";
-            const gguf::TensorInfo* t = shard1.tensor(name);
-            if (t == nullptr)
-                throw Error("The model file has no tensor " + name + "; use the supported model file.");
-            sum += t->slice_bytes();
-        }
-    }
-    return sum;
-}
-
-Weights::Weights(const Config& config, const gguf::File& shard1, const runtime::DirectFile& file, int resident,
+Weights::Weights(const Config& config, const gguf::File& shard1, const runtime::DirectFile& file,
                  runtime::ReadPool& pool) {
-    WeightLoader dry(shard1, nullptr, resident, config.n_expert);
+    WeightLoader dry(shard1, nullptr, config.n_expert);
     bind(dry, config);
     arena_bytes_ = dry.used();
     void* arena = nullptr;
@@ -227,10 +205,10 @@ Weights::Weights(const Config& config, const gguf::File& shard1, const runtime::
             "The GPU maps pinned memory at a different address than the CPU; the engine needs unified "
             "addressing (a Jetson Orin with JetPack 7).");
 
-    WeightLoader loader(shard1, arena_, resident, config.n_expert);
+    WeightLoader loader(shard1, arena_, config.n_expert);
     bind(loader, config);
 
-    // Large regions (the resident experts) are split so the pool keeps several reads in flight.
+    // Large tensors (the output head, 0.5 GiB) are split so the pool keeps several reads in flight.
     constexpr uint64_t kChunk = 64 * (uint64_t{1} << 20);
     std::vector<WeightLoader::Read> chunks;
     for (const WeightLoader::Read& r : loader.reads) {

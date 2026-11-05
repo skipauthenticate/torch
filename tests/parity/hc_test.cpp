@@ -1,8 +1,12 @@
 // Parity of the hyper-connection kernels (src/kernels/hc) with a scalar double reference at the model's sizes.
 #include "kernels/hc/hc.h"
 
+#include <cstring>
+
 #include "../unit/check.h"
 #include "device.h"
+#include "kernels/gemv/gemv.h"
+#include "kernels/norm/norm.h"
 #include "reference.h"
 
 using namespace torch;
@@ -39,8 +43,15 @@ void check_collapse() {
         }
     }
     DeviceBuffer<float> dxn(xn), dgate(gate), dmixed(kN);
-    kernels::hc_collapse(dxn.get(), dgate.get(), dmixed.get(), kN, kHc, nullptr);
+    DeviceBuffer<kernels::BlockQ8> q8(kN / 32), want_q8(kN / 32);
+    kernels::hc_collapse(dxn.get(), dgate.get(), dmixed.get(), q8.get(), kN, kHc, nullptr);
     CHECK(test::report("hc_collapse", test::worst_relative(dmixed.download(), want, mag), kTolerance));
+    // its Q8 blocks are bitwise those quantize_q8 makes of its output
+    kernels::quantize_q8(dmixed.get(), kN, want_q8.get(), nullptr);
+    const std::vector<kernels::BlockQ8> a = q8.download(), b = want_q8.download();
+    const bool same = std::memcmp(a.data(), b.data(), a.size() * sizeof(kernels::BlockQ8)) == 0;
+    CHECK(same);
+    std::printf("%-40s %s\n", "hc_collapse Q8 = quantize_q8", same ? "ok" : "FAIL");
 }
 
 void check_combine() {
@@ -58,6 +69,22 @@ void check_combine() {
     DeviceBuffer<float> dres(res), dout(out), dinject(inject);
     kernels::hc_combine(dres.get(), dout.get(), dinject.get(), kN, kHc, nullptr);
     CHECK(test::report("hc_combine", test::worst_relative(dres.download(), want, mag), kTolerance));
+}
+
+// hc_combine_norm must equal hc_combine followed by rms_norm bit for bit (the model relies on it).
+void check_combine_norm() {
+    const std::vector<float> res = test::random_floats(static_cast<size_t>(kHc) * kN, -2, 2, 8);
+    const std::vector<float> out = test::random_floats(kN, -2, 2, 9);
+    const std::vector<float> inject = test::random_floats(kHc, -6, 6, 10);
+    const std::vector<float> w = test::random_floats(static_cast<size_t>(kHc) * kN, 0.5, 1.5, 11);
+    constexpr float kEps = 1e-6f;
+    DeviceBuffer<float> r1(res), r2(res), dout(out), dinject(inject), dw(w), x1(res.size()), x2(res.size());
+    kernels::hc_combine(r1.get(), dout.get(), dinject.get(), kN, kHc, nullptr);
+    kernels::rms_norm(r1.get(), kN, dw.get(), kN, nullptr, 0, x1.get(), kN, kN, kHc, kEps, nullptr);
+    kernels::hc_combine_norm(r2.get(), dout.get(), dinject.get(), dw.get(), x2.get(), kN, kHc, kEps, nullptr);
+    const bool same = r1.download() == r2.download() && x1.download() == x2.download();
+    CHECK(same);
+    std::printf("%-40s %s\n", "hc_combine_norm = combine + rms_norm", same ? "ok" : "FAIL");
 }
 
 void check_broadcast() {
@@ -80,6 +107,7 @@ int main() {
         check_silu_scale();
         check_collapse();
         check_combine();
+        check_combine_norm();
         check_broadcast();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
