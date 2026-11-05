@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <span>
 #include <string>
 
 #include "core/cuda_check.h"
@@ -11,98 +13,239 @@
 namespace torch::runtime {
 namespace {
 
+using Clock = std::chrono::steady_clock;
+
+constexpr int kReadThreads = 16;  // 128 KiB reads reach ~5.4 GB/s at queue depth 16 (bench/ssd_reads.cpp)
+constexpr int kSpareBuffers =
+    4;  // staging buffers per kind beyond one per slot, for reads still in flight after a hedge
+
+// A slot holds one expert matrix at the same offset within a page as in the file: its size rounded up to pages, plus
+// the page the slice may start inside.
+uint64_t slot_bytes(uint64_t slice) {
+    return page_ceil(slice) + kPage;
+}
+
+uint64_t slice_of(const gguf::File& shard1, int layer, const char* kind) {
+    const std::string name = "blk." + std::to_string(layer) + ".ffn_" + kind + "_exps.weight";
+    const gguf::TensorInfo* t = shard1.tensor(name);
+    if (t == nullptr)
+        throw Error("The model file has no tensor " + name + "; use the supported model file.");
+    return t->slice_bytes();
+}
+
 constexpr const char* kKinds[3] = {"gate", "up", "down"};
 
-// The largest expert slice of each kind over all layers, plus the page a read may start inside.
-void slot_sizes(const model::Config& config, const gguf::File& shard1, uint64_t out[3]) {
-    for (int k = 0; k < 3; ++k) {
-        uint64_t most = 0;
-        for (int il = 0; il < config.n_layer; ++il) {
-            const std::string name = "blk." + std::to_string(il) + ".ffn_" + kKinds[k] + "_exps.weight";
-            const gguf::TensorInfo* t = shard1.tensor(name);
-            if (t == nullptr)
-                throw Error("The model file has no tensor " + name + "; use the supported model file.");
-            most = std::max(most, t->slice_bytes());
-        }
-        out[k] = page_ceil(most) + kPage;
-    }
+const model::ExpertTensor& tensor(const model::Layer& L, int kind) {
+    return kind == 0 ? L.gate_exps : kind == 1 ? L.up_exps : L.down_exps;
+}
+
+template <class T>
+T* device_alloc(size_t count) {
+    void* p = nullptr;
+    TORCH_CUDA_CHECK(cudaMalloc(&p, count * sizeof(T)));
+    TORCH_CUDA_CHECK(cudaMemset(p, 0, count * sizeof(T)));
+    return static_cast<T*>(p);
+}
+
+template <class T>
+T* mapped_alloc(size_t count) {
+    void* p = nullptr;
+    TORCH_CUDA_CHECK(cudaHostAlloc(&p, count * sizeof(T), cudaHostAllocMapped));
+    void* device = nullptr;
+    TORCH_CUDA_CHECK(cudaHostGetDevicePointer(&device, p, 0));
+    if (device != p)
+        throw Error(
+            "The GPU maps pinned memory at a different address than the CPU; the engine needs unified "
+            "addressing (a Jetson Orin with JetPack 7).");
+    return static_cast<T*>(p);
 }
 
 }  // namespace
 
-uint64_t ExpertStore::staging_bytes(const model::Config& config, const gguf::File& shard1, int slots) {
-    uint64_t sizes[3];
-    slot_sizes(config, shard1, sizes);
-    const uint64_t tables = uint64_t{3} * static_cast<uint64_t>(config.n_layer * slots) * sizeof(void*);
-    return static_cast<uint64_t>(slots) * (sizes[0] + sizes[1] + sizes[2]) + page_ceil(tables);
+std::vector<uint64_t> ExpertStore::layer_expert_bytes(const model::Config& config, const gguf::File& shard1) {
+    std::vector<uint64_t> bytes;
+    for (int il = 0; il < config.n_layer; ++il) {
+        uint64_t sum = 0;
+        for (const char* kind : kKinds)
+            sum += slot_bytes(slice_of(shard1, il, kind));
+        bytes.push_back(sum);
+    }
+    return bytes;
+}
+
+uint64_t ExpertStore::fixed_bytes(const model::Config& config, const gguf::File& shard1) {
+    uint64_t staging = 0, largest = 0;
+    for (const char* kind : kKinds) {
+        uint64_t most = 0;
+        for (int il = 0; il < config.n_layer; ++il)
+            most = std::max(most, slice_of(shard1, il, kind));
+        staging += slot_bytes(most);
+        largest = std::max(largest, most);
+    }
+    const uint64_t layers = static_cast<uint64_t>(config.n_layer);
+    const uint64_t pointers =
+        layers * (static_cast<uint64_t>(config.n_expert) + static_cast<uint64_t>(config.n_expert_used)) * 3;
+    return static_cast<uint64_t>(config.n_expert_used + kSpareBuffers) * staging + pointers * sizeof(void*) + largest +
+           page_ceil(sizeof(Mailbox));
 }
 
 ExpertStore::ExpertStore(const model::Config& config, const std::vector<model::Layer>& layers, const DirectFile& shard1,
-                         int resident, int slots, ReadPool& pool)
-    : layers_(layers), file_(shard1), pool_(pool), resident_(resident), slots_(slots) {
-    uint64_t sizes[3] = {};
-    for (int k = 0; k < 3; ++k) {
+                         const std::vector<std::vector<int32_t>>& resident)
+    : layers_(layers), file_(shard1), slots_(config.n_expert_used), n_expert_(config.n_expert), pool_(kReadThreads) {
+    if (static_cast<int>(resident.size()) != config.n_layer || slots_ > kGateSlots)
+        throw Error("The expert placement does not match the model; this is a bug in the engine.");
+    host_map_.assign(static_cast<size_t>(config.n_layer) * static_cast<size_t>(config.n_expert) * 3, nullptr);
+    map_ = device_alloc<const uint8_t*>(host_map_.size());
+    load(resident);
+
+    uint64_t largest = 0, stride[3] = {};
+    for (int kind = 0; kind < 3; ++kind) {
         uint64_t most = 0;
-        for (const model::Layer& L : layers) {
-            const model::ExpertTensor& t = k == 0 ? L.gate_exps : k == 1 ? L.up_exps : L.down_exps;
-            most = std::max(most, t.slice_bytes);
-        }
-        sizes[k] = page_ceil(most) + kPage;
-        slot_bytes_[k] = sizes[k];
+        for (const model::Layer& L : layers)
+            most = std::max(most, tensor(L, kind).slice_bytes);
+        stride[kind] = slot_bytes(most);
+        largest = std::max(largest, most);
     }
-    void* staging = nullptr;
-    TORCH_CUDA_CHECK(
-        cudaHostAlloc(&staging, static_cast<size_t>(slots) * (sizes[0] + sizes[1] + sizes[2]), cudaHostAllocMapped));
-    staging_ = static_cast<uint8_t*>(staging);
-    void* tables = nullptr;
-    TORCH_CUDA_CHECK(cudaHostAlloc(&tables, size_t{3} * static_cast<size_t>(config.n_layer * slots) * sizeof(void*),
-                                   cudaHostAllocMapped));
-    tables_ = static_cast<const uint8_t**>(tables);
+    const int per_kind = slots_ + kSpareBuffers;
+    staging_ = mapped_alloc<uint8_t>(static_cast<size_t>(per_kind) * (stride[0] + stride[1] + stride[2]));
+    io_ = std::make_unique<HedgedReads>(file_, kReadThreads);
+    uint8_t* at = staging_;
+    for (int kind = 0; kind < 3; ++kind) {
+        io_->add_pool(at, stride[kind], per_kind);  // pool id = kind
+        at += static_cast<uint64_t>(per_kind) * stride[kind];
+    }
+    tables_ = device_alloc<const uint8_t*>(static_cast<size_t>(config.n_layer) * 3 * static_cast<size_t>(slots_));
+    seq_ = device_alloc<uint32_t>(1);
+    counters_ = device_alloc<unsigned long long>(2);
+    n_route_counts_ = static_cast<size_t>(config.n_layer) * static_cast<size_t>(config.n_expert);
+    route_counts_ = device_alloc<unsigned long long>(n_route_counts_);
+    zeros_ = device_alloc<uint8_t>(largest);
+    mailbox_ = mapped_alloc<Mailbox>(1);
+    *mailbox_ = Mailbox{};
+    thread_ = std::thread([this] { serve(); });
+}
+
+void ExpertStore::add(const std::vector<std::vector<int32_t>>& more) {
+    if (more.size() != layers_.size())
+        throw Error("The expert placement does not match the model; this is a bug in the engine.");
+    load(more);
+}
+
+void ExpertStore::load(const std::vector<std::vector<int32_t>>& resident) {
+    // One allocation for all of them: their slots layer after layer, gate, up and down.
+    struct Read {
+        int layer, expert, kind;
+        uint64_t offset;  // in the arena
+    };
+    std::vector<Read> reads;
+    uint64_t arena_bytes = 0;
+    for (size_t il = 0; il < resident.size(); ++il) {
+        for (const int32_t e : resident[il]) {
+            if (e < 0 || e >= n_expert_)
+                throw Error("The expert placement names expert " + std::to_string(e) +
+                            ", which the model does not have.");
+            if (host_map_[(il * static_cast<size_t>(n_expert_) + static_cast<size_t>(e)) * 3] != nullptr)
+                throw Error("Expert " + std::to_string(e) + " of layer " + std::to_string(il) +
+                            " is already resident; this is a bug in the engine.");
+            for (int kind = 0; kind < 3; ++kind) {
+                reads.push_back({static_cast<int>(il), e, kind, arena_bytes});
+                arena_bytes += slot_bytes(tensor(layers_[il], kind).slice_bytes);
+            }
+        }
+    }
+    if (reads.empty())
+        return;
+    uint8_t* arena = mapped_alloc<uint8_t>(arena_bytes);
+    arenas_.push_back(arena);
+    pool_.run(static_cast<int>(reads.size()), [&](int i) {
+        const Read& r = reads[static_cast<size_t>(i)];
+        const model::ExpertTensor& t = tensor(layers_[static_cast<size_t>(r.layer)], r.kind);
+        host_map_[(static_cast<size_t>(r.layer) * static_cast<size_t>(n_expert_) + static_cast<size_t>(r.expert)) * 3 +
+                  static_cast<size_t>(r.kind)] =
+            file_.read(t.file_offset + static_cast<uint64_t>(r.expert) * t.slice_bytes, t.slice_bytes,
+                       arena + r.offset);
+    });
+    TORCH_CUDA_CHECK(cudaMemcpy(map_, host_map_.data(), host_map_.size() * sizeof(void*), cudaMemcpyHostToDevice));
 }
 
 ExpertStore::~ExpertStore() {
+    stop_ = true;
+    if (thread_.joinable())
+        thread_.join();
+    io_.reset();  // waits for reads still in flight before their buffers are freed
+    cudaFreeHost(mailbox_);
+    cudaFree(zeros_);
+    cudaFree(route_counts_);
+    cudaFree(counters_);
+    cudaFree(seq_);
+    cudaFree(tables_);
+    cudaFree(map_);
     if (staging_)
         cudaFreeHost(staging_);
-    if (tables_)
-        cudaFreeHost(const_cast<uint8_t**>(tables_));
+    for (uint8_t* arena : arenas_)
+        cudaFreeHost(arena);
 }
 
-ExpertStore::Tables ExpertStore::prepare(int layer, std::span<const int32_t> ids) {
-    if (static_cast<int>(ids.size()) > slots_)
-        throw Error("A layer routed to more experts than the store has slots for; this is a bug in the engine.");
-    const model::Layer& L = layers_[static_cast<size_t>(layer)];
-    const model::ExpertTensor* tensors[3] = {&L.gate_exps, &L.up_exps, &L.down_exps};
-    const uint8_t** table = tables_ + size_t{3} * static_cast<size_t>(layer * slots_);
-
-    struct Miss {
-        int slot;
-        int32_t expert;
-    };
-    Miss misses[16];
-    int n_miss = 0;
-    for (int s = 0; s < static_cast<int>(ids.size()); ++s) {
-        const int32_t e = ids[static_cast<size_t>(s)];
-        if (e < resident_) {
-            for (int k = 0; k < 3; ++k)
-                table[k * slots_ + s] = tensors[k]->resident + static_cast<uint64_t>(e) * tensors[k]->slice_bytes;
-            ++hits_;
-        } else {
-            misses[n_miss++] = {s, e};
-            ++misses_;
+void ExpertStore::serve() {
+    std::atomic_ref<uint32_t> request(mailbox_->request_seq);
+    std::atomic_ref<uint32_t> done(mailbox_->done_seq);
+    uint32_t served = 0;
+    auto idle_since = Clock::now();
+    while (!stop_) {
+        const uint32_t seq = request.load(std::memory_order_acquire);
+        if (seq == served) {
+            // Poll hard while decode is running; back off when nothing has arrived for a while.
+            if (Clock::now() - idle_since > std::chrono::milliseconds(2))
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            else
+                asm volatile("yield");
+            continue;
         }
+        const auto start = Clock::now();
+        const model::Layer& L = layers_[mailbox_->layer];
+        const int count = static_cast<int>(std::min<uint32_t>(mailbox_->count, kGateSlots));
+        // The GPU has finished the previous request's experts: their buffers are free again.
+        io_->release();
+        HedgedReads::Request reads[kGateSlots * 3];
+        for (int i = 0; i < count; ++i) {
+            for (int kind = 0; kind < 3; ++kind) {
+                const model::ExpertTensor& t = tensor(L, kind);
+                reads[i * 3 + kind] = {kind, t.file_offset + static_cast<uint64_t>(mailbox_->expert[i]) * t.slice_bytes,
+                                       t.slice_bytes};
+            }
+        }
+        const uint8_t* data[kGateSlots * 3];
+        io_->read_all(std::span(reads, static_cast<size_t>(3 * count)),
+                      std::span(data, static_cast<size_t>(3 * count)));
+        for (int i = 0; i < 3 * count; ++i) {
+            failed_ = failed_ || data[i] == nullptr;
+            mailbox_->data[i / 3][i % 3] = data[i] != nullptr ? data[i] : zeros_;
+        }
+        read_ns_ +=
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        done.store(seq, std::memory_order_release);
+        served = seq;
+        idle_since = Clock::now();
     }
-    // One job per matrix of each missing expert, so the pool keeps up to 3 x misses reads in flight.
-    pool_.run(3 * n_miss, [&](int job) {
-        const Miss& m = misses[job / 3];
-        const int k = job % 3;
-        const model::ExpertTensor& t = *tensors[k];
-        uint8_t* slot = staging_ + static_cast<uint64_t>(m.slot) * (slot_bytes_[0] + slot_bytes_[1] + slot_bytes_[2]);
-        for (int before = 0; before < k; ++before)
-            slot += slot_bytes_[before];
-        table[k * slots_ + m.slot] =
-            file_.read(t.file_offset + static_cast<uint64_t>(m.expert) * t.slice_bytes, t.slice_bytes, slot);
-    });
-    return {table, table + slots_, table + 2 * slots_};
+}
+
+std::pair<uint64_t, uint64_t> ExpertStore::hits_and_misses() const {
+    unsigned long long c[2] = {};
+    TORCH_CUDA_CHECK(cudaMemcpy(c, counters_, sizeof c, cudaMemcpyDeviceToHost));
+    return {c[0], c[1]};
+}
+
+std::vector<uint64_t> ExpertStore::read_route_counts() const {
+    std::vector<uint64_t> out(n_route_counts_);
+    TORCH_CUDA_CHECK(cudaMemcpy(out.data(), route_counts_, out.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    return out;
+}
+
+void ExpertStore::check() const {
+    if (failed_)
+        throw Error("Reading a non-resident expert from the SSD failed; check the disk.");
+    if (mailbox_->error)
+        throw Error("A non-resident expert did not arrive within 2 s; the I/O thread stalled.");
 }
 
 }  // namespace torch::runtime

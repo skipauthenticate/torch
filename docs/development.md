@@ -90,6 +90,20 @@ resident (0 reads every routed expert from the SSD), `--logits FILE` writes ever
 FILE` writes every step's top log-probabilities for the parity script. The context is limited to 2,048 tokens until
 milestone M6: below that, the model's sparse attention selects every cell, so dense attention is exact.
 
+`--tokens @FILE` reads the ids from a file (as `bench/workloads/` stores them), `--placement COUNTS` keeps the
+most-routed experts of a route-count file resident and `--route-counts COUNTS` adds this run's routing to one, and
+`--quiet --profile` prints only the speed, the generated ids and where decode time went. Each token runs as one CUDA
+graph; `TORCH_EAGER=1` launches kernel by kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir
+TORCH_DUMP_STAGES=router,...` writes the named stages' values per position and layer.
+
+### Benchmarks
+
+`bench/run_workloads.py --torch build/torch --model MODEL --out RESULT.json --placement COUNTS` runs the three
+workloads of [benchmarking.md](benchmarking.md) and writes the result file; `--calibrate COUNTS` records the route
+counts from the held-out calibration prompts. `build/torch_bench_kernels MODEL --json FILE` times every kernel of a
+token in GB/s against the 180 GB/s ceiling, and `bench/kernel_gates.py FILE` checks that result against the decode
+gates.
+
 ### Model parity
 
 `tests/model/parity.py` (standard library only) compares Torch's next-token log-probabilities with those of a second
@@ -140,6 +154,11 @@ The development board is shared with other work. Every build or run that uses th
 holds the board's GPU lock (a `flock` on a shared lock file); builds run at `nice -n 10` with `-j 4`, or with `-j 1`
 outside the lock. Copy the tree to the board with `rsync -rlpD --checksum` rather than `-a`: `-a` keeps the source
 machine's modification times, and the build on the board can then skip files that changed.
+
+`tools/check_orin.sh` runs everything a milestone must pass on the board, from the development machine:
+`TORCH_ORIN=user@host TORCH_MODEL=/path/on/board/MODEL-00001-of-00002.gguf TORCH_GPU_LOCK=/path/to/lock
+tools/check_orin.sh` copies the tree, builds it, and under the lock runs the unit, kernel parity and model parity
+tests, the graph-versus-eager and residency checks, and the kernel harness against its gates.
 
 ### Fuzzing
 

@@ -2,8 +2,11 @@
 // gate, no weight, a strided layout and the in-place form.
 #include "kernels/norm/norm.h"
 
+#include <cstring>
+
 #include "../unit/check.h"
 #include "device.h"
+#include "kernels/gemv/gemv.h"
 #include "reference.h"
 
 using namespace torch;
@@ -59,6 +62,26 @@ void check_rms(const Case& c, uint32_t seed) {
     CHECK(test::report(c.name, test::worst_relative(got, want, scale), kTolerance));
 }
 
+// rms_norm_q8 must give rms_norm's output bit for bit and the Q8 blocks quantize_q8 makes of it (the model feeds them
+// to ssm_out in place of quantizing again).
+void check_rms_q8() {
+    constexpr int kN = 128, kGroups = 48;
+    const std::vector<float> x = test::random_floats(static_cast<size_t>(kN) * kGroups, -3, 3, 21);
+    const std::vector<float> w = test::random_floats(kN, 0.5f, 1.5f, 22);
+    const std::vector<float> gate = test::random_floats(static_cast<size_t>(kN) * kGroups, -4, 4, 23);
+    DeviceBuffer<float> dx(x), dw(w), dgate(gate), out1(x.size()), out2(x.size());
+    DeviceBuffer<kernels::BlockQ8> q1(x.size() / 32), q2(x.size() / 32);
+    kernels::rms_norm(dx.get(), kN, dw.get(), 0, dgate.get(), kN, out1.get(), kN, kN, kGroups, 1e-6f, nullptr);
+    kernels::quantize_q8(out1.get(), static_cast<int64_t>(x.size()), q1.get(), nullptr);
+    kernels::rms_norm_q8(dx.get(), kN, dw.get(), 0, dgate.get(), kN, out2.get(), kN, q2.get(), kN, kGroups, 1e-6f,
+                         nullptr);
+    const std::vector<kernels::BlockQ8> a = q1.download(), b = q2.download();
+    const bool same =
+        out1.download() == out2.download() && std::memcmp(a.data(), b.data(), a.size() * sizeof(kernels::BlockQ8)) == 0;
+    CHECK(same);
+    std::printf("%-40s %s\n", "rms_norm_q8 = rms_norm + quantize_q8", same ? "ok" : "FAIL");
+}
+
 void check_l2() {
     const int n = 128, groups = 16;
     const float eps = 1e-6f;
@@ -88,6 +111,7 @@ int main() {
         check_rms({"rms_norm in place, weights and gate", 2560, 4, 2560, 2560, 2560, true, true, true}, 9);
         check_rms({"rms_norm no weight", 2560, 2, 2560, 0, 0, false, false, false}, 13);
         check_rms({"rms_norm 48 x 128 strided, gate", 128, 48, 256, 0, 128, true, true, false}, 17);
+        check_rms_q8();
         check_l2();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

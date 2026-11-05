@@ -3,24 +3,26 @@
 // The rows of head h hash the token and its predecessors (bigrams for heads 0-7, trigrams for 8-15) into a
 // prime-sized slice of per_layer_token_embd, 320,001,536 IQ4_NL rows of 160 values (26.8 GiB) that stay on the SSD.
 // A row is 90 bytes, so each lookup is one O_DIRECT read of the page (or two) holding it; the 16 reads run in
-// parallel and the rows are dequantized to F32 on the CPU. Architecture decision 9 adds a
-// row cache and read-ahead in M5.
+// parallel, hedged like the expert reads (hedged_reads.h: one 4 KiB read here once stalled for 30 s), and the rows are
+// dequantized to F32 on the CPU. Architecture decision 9 adds a row cache and read-ahead in M5.
 #pragma once
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 #include "gguf/gguf.h"
 #include "model/config.h"
 #include "runtime/direct_io.h"
+#include "runtime/hedged_reads.h"
 
 namespace torch::runtime {
 
 class PleRows {
 public:
-    PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file, ReadPool& pool);
+    PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file);
     PleRows(const PleRows&) = delete;
     PleRows& operator=(const PleRows&) = delete;
     ~PleRows();
@@ -34,13 +36,14 @@ public:
     // end of sequence does not).
     static std::vector<uint64_t> row_ids(const model::Config& config, std::span<const int32_t> history, size_t i);
 
+    uint64_t hedged_reads() const noexcept { return reads_->hedged(); }
+
 private:
     const model::Config& config_;
-    const DirectFile& file_;
-    ReadPool& pool_;
     uint64_t table_offset_ = 0;  // of row 0 in shard 2
     uint64_t row_bytes_ = 0;
-    std::vector<uint8_t*> buffers_;  // one page-aligned two-page buffer per head
+    uint8_t* buffers_ = nullptr;  // page-aligned two-page buffers: one per head and kSpareBuffers
+    std::unique_ptr<HedgedReads> reads_;
 };
 
 }  // namespace torch::runtime

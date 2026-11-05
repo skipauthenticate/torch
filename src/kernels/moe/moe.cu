@@ -6,61 +6,61 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kMaxExperts = 1024;
+constexpr int kMaxTopK = 32;
 
 // True when (v, i) beats (best_v, best_i): larger value, or the same value at a lower index.
 __device__ __forceinline__ bool better(float v, int i, float best_v, int best_i) {
     return v > best_v || (v == best_v && i < best_i);
 }
 
-// One block, one thread per expert (the launcher rounds the block up to a multiple of 32).
+// One block, one thread per expert (the launcher rounds n up to whole warps). The softmax uses the block's
+// reductions. The top k is found by counting, not by k rounds of argmax: an expert's rank is the number of experts that
+// beat it (larger p, or equal p at a lower index), a strict total order. Each expert first counts within its warp; the
+// k with rank < k there are the warp's candidates, and every expert of the overall top k is among them. Each candidate
+// then counts among all candidates, which gives its exact overall rank, so the choice, the order and the sum of the
+// chosen p (taken in rank order) are those of k rounds of a block-wide argmax.
 __global__ void router_kernel(const float* logits, int n, int k, int32_t* ids, float* weights) {
-    __shared__ float p[kMaxExperts];
-    __shared__ float warp_v[kWarp];
-    __shared__ int warp_i[kWarp];
-    const int t = threadIdx.x;
+    __shared__ float p_s[kMaxExperts];
+    __shared__ float cand_v[kMaxExperts / kWarp * kMaxTopK];
+    __shared__ int cand_i[kMaxExperts / kWarp * kMaxTopK];
+    __shared__ float sel_v[kMaxTopK];
+    __shared__ int sel_i[kMaxTopK];
+    const int t = threadIdx.x, warp = t / kWarp, warps = blockDim.x / kWarp;
     const float logit = t < n ? logits[t] : -INFINITY;
     const float peak = block_max(logit);
     const float e = t < n ? expf(logit - peak) : 0.0f;
     const float sum = block_sum(e);
-    p[t] = t < n ? e / sum : -INFINITY;
+    const float p = t < n ? e / sum : -INFINITY;
+    p_s[t] = p;
+    __syncwarp();
 
-    float chosen = 0.0f;
-    for (int r = 0; r < k; ++r) {
-        __syncthreads();
-        float v = p[t];
-        int i = t;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, v, offset);
-            const int oi = __shfl_xor_sync(0xffffffffu, i, offset);
-            if (better(ov, oi, v, i)) {
-                v = ov;
-                i = oi;
-            }
-        }
-        if (t % kWarp == 0) {
-            warp_v[t / kWarp] = v;
-            warp_i[t / kWarp] = i;
-        }
-        __syncthreads();
-        if (t == 0) {
-            float bv = warp_v[0];
-            int bi = warp_i[0];
-            for (int w = 1; w < blockDim.x / kWarp; ++w) {
-                if (better(warp_v[w], warp_i[w], bv, bi)) {
-                    bv = warp_v[w];
-                    bi = warp_i[w];
-                }
-            }
-            ids[r] = bi;
-            weights[r] = bv;
-            p[bi] = -INFINITY;
-            chosen += bv;
+    int rank = 0;  // within the warp
+    for (int j = warp * kWarp; j < warp * kWarp + kWarp; ++j)
+        rank += better(p_s[j], j, p, t) ? 1 : 0;
+    if (rank < k) {
+        cand_v[warp * k + rank] = p;
+        cand_i[warp * k + rank] = t;
+    }
+    __syncthreads();
+    if (rank < k) {
+        rank = 0;  // overall
+        for (int c = 0; c < warps * k; ++c)
+            rank += better(cand_v[c], cand_i[c], p, t) ? 1 : 0;
+        if (rank < k) {
+            sel_v[rank] = p;
+            sel_i[rank] = t;
         }
     }
+    __syncthreads();
     if (t == 0) {
-        const float norm = fmaxf(chosen, 6.103515625e-5f);
+        float chosen = 0.0f;
         for (int r = 0; r < k; ++r)
-            weights[r] /= norm;
+            chosen += sel_v[r];
+        const float norm = fmaxf(chosen, 6.103515625e-5f);
+        for (int r = 0; r < k; ++r) {
+            ids[r] = sel_i[r];
+            weights[r] = sel_v[r] / norm;
+        }
     }
 }
 

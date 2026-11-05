@@ -7,8 +7,13 @@
 
 namespace torch::runtime {
 
-PleRows::PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file, ReadPool& pool)
-    : config_(config), file_(file), pool_(pool) {
+namespace {
+
+constexpr int kSpareBuffers = 4;  // for reads that lost to their hedge and are still in flight
+
+}  // namespace
+
+PleRows::PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file) : config_(config) {
     const gguf::TensorInfo* t = shard2.tensor("per_layer_token_embd.weight");
     if (t == nullptr || t->n_dims != 2 || t->shape[0] != config.ple_dim ||
         t->type != static_cast<uint32_t>(Type::IQ4_NL))
@@ -20,17 +25,17 @@ PleRows::PleRows(const model::Config& config, const gguf::File& shard2, const Di
     }
     table_offset_ = shard2.data_offset() + t->offset;
     row_bytes_ = t->row_bytes();
-    for (int h = 0; h < config.ple_heads(); ++h) {
-        auto* buffer = static_cast<uint8_t*>(std::aligned_alloc(kPage, 2 * kPage));
-        if (buffer == nullptr)
-            throw Error("Out of memory for the PLE read buffers.");
-        buffers_.push_back(buffer);
-    }
+    const int count = config.ple_heads() + kSpareBuffers;
+    buffers_ = static_cast<uint8_t*>(std::aligned_alloc(kPage, static_cast<size_t>(count) * 2 * kPage));
+    if (buffers_ == nullptr)
+        throw Error("Out of memory for the PLE read buffers.");
+    reads_ = std::make_unique<HedgedReads>(file, config.ple_heads());
+    reads_->add_pool(buffers_, 2 * kPage, count);
 }
 
 PleRows::~PleRows() {
-    for (uint8_t* b : buffers_)
-        std::free(b);
+    reads_.reset();  // waits for reads still in flight before their buffers are freed
+    std::free(buffers_);
 }
 
 std::vector<uint64_t> PleRows::row_ids(const model::Config& c, std::span<const int32_t> history, size_t i) {
@@ -58,12 +63,20 @@ std::vector<uint64_t> PleRows::row_ids(const model::Config& c, std::span<const i
 
 void PleRows::read(std::span<const int32_t> history, size_t i, float* out) {
     const std::vector<uint64_t> rows = row_ids(config_, history, i);
-    pool_.run(config_.ple_heads(), [&](int h) {
-        const uint8_t* row = file_.read(table_offset_ + rows[static_cast<size_t>(h)] * row_bytes_, row_bytes_,
-                                        buffers_[static_cast<size_t>(h)]);
-        dequant_row(Type::IQ4_NL, row, config_.ple_dim,
-                    out + static_cast<size_t>(h) * static_cast<size_t>(config_.ple_dim));
-    });
+    const size_t heads = rows.size();
+    std::vector<HedgedReads::Request> requests(heads);
+    for (size_t h = 0; h < heads; ++h)
+        requests[h] = {0, table_offset_ + rows[h] * row_bytes_, row_bytes_};
+    std::vector<const uint8_t*> data(heads);
+    reads_->read_all(requests, data);
+    for (size_t h = 0; h < heads; ++h) {
+        if (data[h] == nullptr) {
+            reads_->release();
+            throw Error("A read of the PLE rows from shard 2 failed; check the SSD and the file.");
+        }
+        dequant_row(Type::IQ4_NL, data[h], config_.ple_dim, out + h * static_cast<size_t>(config_.ple_dim));
+    }
+    reads_->release();
 }
 
 }  // namespace torch::runtime

@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,7 @@
 
 #include "core/cuda_check.h"
 #include "core/error.h"
+#include "core/placement.h"
 #include "formats/dequant.h"
 #include "kernels/attention/attention.h"
 #include "kernels/deltanet/deltanet.h"
@@ -19,6 +21,7 @@
 #include "kernels/moe/moe.h"
 #include "kernels/norm/norm.h"
 #include "kernels/ple/ple.h"
+#include "kernels/sampling/argmax.h"
 #include "model/weights.h"
 #include "runtime/direct_io.h"
 #include "runtime/expert_store.h"
@@ -29,7 +32,7 @@ namespace {
 
 using kernels::BlockQ8;
 
-constexpr int kReadThreads = 8;
+constexpr int kReadThreads = 16;  // 128 KiB reads reach ~5.4 GB/s at queue depth 16 (bench/ssd_reads.cpp)
 
 using Clock = std::chrono::steady_clock;
 double ms(Clock::duration d) {
@@ -68,11 +71,12 @@ struct Buffers {
     float *res, *xn, *lo, *hc_gate, *mixed, *inject, *out;
     float *embd, *ple_embd;
     float *qkv, *z, *beta, *alpha, *conv_out, *o;
-    float *q, *k, *v, *attn;
+    float *q, *k, *v, *attn, *attn_scratch;
     float *router, *weights, *h, *y, *shared_g, *shared_u, *shared_h, *shared_y, *shared_gate;
     int32_t* ids;
     float *key, *key_n, *value, *query, *ple_gate, *gated, *ple_x;
     float* logits;
+    kernels::ArgmaxResult *argmax, *argmax_scratch;
     BlockQ8 *q8, *q8_h;
 
     void lay_out(DeviceLayout& d, const Config& c, int context) {
@@ -106,6 +110,7 @@ struct Buffers {
         conv_out = d.take<float>(CC), o = d.take<float>(V);
         q = d.take<float>(2 * static_cast<size_t>(c.n_head * c.head_dim)), k = d.take<float>(KV);
         v = d.take<float>(KV), attn = d.take<float>(static_cast<size_t>(c.n_head * c.head_dim));
+        attn_scratch = d.take<float>(static_cast<size_t>(kernels::attention_scratch_floats(c.n_head, context)));
         router = d.take<float>(static_cast<size_t>(c.n_expert)), weights = d.take<float>(K);
         ids = d.take<int32_t>(K), h = d.take<float>(K * FF), y = d.take<float>(K * E);
         const size_t SH = static_cast<size_t>(c.n_ff_shared);
@@ -114,20 +119,22 @@ struct Buffers {
         key = d.take<float>(HCD), key_n = d.take<float>(HCD), value = d.take<float>(E), query = d.take<float>(HCD);
         ple_gate = d.take<float>(static_cast<size_t>(c.hc)), gated = d.take<float>(HCD), ple_x = d.take<float>(HCD);
         logits = d.take<float>(static_cast<size_t>(c.n_vocab));
+        argmax = d.take<kernels::ArgmaxResult>(1),
+        argmax_scratch = d.take<kernels::ArgmaxResult>(kernels::kArgmaxBlocks);
         q8 = d.take<BlockQ8>(HCD / 32), q8_h = d.take<BlockQ8>(K * FF / 32);
     }
 };
 
 // Pinned host memory the GPU copies to and from.
 struct HostBuffers {
-    float* inputs;  // the token embedding, then the PLE rows
-    int32_t* ids;   // a layer's routing
-    int32_t* pos;
     float* logits;
+    float* inputs;  // the token embedding, then the PLE rows
+    kernels::ArgmaxResult* argmax;
+    int32_t* pos;
 
     static uint64_t bytes(const Config& c) {
         return (2 * static_cast<uint64_t>(c.n_embd) + static_cast<uint64_t>(c.n_vocab)) * sizeof(float) +
-               (static_cast<uint64_t>(c.n_expert_used) + 1) * sizeof(int32_t);
+               sizeof(kernels::ArgmaxResult) + sizeof(int32_t);
     }
 };
 
@@ -140,6 +147,7 @@ struct Model::Impl {
     int context;
     runtime::ReadPool pool{kReadThreads};
     Budget budget;
+    RouteCounts ranking;  // the order experts are made resident in, without --resident
     std::unique_ptr<Weights> weights;
     std::unique_ptr<runtime::ExpertStore> store;
     std::unique_ptr<runtime::PleRows> ple;
@@ -153,9 +161,16 @@ struct Model::Impl {
     DecodeTimes times;
     // TORCH_DUMP=1: after every stage, one line on stderr with the stage's sum, mean |x| and count of non-finite
     // values, for bisecting numerics. TORCH_DUMP_DIR=dir also writes each stage's values to
-    // dir/<position>-<layer>-<stage>.f32. Slow: every stage waits for the GPU.
+    // dir/<position>-<layer>-<stage>.f32. TORCH_DUMP_STAGES=a,b limits both to those stages. Slow: every dumped stage
+    // waits for the GPU.
     const char* dump_dir = std::getenv("TORCH_DUMP_DIR");
+    const std::string dump_stages =
+        std::getenv("TORCH_DUMP_STAGES") ? std::string(",") + std::getenv("TORCH_DUMP_STAGES") + "," : "";
     const bool dumping = std::getenv("TORCH_DUMP") != nullptr || dump_dir != nullptr;
+    // A token runs as one replayed CUDA graph; TORCH_EAGER=1 (and the stage dumps) launch kernel by kernel instead.
+    const bool eager = dumping || std::getenv("TORCH_EAGER") != nullptr;
+    cudaGraphExec_t graph = nullptr;
+    bool want_logits = true;
     int layer_ = -1;  // the layer being computed, for dump lines
 
     explicit Impl(const Options& o)
@@ -165,6 +180,7 @@ struct Model::Impl {
           file2(o.shard2),
           cfg(Config::read(shard1)),
           context(o.context) {
+        want_logits = o.logits;
         if (context < 1 || context > cfg.indexer_top_k)
             throw Error("The context must be between 1 and " + std::to_string(cfg.indexer_top_k) +
                         " tokens in this version, where attention is computed densely.");
@@ -176,12 +192,12 @@ struct Model::Impl {
             {"weights other than routed experts", Weights::base_bytes(cfg, shard1)},
             {"KV cache, DeltaNet state and activations (" + std::to_string(context) + " tokens)",
              dry.used() + HostBuffers::bytes(cfg)},
-            {"expert staging (" + std::to_string(cfg.n_expert_used) + " slots) and tables",
-             runtime::ExpertStore::staging_bytes(cfg, shard1, cfg.n_expert_used)},
+            {"expert staging (" + std::to_string(cfg.n_expert_used) + " slots), map and tables",
+             runtime::ExpertStore::fixed_bytes(cfg, shard1)},
             {"CUDA context and allocator slack", kCudaContext},
         };
-        budget = plan_budget(mem_available(), kFreeFloor, std::move(reservations), Weights::expert_bytes(cfg, shard1),
-                             cfg.n_expert, o.resident);
+        budget = plan_budget(mem_available(), kFreeFloor, std::move(reservations));
+        const Placement placement = place(o);
 
         TORCH_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         kernels::upload_iq_tables();
@@ -195,19 +211,71 @@ struct Model::Impl {
         host = static_cast<uint8_t*>(h);
         hb.logits = reinterpret_cast<float*>(host);
         hb.inputs = hb.logits + cfg.n_vocab;
-        hb.ids = reinterpret_cast<int32_t*>(hb.inputs + 2 * cfg.n_embd);
-        hb.pos = hb.ids + cfg.n_expert_used;
+        hb.argmax = reinterpret_cast<kernels::ArgmaxResult*>(hb.inputs + 2 * cfg.n_embd);
+        hb.pos = reinterpret_cast<int32_t*>(hb.argmax + 1);
 
-        weights = std::make_unique<Weights>(cfg, shard1, file1, budget.resident, pool);
-        store = std::make_unique<runtime::ExpertStore>(cfg, weights->layers, file1, budget.resident, cfg.n_expert_used,
-                                                       pool);
-        ple = std::make_unique<runtime::PleRows>(cfg, shard2, file2, pool);
+        weights = std::make_unique<Weights>(cfg, shard1, file1, pool);
+        store = std::make_unique<runtime::ExpertStore>(cfg, weights->layers, file1, placement.resident);
+        ple = std::make_unique<runtime::PleRows>(cfg, shard2, file2);
+        if (!o.resident)
+            top_up(placement);
         reset();
+    }
+
+    // Measures MemAvailable now that everything is allocated and makes the next-ranked experts resident until it is
+    // down to the floor plus kTopUpMargin (budget.h). Output does not change, only the hit rate.
+    void top_up(const Placement& placement) {
+        budget.available_after_load = mem_available();
+        const uint64_t keep = budget.floor + kTopUpMargin;
+        if (budget.available_after_load <= keep)
+            return;
+        const Placement more = extend_ranked(ranking, runtime::ExpertStore::layer_expert_bytes(cfg, shard1), placement,
+                                             budget.available_after_load - keep);
+        store->add(more.resident);
+        budget.added = more.count();
+        budget.added_bytes = more.bytes;
+    }
+
+    // Which experts are resident: exactly --resident per layer, the most-routed in Options::placement, or as many of
+    // every layer's first experts as fit. Fills in the budget's placement lines and the ranking top_up() continues.
+    Placement place(const Options& o) {
+        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
+        Placement p;
+        if (o.resident) {
+            if (*o.resident < 0 || *o.resident > cfg.n_expert)
+                throw Error("--resident must be between 0 and " + std::to_string(cfg.n_expert) + ".");
+            p = place_uniform(*o.resident, cfg.n_expert, bytes);
+            if (p.bytes > budget.room())
+                throw Error("Only " + std::to_string(uniform_capacity(budget.room(), cfg.n_expert, bytes)) +
+                            " experts per layer fit in free memory, not " + std::to_string(*o.resident) +
+                            "; ask for fewer with --resident.");
+            budget.placement = *o.resident == 0
+                                   ? "no experts resident (--resident 0)"
+                                   : "experts 0 to " + std::to_string(*o.resident - 1) + " of every layer (--resident)";
+        } else if (!o.placement.empty()) {
+            const RouteCounts counts = RouteCounts::read(o.placement);
+            if (counts.n_layer != cfg.n_layer || counts.n_expert != cfg.n_expert)
+                throw Error("The route counts in " + o.placement.string() + " were recorded with another model.");
+            p = place_ranked(counts, bytes, budget.room());
+            budget.placement = "the most-routed experts in " + o.placement.string();
+            ranking = counts;
+        } else {
+            const int k = uniform_capacity(budget.room(), cfg.n_expert, bytes);
+            p = place_uniform(k, cfg.n_expert, bytes);
+            budget.placement = "experts 0 to " + std::to_string(k - 1) + " of every layer (no route counts given)";
+            ranking = uniform_ranking(cfg.n_layer, cfg.n_expert);
+        }
+        budget.resident = p.count();
+        budget.experts = cfg.n_layer * cfg.n_expert;
+        budget.resident_bytes = p.bytes;
+        return p;
     }
 
     ~Impl() {
         if (stream)
             cudaStreamSynchronize(stream);
+        if (graph)
+            cudaGraphExecDestroy(graph);
         if (device)
             cudaFree(device);
         if (host)
@@ -217,7 +285,7 @@ struct Model::Impl {
     }
 
     void dump(const char* stage, int layer, const float* d, int n) {
-        if (!dumping)
+        if (!dumping || (!dump_stages.empty() && dump_stages.find(std::string(",") + stage + ",") == std::string::npos))
             return;
         std::vector<float> h(static_cast<size_t>(n));
         TORCH_CUDA_CHECK(cudaMemcpyAsync(h.data(), d, sizeof(float) * h.size(), cudaMemcpyDeviceToHost, stream));
@@ -252,25 +320,71 @@ struct Model::Impl {
     }
 
     // y = m . x: BF16 weights take x as F32, quantized weights take it quantized to Q8 (gemv.h).
-    void matvec(const Matrix& m, const float* x, float* y) {
-        if (m.type == Type::BF16) {
-            kernels::gemv_bf16(m.data, m.rows, m.cols, x, y, stream);
-        } else {
-            kernels::quantize_q8(x, m.cols, b.q8, stream);
-            kernels::gemv_q8(m.type, m.data, m.rows, m.cols, b.q8, y, stream);
+    void matvec(const Matrix& m, const float* x, float* y, bool quantized = false) {
+        products(x, {{&m, y}}, quantized);
+    }
+
+    // y_i = m_i . x for matrices that read the same x (at most 4, one width): x is quantized once into b.q8 for the
+    // quantized ones, which share one launch when gemv_q8_group takes their formats; two BF16 ones share one too.
+    // `quantized`: the kernel that wrote x also wrote it to b.q8 (hc_collapse for b.mixed, rms_norm_q8), so the
+    // products of a block's b.mixed run before any product of another vector replaces b.q8.
+    struct Product {
+        const Matrix* m;
+        float* y;
+    };
+    void products(const float* x, std::initializer_list<Product> list, bool quantized = false) {
+        Product bf16[4], q8[4];
+        kernels::Q8Part parts[4];
+        int nb = 0, nq = 0, np = 0;
+        for (const Product& p : list)
+            (p.m->type == Type::BF16 ? bf16[nb++] : q8[nq++]) = p;
+        if (nq > 0 && !quantized)
+            kernels::quantize_q8(x, q8[0].m->cols, b.q8, stream);
+        for (int i = 0; i < nq; ++i) {
+            const Matrix& m = *q8[i].m;
+            if (nq > 1 && kernels::gemv_q8_groups(m.type))
+                parts[np++] = {m.type, m.data, m.rows, q8[i].y};
+            else
+                kernels::gemv_q8(m.type, m.data, m.rows, m.cols, b.q8, q8[i].y, stream);
+        }
+        if (np == 1)
+            kernels::gemv_q8(parts[0].type, parts[0].w, parts[0].rows, q8[0].m->cols, b.q8, parts[0].y, stream);
+        else if (np > 1)
+            kernels::gemv_q8_group(parts, np, q8[0].m->cols, b.q8, false, stream);
+        for (int i = 0; i < nb; i += 2) {
+            const Matrix& m = *bf16[i].m;
+            if (i + 1 < nb)
+                kernels::gemv_bf16_pair(m.data, m.rows, bf16[i + 1].m->data, bf16[i + 1].m->rows, m.cols, x, bf16[i].y,
+                                        bf16[i + 1].y, stream);
+            else
+                kernels::gemv_bf16(m.data, m.rows, m.cols, x, bf16[i].y, stream);
         }
     }
 
     // A hyper-connection mixer: the hc streams of the residual, normalized, mixed into one block input (b.mixed),
-    // and, when `inject` is given, the block output's per-stream weights (b.inject).
-    void hc_mix(const float* norm, const Matrix& down, const Matrix& up, const Matrix* inject) {
+    // and, when `inject` is given, the block output's per-stream weights (b.inject). With `combine`, the previous
+    // block's output (b.out, weighted by b.inject) is first added to the residual, in the same launch as the norm.
+    void hc_mix(const float* norm, const Matrix& down, const Matrix& up, const Matrix* inject, bool combine) {
         const int E = cfg.n_embd;
-        kernels::rms_norm(b.res, E, norm, E, nullptr, 0, b.xn, E, E, cfg.hc, cfg.eps, stream);
-        matvec(down, b.xn, b.lo);
-        kernels::silu_scale(b.lo, cfg.hc_rank, 1.0f / static_cast<float>(cfg.hc), stream);
+        if (combine)
+            kernels::hc_combine_norm(b.res, b.out, b.inject, norm, b.xn, E, cfg.hc, cfg.eps, stream);
+        else
+            kernels::rms_norm(b.res, E, norm, E, nullptr, 0, b.xn, E, E, cfg.hc, cfg.eps, stream);
+        // A BF16 down projection applies the low-rank SiLU as it stores; BF16 inject rows read the same input, so
+        // they share its launch.
+        const float scale = 1.0f / static_cast<float>(cfg.hc);
+        const bool paired =
+            inject && down.type == Type::BF16 && inject->type == Type::BF16 && inject->cols == down.cols;
+        if (down.type == Type::BF16) {
+            kernels::gemv_bf16_pair(down.data, down.rows, paired ? inject->data : nullptr, paired ? inject->rows : 0,
+                                    down.cols, b.xn, b.lo, b.inject, stream, scale);
+        } else {
+            matvec(down, b.xn, b.lo);
+            kernels::silu_scale(b.lo, cfg.hc_rank, scale, stream);
+        }
         matvec(up, b.lo, b.hc_gate);
-        kernels::hc_collapse(b.xn, b.hc_gate, b.mixed, E, cfg.hc, stream);
-        if (inject)
+        kernels::hc_collapse(b.xn, b.hc_gate, b.mixed, b.q8, E, cfg.hc, stream);
+        if (inject && !paired)
             matvec(*inject, b.xn, b.inject);
         dump("hc_norm", layer_, b.xn, cfg.hc * E);
         dump("hc_lo", layer_, b.lo, cfg.hc_rank);
@@ -296,43 +410,33 @@ struct Model::Impl {
     void deltanet(const Layer& L, int il) {
         const int DS = cfg.ssm_head_dim, QK = cfg.ssm_k_heads * DS, HV = cfg.ssm_v_heads;
         const size_t l = static_cast<size_t>(il);
-        matvec(L.qkv, b.mixed, b.qkv);
-        matvec(L.z, b.mixed, b.z);
-        matvec(L.beta, b.mixed, b.beta);
-        matvec(L.alpha, b.mixed, b.alpha);
+        products(b.mixed, {{&L.qkv, b.qkv}, {&L.z, b.z}, {&L.beta, b.beta}, {&L.alpha, b.alpha}}, true);
         dump("qkv", layer_, b.qkv, cfg.conv_channels());
         dump("z", layer_, b.z, HV * DS);
         dump("beta_alpha", layer_, b.beta, HV);
-        kernels::conv_silu(b.conv_state[l], b.qkv, L.conv, b.conv_out, cfg.conv_channels(), stream);
+        // q and k are L2-normalized in the convolution's launch; the gates are computed in gdn_step's
+        kernels::conv_silu_l2(b.conv_state[l], b.qkv, L.conv, b.conv_out, cfg.conv_channels(), 2 * QK, cfg.eps, stream);
         dump("conv_w", layer_, L.conv, cfg.ssm_conv * cfg.conv_channels());
-        dump("conv_raw", layer_, b.conv_out, cfg.conv_channels());
-        kernels::l2_norm(b.conv_out, DS, b.conv_out, DS, DS, 2 * cfg.ssm_k_heads, cfg.eps, stream);  // q and k
-        kernels::gdn_gates(b.beta, b.alpha, L.dt_bias, L.a, HV, stream);
-        dump("gdn_beta", layer_, b.beta, HV);
-        kernels::gdn_step(b.ssm_state[l], b.conv_out, b.conv_out + QK, b.conv_out + 2 * QK, b.alpha, b.beta, b.o,
-                          cfg.ssm_k_heads, HV, 1.0f / std::sqrt(static_cast<float>(DS)), stream);
         dump("conv_l2", layer_, b.conv_out, cfg.conv_channels());
+        kernels::gdn_step(b.ssm_state[l], b.conv_out, b.conv_out + QK, b.conv_out + 2 * QK, b.alpha, b.beta, L.dt_bias,
+                          L.a, b.o, cfg.ssm_k_heads, HV, 1.0f / std::sqrt(static_cast<float>(DS)), stream);
+        dump("gdn_beta", layer_, b.beta, HV);
         dump("gdn_g", layer_, b.alpha, HV);
         dump("gdn_out", layer_, b.o, HV * DS);
-        kernels::rms_norm(b.o, DS, L.ssm_norm, 0, b.z, DS, b.o, DS, DS, HV, cfg.eps, stream);
+        kernels::rms_norm_q8(b.o, DS, L.ssm_norm, 0, b.z, DS, b.o, DS, b.q8, DS, HV, cfg.eps, stream);
         dump("gdn_norm", layer_, b.o, HV * DS);
-        matvec(L.ssm_out, b.o, b.out);
+        matvec(L.ssm_out, b.o, b.out, true);
         dump("linear_attn_out", layer_, b.out, cfg.n_embd);
     }
 
     void attention(const Layer& L, int il) {
         const int D = cfg.head_dim, H = cfg.n_head, HKV = cfg.n_head_kv;
         const size_t l = static_cast<size_t>(il);
-        matvec(L.wq, b.mixed, b.q);  // per head [q | gate]
-        matvec(L.wk, b.mixed, b.k);
-        matvec(L.wv, b.mixed, b.v);
-        kernels::rms_norm(b.q, 2 * D, L.q_norm, 0, nullptr, 0, b.q, 2 * D, D, H, cfg.eps, stream);
-        kernels::rms_norm(b.k, D, L.k_norm, 0, nullptr, 0, b.k, D, D, HKV, cfg.eps, stream);
-        kernels::rope_neox(b.q, 2 * D, H, cfg.n_rot, b.pos, cfg.rope_base, stream);
-        kernels::rope_neox(b.k, D, HKV, cfg.n_rot, b.pos, cfg.rope_base, stream);
-        kernels::store_kv(b.k, b.v, b.k_cache[l], b.v_cache[l], HKV * D, b.pos, stream);
-        kernels::attention_decode(b.q, b.q + D, 2 * D, b.k_cache[l], b.v_cache[l], b.attn, b.pos, H, HKV,
-                                  1.0f / std::sqrt(static_cast<float>(D)), context, stream);
+        products(b.mixed, {{&L.wq, b.q}, {&L.wk, b.k}, {&L.wv, b.v}}, true);  // q: per head [q | gate]
+        kernels::qk_norm_rope_store(b.q, 2 * D, L.q_norm, b.k, L.k_norm, b.v, b.k_cache[l], b.v_cache[l], H, HKV,
+                                    cfg.n_rot, b.pos, cfg.rope_base, cfg.eps, stream);
+        kernels::attention_decode(b.q, b.q + D, 2 * D, b.k_cache[l], b.v_cache[l], b.attn, b.attn_scratch, b.pos, H,
+                                  HKV, 1.0f / std::sqrt(static_cast<float>(D)), context, stream);
         dump("attn", layer_, b.attn, H * D);
         matvec(L.wo, b.attn, b.out);
         dump("attn_out", layer_, b.out, cfg.n_embd);
@@ -340,29 +444,32 @@ struct Model::Impl {
 
     void experts(const Layer& L, int il) {
         const int E = cfg.n_embd, K = cfg.n_expert_used, FF = cfg.n_ff_expert;
-        matvec(L.router, b.mixed, b.router);
+        products(b.mixed, {{&L.router, b.router}, {&L.shared_gate_inp, b.shared_gate}}, true);
         dump("router", layer_, b.router, cfg.n_expert);
         kernels::router_top_k(b.router, cfg.n_expert, K, b.ids, b.weights, stream);
-        // The host needs the routing to place the experts: the one wait per layer (see model.h).
-        TORCH_CUDA_CHECK(
-            cudaMemcpyAsync(hb.ids, b.ids, sizeof(int32_t) * static_cast<size_t>(K), cudaMemcpyDeviceToHost, stream));
-        const auto wait_start = Clock::now();
-        TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
-        const auto read_start = Clock::now();
-        const runtime::ExpertStore::Tables t = store->prepare(il, {hb.ids, static_cast<size_t>(K)});
-        times.routing += ms(read_start - wait_start);
-        times.expert_reads += ms(Clock::now() - read_start);
+        // The layer's expert pointer table is written on the GPU; misses are read by the store's I/O thread.
+        const int slots = store->slots();
+        const uint8_t** table = store->table(il);
+        runtime::expert_gate(b.ids, K, il, store->map(), cfg.n_expert, table, slots, store->mailbox(), store->seq(),
+                             store->counters(), store->route_counts(), store->zeros(), stream);
 
-        kernels::quantize_q8(b.mixed, E, b.q8, stream);
-        kernels::gemv_q8_experts(L.gate_exps.type, t.gate, t.up, K, FF, E, b.q8, 0, b.h, stream);
+        // the routed and the shared experts' gate and up read b.mixed as hc_collapse quantized it
+        kernels::gemv_q8_experts(L.gate_exps.type, table, table + slots, K, FF, E, b.q8, 0, b.h, stream);
+        const Matrix &sg = L.shared_gate, &su = L.shared_up;
+        if (kernels::gemv_q8_groups(sg.type) && kernels::gemv_q8_groups(su.type) && sg.rows == su.rows) {
+            const kernels::Q8Part parts[2] = {{sg.type, sg.data, sg.rows, b.shared_h},
+                                              {su.type, su.data, su.rows, nullptr}};
+            kernels::gemv_q8_group(parts, 2, E, b.q8, true, stream);
+        } else {
+            kernels::gemv_q8(sg.type, sg.data, sg.rows, E, b.q8, b.shared_g, stream);
+            kernels::gemv_q8(su.type, su.data, su.rows, E, b.q8, b.shared_u, stream);
+            kernels::swiglu(b.shared_g, b.shared_u, b.shared_h, cfg.n_ff_shared, stream);
+        }
+        // b.h and b.shared_h are quantized by their own launches: writing them as Q8 from gate and up measured slower
+        // (+5-9 us a routed launch, +0.15-0.3 ms a token against 0.14 ms of quantize_q8; branch m3-gemv-q8-epilogues).
         kernels::quantize_q8(b.h, int64_t{K} * FF, b.q8_h, stream);
-        kernels::gemv_q8_experts(L.down_exps.type, t.down, nullptr, K, E, FF, b.q8_h, FF / 32, b.y, stream);
-
-        matvec(L.shared_gate, b.mixed, b.shared_g);
-        matvec(L.shared_up, b.mixed, b.shared_u);
-        kernels::swiglu(b.shared_g, b.shared_u, b.shared_h, cfg.n_ff_shared, stream);
+        kernels::gemv_q8_experts(L.down_exps.type, table + 2 * slots, nullptr, K, E, FF, b.q8_h, FF / 32, b.y, stream);
         matvec(L.shared_down, b.shared_h, b.shared_y);
-        matvec(L.shared_gate_inp, b.mixed, b.shared_gate);
         kernels::moe_combine(b.y, b.weights, K, b.shared_y, b.shared_gate, b.out, E, stream);
         dump("experts_h", layer_, b.h, K * FF);
         dump("experts_y", layer_, b.y, K * E);
@@ -370,24 +477,9 @@ struct Model::Impl {
         dump("ffn_out", layer_, b.out, E);
     }
 
-    std::span<const float> decode(int32_t token) {
-        const auto start = Clock::now();
-        if (token < 0 || token >= cfg.n_vocab)
-            throw Error("Token id " + std::to_string(token) + " is outside the vocabulary of " +
-                        std::to_string(cfg.n_vocab) + ".");
-        if (static_cast<int>(history.size()) >= context)
-            throw Error("The context of " + std::to_string(context) + " tokens is full; start a new sequence.");
+    // Everything the GPU does for one token, on `stream`: run directly, or recorded once into the token's graph.
+    void enqueue() {
         const int E = cfg.n_embd;
-        const size_t pos = history.size();
-        history.push_back(token);
-
-        // The token embedding and the PLE rows are single rows: the CPU dequantizes them to F32 and uploads them.
-        const Matrix& te = weights->token_embd;
-        dequant_row(te.type, te.data + static_cast<uint64_t>(token) * te.row_bytes(), E, hb.inputs);
-        const auto ple_start = Clock::now();
-        ple->read(history, pos, hb.inputs + E);
-        times.ple += ms(Clock::now() - ple_start);
-        *hb.pos = static_cast<int32_t>(pos);
         TORCH_CUDA_CHECK(cudaMemcpyAsync(b.pos, hb.pos, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TORCH_CUDA_CHECK(
             cudaMemcpyAsync(b.embd, hb.inputs, sizeof(float) * static_cast<size_t>(E), cudaMemcpyHostToDevice, stream));
@@ -398,35 +490,97 @@ struct Model::Impl {
         layer_ = -1;
         dump("embd", layer_, b.embd, E);
         dump("ple_rows", layer_, b.ple_embd, E);
+        // A block's output is added to the residual in the next mixer's norm launch (hc_combine_norm), except before a
+        // PLE block, which reads the residual first, and when dumping stages, which shows the residual per layer.
+        bool pending = false;  // b.out and b.inject still to be added to b.res
+        const auto settle = [&] {
+            if (pending)
+                kernels::hc_combine(b.res, b.out, b.inject, E, cfg.hc, stream);
+            pending = false;
+        };
         for (int il = 0; il < cfg.n_layer; ++il) {
             const Layer& L = weights->layers[static_cast<size_t>(il)];
             layer_ = il;
-            if (L.ple)
+            if (L.ple) {
+                settle();
                 ple_block(L);
-            hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject);
+            }
+            hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, pending);
             if (L.recurrent)
                 deltanet(L, il);
             else
                 attention(L, il);
-            kernels::hc_combine(b.res, b.out, b.inject, E, cfg.hc, stream);
-            hc_mix(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, &L.hc_ffn_inject);
+            hc_mix(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, &L.hc_ffn_inject, true);
             experts(L, il);
-            kernels::hc_combine(b.res, b.out, b.inject, E, cfg.hc, stream);
-            dump("residual", layer_, b.res, cfg.hc * E);
+            pending = true;
+            if (dumping) {
+                settle();
+                dump("residual", layer_, b.res, cfg.hc * E);
+            }
         }
         layer_ = -1;
         // The head's mixer is the output norm: there is no separate one.
-        hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr);
-        matvec(weights->output, b.mixed, b.logits);
+        hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending);
+        matvec(weights->output, b.mixed, b.logits, true);
         dump("logits", layer_, b.logits, cfg.n_vocab);
-        TORCH_CUDA_CHECK(cudaMemcpyAsync(hb.logits, b.logits, sizeof(float) * static_cast<size_t>(cfg.n_vocab),
-                                         cudaMemcpyDeviceToHost, stream));
-        const auto finish_start = Clock::now();
+        kernels::argmax(b.logits, cfg.n_vocab, b.argmax_scratch, b.argmax, stream);
+        TORCH_CUDA_CHECK(
+            cudaMemcpyAsync(hb.argmax, b.argmax, sizeof(kernels::ArgmaxResult), cudaMemcpyDeviceToHost, stream));
+        if (want_logits)
+            TORCH_CUDA_CHECK(cudaMemcpyAsync(hb.logits, b.logits, sizeof(float) * static_cast<size_t>(cfg.n_vocab),
+                                             cudaMemcpyDeviceToHost, stream));
+    }
+
+    void decode(int32_t token) {
+        const auto start = Clock::now();
+        if (token < 0 || token >= cfg.n_vocab)
+            throw Error("Token id " + std::to_string(token) + " is outside the vocabulary of " +
+                        std::to_string(cfg.n_vocab) + ".");
+        if (static_cast<int>(history.size()) >= context)
+            throw Error("The context of " + std::to_string(context) + " tokens is full; start a new sequence.");
+        const int E = cfg.n_embd;
+        const size_t pos = history.size();
+        history.push_back(token);
+
+        // The token embedding and the PLE rows are single rows: the CPU dequantizes them to F32 into pinned memory,
+        // which the token's first copies read.
+        const Matrix& te = weights->token_embd;
+        dequant_row(te.type, te.data + static_cast<uint64_t>(token) * te.row_bytes(), E, hb.inputs);
+        const auto ple_start = Clock::now();
+        ple->read(history, pos, hb.inputs + E);
+        const double ple_ms = ms(Clock::now() - ple_start);
+        times.ple += ple_ms;
+        times.ple_max = std::max(times.ple_max, ple_ms);
+        times.ple_slow += ple_ms > 5.0 ? 1 : 0;
+        *hb.pos = static_cast<int32_t>(pos);
+
+        if (eager) {
+            enqueue();
+        } else {
+            if (graph == nullptr) {  // recorded at the first token; every pointer it bakes in stays fixed
+                cudaGraph_t g = nullptr;
+                TORCH_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                try {
+                    enqueue();
+                } catch (...) {
+                    cudaStreamEndCapture(stream, &g);  // leave the stream usable; the half-recorded graph is dropped
+                    if (g)
+                        cudaGraphDestroy(g);
+                    throw;
+                }
+                TORCH_CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+                const cudaError_t made = cudaGraphInstantiate(&graph, g, 0);
+                cudaGraphDestroy(g);
+                TORCH_CUDA_CHECK(made);
+            }
+            TORCH_CUDA_CHECK(cudaGraphLaunch(graph, stream));
+        }
+        const auto gpu_start = Clock::now();
         TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
         TORCH_CUDA_CHECK(cudaGetLastError());
-        times.finish += ms(Clock::now() - finish_start);
+        store->check();
+        times.gpu += ms(Clock::now() - gpu_start);
         times.total += ms(Clock::now() - start);
-        return {hb.logits, static_cast<size_t>(cfg.n_vocab)};
     }
 };
 
@@ -442,25 +596,49 @@ const Budget& Model::budget() const noexcept {
 }
 
 DecodeTimes Model::decode_times() const noexcept {
-    return impl_->times;
+    DecodeTimes t = impl_->times;
+    t.expert_reads = impl_->store->read_ms();
+    t.ple_hedged = impl_->ple->hedged_reads();
+    return t;
 }
 
-ExpertStats Model::expert_stats() const noexcept {
-    return {impl_->store->resident(), impl_->store->hits(), impl_->store->misses()};
+ExpertStats Model::expert_stats() const {
+    const auto [hits, misses] = impl_->store->hits_and_misses();
+    return {impl_->budget.resident + impl_->budget.added, impl_->budget.experts, hits, misses,
+            impl_->store->hedged_reads()};
+}
+
+RouteCounts Model::route_counts() const {
+    RouteCounts c;
+    c.n_layer = impl_->cfg.n_layer;
+    c.n_expert = impl_->cfg.n_expert;
+    c.counts = impl_->store->read_route_counts();
+    return c;
 }
 
 int Model::position() const noexcept {
     return static_cast<int>(impl_->history.size());
 }
 
-std::span<const float> Model::decode(int32_t token) noexcept {
+bool Model::decode(int32_t token) noexcept {
     try {
         impl_->error.clear();
-        return impl_->decode(token);
+        impl_->decode(token);
+        return true;
     } catch (const std::exception& e) {
         impl_->error = e.what();
-        return {};
+        return false;
     }
+}
+
+std::span<const float> Model::logits() const noexcept {
+    if (!impl_->want_logits)
+        return {};
+    return {impl_->hb.logits, static_cast<size_t>(impl_->cfg.n_vocab)};
+}
+
+int32_t Model::argmax() const noexcept {
+    return impl_->hb.argmax->index;
 }
 
 const std::string& Model::error() const noexcept {

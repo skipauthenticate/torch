@@ -13,7 +13,7 @@ namespace torch::kernels {
 
 // Softmax over n router logits (n <= 1,024; max-subtracted, expf), then k rounds of argmax in which ties go to the
 // lowest index. ids[r] is the r-th choice, weights[r] = p[ids[r]] / fmaxf(sum of the k chosen p, 6.103515625e-5f),
-// the probabilities renormalized over the chosen experts. Requires k <= n.
+// the probabilities renormalized over the chosen experts. Requires k <= n and k <= 32.
 void router_top_k(const float* logits, int n, int k, int32_t* ids, float* weights, cudaStream_t stream);
 
 // h = silu(g) * u over n values.

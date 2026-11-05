@@ -5,7 +5,7 @@ experts it routes to, and the GPU can stream about 180 GB/s. This page turns tha
 every milestone has a target we can check.
 
 Sizes on this page are in GB (10^9 bytes) so they divide by GB/s; file sizes elsewhere are in GiB. **[file]**,
-**[M2]** and **[est]** mean what they mean in [architecture.md](architecture.md).
+**[M2]**, **[M3]** and **[est]** mean what they mean in [architecture.md](architecture.md).
 
 ## Bytes per token
 
@@ -84,9 +84,11 @@ sessions that extend the previous sequence do not prefill again (architecture de
 
 On the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz), 2026-11-03 and 2026-11-04 [M2]:
 
-- GPU streaming read (`torch_bench_memory`, 1 GiB buffers): 153.6-155.4 GB/s from device memory, 158.2-159.0 GB/s
-  from mapped pinned memory and 157.8 GB/s from registered memory; 150.8 and 154.0 GB/s at 4 GiB. The ~180 GB/s
-  used in the tables above comes from earlier measurements on this board; M3 re-measures the ceiling.
+- GPU streaming (`torch_bench_memory`, 1 GiB buffers, the best launch shape of a sweep, GPU at 1,300 MHz, MAXN),
+  2026-11-04: read 179.8 GB/s from device memory, 179.9 GB/s from mapped pinned memory and 181.4 GB/s from registered
+  memory; copy (both directions counted) 185.3, 180.9 and 188.0 GB/s. The best reads keep 4 independent 16-byte loads
+  in flight per thread in 2 blocks of 512 threads per SM; one load per thread reaches only ~155 GB/s. 180 GB/s is the
+  streaming bandwidth the M3 kernel gates are measured against.
 - SSD `O_DIRECT` random reads (`torch_bench_ssd`, issued as 128 KiB preads, as the engine reads), 2026-11-04:
 
   | Read | Depth 1 | Depth 4 | Depth 16 |
@@ -95,9 +97,44 @@ On the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz), 2026-11-03 and 2026-1
   | 4 KiB: median ms | 0.093 | 0.093 | 0.101 |
 
   Single reads larger than the SSD's 128 KiB transfer limit (WD_BLACK SN850X) sometimes left one request
-  uncompleted until the driver's 30 s timeout (11 of 3,000 reads at depth 1); 128 KiB reads never did.
+  uncompleted until the driver's 30 s timeout (11 of 3,000 reads at depth 1). 128 KiB reads did not in 9,000 tries,
+  but in M3's longer runs about one in 240,000 did, and once a 4 KiB PLE read; the engine therefore issues any read
+  still pending after 50 ms a second time (`runtime/hedged_reads.h`) [M3].
 - Free memory: MemAvailable was 24-29 GiB while other software used the board and 50-51 GiB with it idle. With 51
   GiB the budget keeps 437-439 of 512 experts per layer resident (85%) and loads in 16-20 s.
+- M3 probes, 2026-11-04: a GPU-to-host request through mapped memory and back takes 7.6 us median without a read
+  (`bench/miss_roundtrip.cu`), 0.97 ms with one 1.5-2.7 MB expert read and 2.6 ms (p99 8.9) with ten; a host
+  synchronization per layer took 21.2 us median, 144 us p99. A replayed CUDA graph costs about 1.1 us per kernel
+  (`bench/graph_gaps.cu`); launching a token's ~2,000 kernels one by one took 64 ms of host time.
+- Free memory after loading: MemAvailable fell 37.5 GiB for a planned 45 GiB (loading also frees page cache and idle
+  memory that MemAvailable did not count at start), so the engine measures it again and fills it with experts down
+  to the floor plus 1.5 GiB: 24,000-24,200 of 24,576 resident (98%), runs ending with 7.2-7.7 GiB available [M3].
+- **M3 decode**, 2026-11-04 at commit 2611c30 (`bench/results/2026-11-04-2611c30.json`; the three workloads of
+  [benchmarking.md](benchmarking.md) on their M3 prompts of 1,455-1,520 tokens, 256 generated tokens, greedy, medians
+  of three requests): **code review 25.41, prose 25.68, repetition 24.32 tok/s**, at 99.94-100% routed hits with
+  ~23,900 of 24,576 experts resident; MemAvailable 6.7-8.6 GiB at the end of each request. A token is one CUDA graph
+  of 1,107 kernels: 36.8 ms of kernel time (`bench/results/kernels-2026-11-04-2611c30.json`, mean 148.6 GB/s, 83%
+  of the ceiling) of ~39.4 ms per generated token; the rest is ~1 us per graph node and the 0.35 ms PLE read before
+  each token. Per kernel class, at the start of M3 (`kernels-2026-11-04-790ecbf.json`) and at its end:
+
+  | Kernel | GB/s before | GB/s after | ms per token before | after |
+  | --- | ---: | ---: | ---: | ---: |
+  | BF16 mixer up projections, 10240 x 320 | 93 | 169 | 6.85 | 3.79 |
+  | BF16 mixer down projections + inject | 119 | 164 | 5.49 | 3.95 |
+  | Routed gate+up, IQ2_S / IQ3_XXS / IQ3_S | 71 / 79 / 83 | 122 / 142 / 142 | 7.40 | 4.24 |
+  | Routed down, IQ4_NL / Q2_0 | 93 / 64 | 158 / 134 | 4.59 | 2.63 |
+  | Output head, Q6_K | 140 | 165 | 3.73 | 3.17 |
+  | Other quantized matrices (attention, DeltaNet, shared expert) | 133 | 150 | 16.01 | 14.10 |
+  | Decode attention at position 1,800 | 8 | 90 | 5.50 | 0.50 |
+  | Launches under 1 MiB (count) | 1,463 | 573 | 5.88 | 2.26 |
+  | **Total** (launches) | 2,044 | 1,107 | **55.5** | **36.8** |
+
+  A re-run of the starting point later the same day measured 53.1 ms (its BF16 up projections at 132 GB/s), so the
+  first row's "before" is partly harness variance. M3's gates were not all met: 29 launch classes of 1 MiB or more
+  stay below 85% of the ceiling (most at 150-152 GB/s; IQ2_S gate+up at 122 is limited by its codebook lookups, the
+  shared expert's grouped gate+up at 113-128, attention at 90), the launches under 1 MiB take 2.26 ms (gate 2 ms),
+  and code review runs at 25.4 tok/s (gate 27). M3 merged with these numbers by the maintainer's decision; both gates
+  carry to M4, whose multi-column kernels rewrite these paths [M3].
 - Eager decode (M2, one token per step, one host round trip per layer): 7.77 tok/s, 128.8 ms per token, generating
   64 tokens after a 5-token prompt at 85% expert hits. Per token: 41.5 ms waiting for the GPU up to each router,
   71.8 ms reading the ~71 missed experts (about 1 ms each), 12.7 ms other host work. With every expert read from the
@@ -117,4 +154,5 @@ request; it may not close with a failed gate.
 | M6, long context | | | | 1,000 (about 4 s to the first token) |
 
 M3's 30 tok/s is 86% of the physical ceiling across roughly a thousand launches, which is why its gate is 27:
-that is ambitious [est].
+that is ambitious [est]. M3 measured 25.4 on code review (25.7 prose, 24.3 repetition) and merged below its gate by
+the maintainer's decision; the gate carries to M4.

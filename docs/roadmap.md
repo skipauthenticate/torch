@@ -16,4 +16,8 @@ any speed goal it missed, are written in its pull request. Speed goals are liste
 | **M6** Long context | Sparse indexer attention to 262,144 tokens with pooled keys; F16 KV cache; chunked prefill with the chunked DeltaNet algorithm; sessions that extend the previous sequence; cancel | Needle retrieval at 32K, 128K and 256K; a second turn does not prefill the first (goal: 1,000 prompt tok/s at 4,096) |
 | **M7** First release | `torch_server` (OpenAI-compatible: tokenizer, chat template, sampling, streaming); `torch inspect --export-tokenizer`; install script; model-file verification; v0.1.0 | End-to-end install on a fresh Orin; every file in [model-files.md](model-files.md) verified by sha256 |
 
+M3 merged on 2026-11-04 below two of its gates, by the maintainer's decision: 25.4 tok/s on code review against 27,
+and 29 launch classes of 1 MiB or more below 85% of the streaming ceiling ([performance.md](performance.md#measured-so-far)
+has the numbers). Both carry to M4 as goals, since its multi-column kernels rewrite the same paths.
+
 Contributions that move a milestone forward are welcome; see [CONTRIBUTING.md](../CONTRIBUTING.md).

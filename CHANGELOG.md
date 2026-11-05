@@ -7,6 +7,23 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Milestone M3, fast decode of one token at a time:
+  - Each token runs as one CUDA graph. After each router a gate kernel writes the layer's expert pointer table on
+    the GPU from a device map of resident experts; misses go through a mailbox in mapped memory to the expert store's
+    I/O thread, so the host never synchronizes inside a token (`src/runtime/expert_gate.h`). Greedy argmax on the GPU.
+  - Ranked expert placement from recorded route counts (`--route-counts`, `--placement`, `src/core/placement.h`),
+    then topped up after loading from a fresh MemAvailable reading down to the floor plus 1.5 GiB.
+  - Hedged reads for expert misses and PLE rows (`src/runtime/hedged_reads.h`): a read still pending after 50 ms is
+    issued again, because the development SSD occasionally leaves one uncompleted for 30 s.
+  - Kernels: BF16 short rows four per warp with the inject rows in the down projection's launch; one quantized GEMV
+    for dense rows and experts alike; grouped launches for matrices that share an input, each input quantized once
+    and written as Q8 by the kernel that produces it; split-K decode attention; the residual update fused into the
+    next norm; the DeltaNet gates and q/k norm fused into their neighbors; the router ranked by counting.
+  - Benchmarks: the three workloads as committed token ids and their driver (`bench/workloads/`,
+    `bench/run_workloads.py`), the per-kernel harness (`bench/kernels.cu`) and its gates (`bench/kernel_gates.py`),
+    and microbenchmarks for the miss round trip and graph launch costs.
+  - `tools/check_orin.sh`: the checks a milestone passes on the Orin before it merges.
+  - `torch run --tokens @FILE`; `--quiet` prints the generated ids; `--profile` reports the slowest PLE read.
 - Milestone M2, a correct forward pass:
   - The model on the GPU, one token at a time: kernels for every layer operation (`src/kernels/`), each with a
     parity test against a scalar CPU reference; the forward pass (`src/model/model.cpp`).

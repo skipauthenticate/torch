@@ -1,0 +1,133 @@
+{
+ "tokenizer": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/de4b8e4d43b917e7706784d8bb445c9af86a3540/tokenizer.json",
+ "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+ "prompt_tokens_max": 1536,
+ "prompts": [
+  {
+   "file": "review-bench-1.tokens",
+   "workload": "review",
+   "use": "bench",
+   "seed": 1,
+   "tokens": 1491
+  },
+  {
+   "file": "review-bench-2.tokens",
+   "workload": "review",
+   "use": "bench",
+   "seed": 2,
+   "tokens": 1493
+  },
+  {
+   "file": "review-bench-3.tokens",
+   "workload": "review",
+   "use": "bench",
+   "seed": 3,
+   "tokens": 1455
+  },
+  {
+   "file": "review-calib-101.tokens",
+   "workload": "review",
+   "use": "calib",
+   "seed": 101,
+   "tokens": 1505
+  },
+  {
+   "file": "review-calib-102.tokens",
+   "workload": "review",
+   "use": "calib",
+   "seed": 102,
+   "tokens": 1507
+  },
+  {
+   "file": "review-calib-103.tokens",
+   "workload": "review",
+   "use": "calib",
+   "seed": 103,
+   "tokens": 1529
+  },
+  {
+   "file": "prose-bench-1.tokens",
+   "workload": "prose",
+   "use": "bench",
+   "seed": 1,
+   "tokens": 1470
+  },
+  {
+   "file": "prose-bench-2.tokens",
+   "workload": "prose",
+   "use": "bench",
+   "seed": 2,
+   "tokens": 1517
+  },
+  {
+   "file": "prose-bench-3.tokens",
+   "workload": "prose",
+   "use": "bench",
+   "seed": 3,
+   "tokens": 1520
+  },
+  {
+   "file": "prose-calib-101.tokens",
+   "workload": "prose",
+   "use": "calib",
+   "seed": 101,
+   "tokens": 1503
+  },
+  {
+   "file": "prose-calib-102.tokens",
+   "workload": "prose",
+   "use": "calib",
+   "seed": 102,
+   "tokens": 1507
+  },
+  {
+   "file": "prose-calib-103.tokens",
+   "workload": "prose",
+   "use": "calib",
+   "seed": 103,
+   "tokens": 1459
+  },
+  {
+   "file": "repetition-bench-1.tokens",
+   "workload": "repetition",
+   "use": "bench",
+   "seed": 1,
+   "tokens": 1494
+  },
+  {
+   "file": "repetition-bench-2.tokens",
+   "workload": "repetition",
+   "use": "bench",
+   "seed": 2,
+   "tokens": 1479
+  },
+  {
+   "file": "repetition-bench-3.tokens",
+   "workload": "repetition",
+   "use": "bench",
+   "seed": 3,
+   "tokens": 1484
+  },
+  {
+   "file": "repetition-calib-101.tokens",
+   "workload": "repetition",
+   "use": "calib",
+   "seed": 101,
+   "tokens": 1464
+  },
+  {
+   "file": "repetition-calib-102.tokens",
+   "workload": "repetition",
+   "use": "calib",
+   "seed": 102,
+   "tokens": 1471
+  },
+  {
+   "file": "repetition-calib-103.tokens",
+   "workload": "repetition",
+   "use": "calib",
+   "seed": 103,
+   "tokens": 1479
+  }
+ ]
+}

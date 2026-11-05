@@ -13,12 +13,20 @@
 
 #include <cstdint>
 
+#include "kernels/gemv/gemv.h"
+
 namespace torch::kernels {
 
 // out = (x * rsqrtf(sum(x^2) / n + eps)) * w_g[i] * sigmoid(gate_g[i]), with w_g = w + g * w_stride (w_stride 0 shares
 // one weight vector; w == nullptr means no weight) and gate_g = gate + g * gate_stride (gate == nullptr means none).
 void rms_norm(const float* x, int64_t x_stride, const float* w, int64_t w_stride, const float* gate,
               int64_t gate_stride, float* out, int64_t out_stride, int n, int groups, float eps, cudaStream_t stream);
+
+// rms_norm that also writes each group's output as n / 32 Q8 blocks, group after group, bitwise those quantize_q8
+// writes: for groups that feed a quantized product. Requires n <= 256 and n % 32 == 0.
+void rms_norm_q8(const float* x, int64_t x_stride, const float* w, int64_t w_stride, const float* gate,
+                 int64_t gate_stride, float* out, int64_t out_stride, BlockQ8* q8, int n, int groups, float eps,
+                 cudaStream_t stream);
 
 // out = (x * rsqrtf(sum(x^2) / n + eps / n)) * (1.0f / sqrtf(n)): the unit-length vector with eps inside the root,
 // computed as an RMS norm with eps / n followed by a scale of 1 / sqrt(n), in that order of roundings.

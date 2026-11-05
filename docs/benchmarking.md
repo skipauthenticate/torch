@@ -15,8 +15,16 @@ prompt tokens and 256 generated tokens per request, through the chat template wi
 | **Prose** | Synthetic prose and "Summarize the passage above in detail, then write a short story inspired by it." | Ordinary chat-like text, where drafts are accepted less often |
 | **Repetition** | The same kind of prose and "Repeat the passage above word for word, from the beginning." | Fully predictable output: shows what copy-mode speculation can do |
 
-Prose and repetition use the project's prompt generator (`bench/workloads/`, M3): a fixed word pool and seeds, with a
-nonce per prompt.
+The prompts are written by `bench/workloads/make_workloads.py` (synthetic Python modules for code review, synthetic
+passages from a fixed word pool for prose and repetition, seeds 1-3) and committed as token ids, tokenized with the
+base model's tokenizer at a pinned revision. Seeds 101-103 of the same generator are held out for calibrating the
+expert placement (`bench/run_workloads.py --calibrate`); benchmark prompts are never used for calibration.
+
+**Until M6** (sparse attention and prefill) the prompts are 1,455-1,529 tokens instead of 4,096, so prompt plus
+generated tokens stay below the 2,048 positions where dense attention is exact, and the prompt is fed one token at a
+time. Attention reads ~55 MB less per token at that length than at 4,096 (~0.3 ms at 180 GB/s, about 1% of a token),
+so decode numbers carry over within ~1%. Until M7 (the server) `bench/run_workloads.py` runs the requests through
+`torch run` and writes `bench/results/<date>-<commit>.json`.
 
 ## What is reported
 
