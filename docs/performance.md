@@ -237,6 +237,58 @@ Medians of three requests:
 - The one-token column uses `calib.txt`; the speculative one uses `calib-spec.txt`, route counts from the held-out
   calibration prompts decoded speculatively (`run_workloads.py --calibrate`).
 
+## M5: host time per window
+
+M4 left about 1.1 ms of host work per token that M3 did not have: the bench profile showed PLE rows 1.05 ms and other
+host work 0.48 ms per token, against M3's 0.32 and 0.13. M5 removed it:
+
+- A window's PLE rows (16 per column) are read as one batch of parallel reads instead of column after column.
+- A single-chunk read wakes one read worker instead of all of them. Waking all of them for every 4 KiB PLE row made
+  them contend: the batched reads alone were slower until this change.
+- A window's commit (convolution history, the DeltaNet replay when a window is cut, the PLE ring) launches as one CUDA
+  graph per (state parity, kept columns, replay) instead of about 70 launches: 0.30 to 0.02 ms of host time per window.
+
+Prompt 1 of each workload, the M4 binary against M5's in one board session, alternating, 2026-11-09 (ids identical):
+
+| Workload | M4 tok/s | M5 tok/s | PLE rows, ms per token | Other host work, ms per token |
+| --- | ---: | ---: | --- | --- |
+| Code review | 40.37 | 40.17 | 1.07 to 0.32 | 0.49 to 0.21 |
+| Prose | 40.09 | 41.37 | 1.05 to 0.35 | 0.50 to 0.22 |
+| Repetition | 53.51 | 55.95 | 1.04 to 0.32 | 0.45 to 0.15 |
+
+One token at a time, M3's binary (d0e0a13) against M5's in one session: code review 24.67 and 24.51, prose 25.24 and
+24.97, repetition 23.84 and 24.00 tok/s. M4's one-token regression (3.3-3.6%) is down to ~1%, with ~165 fewer experts
+resident in the M5 runs (23,194 against 23,358).
+
+Measured and not kept (2026-11-09):
+
+- **Copy proposals** (prompt lookup: propose the continuation of the longest earlier match of the last tokens):
+  repetition fell from 53.70 to 39.59 tok/s. 46 of 49 windows verified a copy, but windows took 131.8 ms against
+  105.7 and kept 5.27 tokens against 5.71. Reverted.
+- **A draft-expert subset** (`--draft-experts 256`: only the most-routed draft experts resident): frees 0.64 GiB for
+  ~308 trunk experts, but prose loses drafts; mean +0.4%, inside the run-to-run noise.
+- **Int8 tensor cores for Q6_K at 1-8 columns** (prototype, bitwise equal to the one-column result): 2560x6144 at
+  1 / 4 / 8 columns takes 107.4 / 98.2 / 104.3 us against dp4a's 88.5 / 113.0 / 157.3. Faster from 3 columns; it
+  moves to M6 with the other formats, where prefill needs the same kernels.
+- `--spec 7` on repetition: +1.3%.
+
+### M5 decode
+
+Same command and placements as M4 decode. Medians of three requests:
+
+| Workload | Speculative tok/s | Tokens per window | One token at a time |
+| --- | ---: | ---: | ---: |
+| Code review | 38.23 | 2.63 | 24.41 |
+| Prose | 41.31 | 2.87 | 24.85 |
+| Repetition | 55.98 | 5.71 | 23.93 |
+
+- Measured on 2026-11-09 at 090d839 (`bench/results/2026-11-09-090d839-spec.json` and `2026-11-09-090d839.json`).
+  The generated ids of all nine requests are identical with and without speculation.
+- 22,400-22,530 experts resident in the speculative runs (M4's: ~22,850), 99.92-99.97% of routes hit.
+- With 6.7 GiB taken before loading (what a 262,144-token context's F16 KV, draft-layer KV and pooled indexer keys
+  will need), the same binary measured code review at 35.43 tok/s (median of three; 19,100-19,400 resident) against
+  38.70 without, in one session: about 1 tok/s per 1,000 resident experts.
+
 ## Targets
 
 Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in
@@ -251,6 +303,9 @@ request; it may not close with a failed gate.
 | M6, long context | | | | 1,000 (about 4 s to the first token) |
 
 M4 measured 37.2 on code review against its goal of 45; the goal carries to M5.
+
+M5 measured 38.2 on code review against 50, 41.3 on prose against 40 and 56.0 on repetition against 100. The
+review and repetition goals carry forward with the int8 tensor-core kernels, which move to M6.
 
 M3's 30 tok/s is 86% of the physical ceiling across roughly a thousand launches, which is why its gate is 27:
 that is ambitious [est]. M3 measured 25.4 on code review (25.7 prose, 24.3 repetition) and merged below its gate by

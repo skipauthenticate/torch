@@ -79,6 +79,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Milestone M5, host time per window:
+  - A verify window's PLE rows are read in one batch of parallel reads, and a single-chunk read wakes one read worker
+    instead of all of them: PLE time per token 1.05 to 0.32 ms.
+  - A window's commit launches as one CUDA graph per (state parity, kept columns, replay case): 0.30 to 0.02 ms of host
+    time per window. `TORCH_HOST_STAGES=1` prints the host time per window by stage.
+  - Code review 38.2, prose 41.3 and repetition 56.0 tok/s (2026-11-09); one token at a time back to within ~1% of M3.
 - Architecture after the 2026-11-03 design review: a written memory budget with a KV cache that grows with the
   sequence; per-layer CUDA graph segments with a pointer table for resident and staged experts; 1-4 columns in
   registers plus an int8 tensor-core path for 5-16 with one canonical reduction order; double-buffered DeltaNet

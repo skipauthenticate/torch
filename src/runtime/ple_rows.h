@@ -22,14 +22,19 @@ namespace torch::runtime {
 
 class PleRows {
 public:
-    PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file);
+    // Reads go through a pool of buffers for `columns` tokens at once (read_window).
+    PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file, int columns = 1);
     PleRows(const PleRows&) = delete;
     PleRows& operator=(const PleRows&) = delete;
     ~PleRows();
 
     // Writes the rows for token history[i] to out, ple_heads x ple_dim floats, head after head. Throws Error when a
     // read fails.
-    void read(std::span<const int32_t> history, size_t i, float* out);
+    void read(std::span<const int32_t> history, size_t i, float* out) { read_window(history, i, 1, out); }
+
+    // Writes the rows of history[first] .. history[first + count - 1] to out, one token after another (ple_heads x
+    // ple_dim floats each), issuing all count x ple_heads reads at once. count is at most the constructor's columns.
+    void read_window(std::span<const int32_t> history, size_t first, int count, float* out);
 
     // The table row each head reads for history[i]. Predecessors before the start of the history read as the PLE
     // end-of-sequence token, and an end of sequence among the predecessors cuts the window there (the token's own
@@ -42,7 +47,8 @@ private:
     const model::Config& config_;
     uint64_t table_offset_ = 0;  // of row 0 in shard 2
     uint64_t row_bytes_ = 0;
-    uint8_t* buffers_ = nullptr;  // page-aligned two-page buffers: one per head and kSpareBuffers
+    int columns_ = 1;
+    uint8_t* buffers_ = nullptr;  // page-aligned two-page buffers: one per (column, head) and kSpareBuffers
     std::unique_ptr<HedgedReads> reads_;
 };
 

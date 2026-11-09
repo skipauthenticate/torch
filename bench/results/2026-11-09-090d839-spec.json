@@ -1,0 +1,366 @@
+{
+ "engine_commit": "090d839",
+ "torch_sha256": "7c76018f58b8c52b80dade8a48bf8c76472b6ae57ca526be754ca6de3b07537c",
+ "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+ "model_bytes": 54817524224,
+ "placement": "calib-spec.txt",
+ "spec_args": "--draft draft-iq4.gguf --draft-variants stream:40960 --draft-vocab vocab.txt --spec 5 --spec-policy adaptive-stop --swap 32 --swap-prompt 0",
+ "generated_per_request": 256,
+ "board": {
+  "host": "localhost.localdomain",
+  "jetpack": "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64, DATE: Fri Aug  7 05:54:22 AM UTC 2026",
+  "power_mode": "NV Power Mode: MAXN",
+  "gpu_max_mhz": "1300500000"
+ },
+ "placement_sha256": "5c8119d5f632d6286f082dbcaed93200b2cec7b60f526a18e470d8f6ad86b52e",
+ "workloads": {
+  "review": {
+   "median_decode_tok_s": 38.23,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1491,
+     "decode_tok_s": 40.06,
+     "ms_per_token": 25.0,
+     "resident": 22529,
+     "hits": 857049,
+     "misses": 711,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.45,
+     "mem_available_lowest_gib": 7.32,
+     "mem_available_end_gib": 7.32,
+     "generation": {
+      "hits": 141882,
+      "misses": 198,
+      "swaps": 181,
+      "swap_ms": 11.6,
+      "swap_ms_per_window": 0.12,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 97,
+      "max_drafts": 5,
+      "drafts_verified": 2.05,
+      "tokens_per_window": 2.63,
+      "tok_s": 40.06,
+      "ms_per_window": 65.8,
+      "verify_accept_ms": 61.3,
+      "draft_ms": 4.5,
+      "host_ms": 0.0
+     },
+     "wall_s": 91.1,
+     "output_sha256": "5da61c77d4dfb996e12fcc390e92eedd7ce2e5cab4eb5449946387b7a49f4659",
+     "profile": "decode time per token over 1747 steps: 37.33 ms; PLE rows 0.35 (slowest 50.1, 1 over 5 ms, 1 hedged), waiting for the GPU 36.75 (expert reads during it 0.30), launches and other host work 0.23"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1493,
+     "decode_tok_s": 38.23,
+     "ms_per_token": 26.2,
+     "resident": 22519,
+     "hits": 864233,
+     "misses": 727,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.45,
+     "mem_available_lowest_gib": 7.31,
+     "mem_available_end_gib": 7.31,
+     "generation": {
+      "hits": 148129,
+      "misses": 191,
+      "swaps": 180,
+      "swap_ms": 11.6,
+      "swap_ms_per_window": 0.11,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 102,
+      "max_drafts": 5,
+      "drafts_verified": 2.03,
+      "tokens_per_window": 2.5,
+      "tok_s": 38.23,
+      "ms_per_window": 65.5,
+      "verify_accept_ms": 60.9,
+      "draft_ms": 4.7,
+      "host_ms": 0.0
+     },
+     "wall_s": 91.4,
+     "output_sha256": "d1b0e1f759fa5f3ad558dbfd87c88731bba446e2b623c0b4ee60b92e0fd18276",
+     "profile": "decode time per token over 1749 steps: 37.42 ms; PLE rows 0.35 (slowest 50.2, 1 over 5 ms, 1 hedged), waiting for the GPU 36.86 (expert reads during it 0.32), launches and other host work 0.22"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1455,
+     "decode_tok_s": 37.89,
+     "ms_per_token": 26.4,
+     "resident": 22503,
+     "hits": 861851,
+     "misses": 709,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.46,
+     "mem_available_lowest_gib": 7.31,
+     "mem_available_end_gib": 7.31,
+     "generation": {
+      "hits": 163905,
+      "misses": 255,
+      "swaps": 233,
+      "swap_ms": 14.3,
+      "swap_ms_per_window": 0.16,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 91,
+      "max_drafts": 5,
+      "drafts_verified": 2.76,
+      "tokens_per_window": 2.81,
+      "tok_s": 37.89,
+      "ms_per_window": 74.1,
+      "verify_accept_ms": 67.9,
+      "draft_ms": 6.3,
+      "host_ms": 0.0
+     },
+     "wall_s": 90.1,
+     "output_sha256": "a60996c989057830266e55fda30e30f360c59c535d5271f5215f84f5030a0e61",
+     "profile": "decode time per token over 1711 steps: 37.31 ms; PLE rows 0.32 (slowest 1.8, 0 over 5 ms, 0 hedged), waiting for the GPU 36.76 (expert reads during it 0.31), launches and other host work 0.23"
+    }
+   ]
+  },
+  "prose": {
+   "median_decode_tok_s": 41.31,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1470,
+     "decode_tok_s": 41.31,
+     "ms_per_token": 24.2,
+     "resident": 22492,
+     "hits": 841593,
+     "misses": 327,
+     "hedged": 1,
+     "mem_available_after_load_gib": 7.45,
+     "mem_available_lowest_gib": 7.31,
+     "mem_available_end_gib": 7.31,
+     "generation": {
+      "hits": 136185,
+      "misses": 135,
+      "swaps": 127,
+      "swap_ms": 8.8,
+      "swap_ms_per_window": 0.09,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 94,
+      "max_drafts": 5,
+      "drafts_verified": 2.02,
+      "tokens_per_window": 2.71,
+      "tok_s": 41.31,
+      "ms_per_window": 65.8,
+      "verify_accept_ms": 61.3,
+      "draft_ms": 4.7,
+      "host_ms": 0.0
+     },
+     "wall_s": 90.0,
+     "output_sha256": "2bb3e10fb0e3e9b5a41f1362dae7a59dd6a9ecbe2000819834ab3f1d91dbe9e2",
+     "profile": "decode time per token over 1726 steps: 36.97 ms; PLE rows 0.35 (slowest 50.2, 1 over 5 ms, 1 hedged), waiting for the GPU 36.41 (expert reads during it 0.17), launches and other host work 0.21"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1517,
+     "decode_tok_s": 39.75,
+     "ms_per_token": 25.2,
+     "resident": 22475,
+     "hits": 878560,
+     "misses": 320,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.46,
+     "mem_available_lowest_gib": 7.31,
+     "mem_available_end_gib": 7.31,
+     "generation": {
+      "hits": 150562,
+      "misses": 158,
+      "swaps": 147,
+      "swap_ms": 10.1,
+      "swap_ms_per_window": 0.11,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 89,
+      "max_drafts": 5,
+      "drafts_verified": 2.53,
+      "tokens_per_window": 2.87,
+      "tok_s": 39.75,
+      "ms_per_window": 72.2,
+      "verify_accept_ms": 66.2,
+      "draft_ms": 6.2,
+      "host_ms": 0.0
+     },
+     "wall_s": 91.9,
+     "output_sha256": "c78e9a71bb2d754dde77c8fa6025dee8b623b2700cd87e4b75b6eed583775431",
+     "profile": "decode time per token over 1773 steps: 37.07 ms; PLE rows 0.33 (slowest 1.8, 0 over 5 ms, 0 hedged), waiting for the GPU 36.53 (expert reads during it 0.14), launches and other host work 0.21"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1520,
+     "decode_tok_s": 42.95,
+     "ms_per_token": 23.3,
+     "resident": 22459,
+     "hits": 862770,
+     "misses": 270,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.44,
+     "mem_available_lowest_gib": 7.28,
+     "mem_available_end_gib": 7.28,
+     "generation": {
+      "hits": 133328,
+      "misses": 112,
+      "swaps": 109,
+      "swap_ms": 8.1,
+      "swap_ms_per_window": 0.09,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 88,
+      "max_drafts": 5,
+      "drafts_verified": 2.16,
+      "tokens_per_window": 2.9,
+      "tok_s": 42.95,
+      "ms_per_window": 67.6,
+      "verify_accept_ms": 62.7,
+      "draft_ms": 5.0,
+      "host_ms": 0.0
+     },
+     "wall_s": 91.2,
+     "output_sha256": "f39818ec87256c26164ad73952408a6a09ca1d831378920ba16dd394cb3bb161",
+     "profile": "decode time per token over 1776 steps: 36.86 ms; PLE rows 0.32 (slowest 1.8, 0 over 5 ms, 0 hedged), waiting for the GPU 36.30 (expert reads during it 0.12), launches and other host work 0.24"
+    }
+   ]
+  },
+  "repetition": {
+   "median_decode_tok_s": 55.98,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1494,
+     "decode_tok_s": 55.59,
+     "ms_per_token": 18.0,
+     "resident": 22436,
+     "hits": 846269,
+     "misses": 451,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.46,
+     "mem_available_lowest_gib": 7.39,
+     "mem_available_end_gib": 7.39,
+     "generation": {
+      "hits": 129401,
+      "misses": 199,
+      "swaps": 191,
+      "swap_ms": 10.6,
+      "swap_ms_per_window": 0.24,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 45,
+      "max_drafts": 5,
+      "drafts_verified": 5.0,
+      "tokens_per_window": 5.71,
+      "tok_s": 55.59,
+      "ms_per_window": 102.1,
+      "verify_accept_ms": 92.4,
+      "draft_ms": 9.9,
+      "host_ms": 0.0
+     },
+     "wall_s": 89.4,
+     "output_sha256": "daedec83d55e56640fb218d9d33777d6f10e0a8fe9e8cf9c536f6f43e1347ea4",
+     "profile": "decode time per token over 1750 steps: 36.11 ms; PLE rows 0.32 (slowest 1.4, 0 over 5 ms, 0 hedged), waiting for the GPU 35.63 (expert reads during it 0.20), launches and other host work 0.16"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1479,
+     "decode_tok_s": 55.98,
+     "ms_per_token": 17.9,
+     "resident": 22418,
+     "hits": 838102,
+     "misses": 458,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.46,
+     "mem_available_lowest_gib": 7.37,
+     "mem_available_end_gib": 7.37,
+     "generation": {
+      "hits": 128453,
+      "misses": 187,
+      "swaps": 177,
+      "swap_ms": 10.5,
+      "swap_ms_per_window": 0.23,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 45,
+      "max_drafts": 5,
+      "drafts_verified": 4.96,
+      "tokens_per_window": 5.71,
+      "tok_s": 55.98,
+      "ms_per_window": 101.4,
+      "verify_accept_ms": 91.8,
+      "draft_ms": 9.8,
+      "host_ms": 0.0
+     },
+     "wall_s": 88.3,
+     "output_sha256": "1371987452c0a41aa95dcee1fe9fa26534ff8d7e2c383603733cf4a8ce8f19c2",
+     "profile": "decode time per token over 1735 steps: 36.08 ms; PLE rows 0.35 (slowest 50.1, 1 over 5 ms, 1 hedged), waiting for the GPU 35.56 (expert reads during it 0.20), launches and other host work 0.18"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1484,
+     "decode_tok_s": 56.83,
+     "ms_per_token": 17.6,
+     "resident": 22404,
+     "hits": 838689,
+     "misses": 351,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.45,
+     "mem_available_lowest_gib": 7.39,
+     "mem_available_end_gib": 7.39,
+     "generation": {
+      "hits": 126520,
+      "misses": 200,
+      "swaps": 189,
+      "swap_ms": 10.4,
+      "swap_ms_per_window": 0.24,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": {
+      "policy": "adaptive-stop",
+      "windows": 44,
+      "max_drafts": 5,
+      "drafts_verified": 5.0,
+      "tokens_per_window": 5.8,
+      "tok_s": 56.83,
+      "ms_per_window": 102.1,
+      "verify_accept_ms": 92.5,
+      "draft_ms": 9.8,
+      "host_ms": 0.0
+     },
+     "wall_s": 88.4,
+     "output_sha256": "57a72ae27a57646cb605f31dc65bbd5f812b3a8df1a83a6137f35d637a3af694",
+     "profile": "decode time per token over 1740 steps: 35.99 ms; PLE rows 0.32 (slowest 2.9, 0 over 5 ms, 0 hedged), waiting for the GPU 35.51 (expert reads during it 0.15), launches and other host work 0.16"
+    }
+   ]
+  }
+ }
+}

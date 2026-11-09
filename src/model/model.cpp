@@ -274,7 +274,7 @@ struct Model::Impl {
 
         weights = std::make_unique<Weights>(cfg, shard1, file1, pool);
         store = std::make_unique<runtime::ExpertStore>(cfg, weights->layers, file1, placement.resident);
-        ple = std::make_unique<runtime::PleRows>(cfg, shard2, file2);
+        ple = std::make_unique<runtime::PleRows>(cfg, shard2, file2, kMaxColumns);
         if (!o.resident)
             top_up(placement);
         swaps_per_window = o.swaps_per_window;
@@ -342,10 +342,21 @@ struct Model::Impl {
     ~Impl() {
         if (stream)
             cudaStreamSynchronize(stream);
+        if (std::getenv("TORCH_HOST_STAGES") && hs_windows)
+            std::fprintf(
+                stderr,
+                "HOST per window: commit %.3f embed %.3f before_window %.3f launch %.3f swaps %.3f ms (%d windows)\n",
+                hs[0] / hs_windows, hs[1] / hs_windows, hs[2] / hs_windows, hs[3] / hs_windows, hs[4] / hs_windows,
+                hs_windows);
         for (const auto& row : graphs)
             for (cudaGraphExec_t g : row)
                 if (g)
                     cudaGraphExecDestroy(g);
+        for (const auto& a : commit_graphs)
+            for (const auto& b2 : a)
+                for (cudaGraphExec_t g : b2)
+                    if (g)
+                        cudaGraphExecDestroy(g);
         if (device)
             cudaFree(device);
         if (host)
@@ -690,7 +701,11 @@ struct Model::Impl {
     // columns, and when n is short of the window the DeltaNet state is recomputed from the state before the window
     // over the kept columns (the same kernel and order as the window, so bitwise the same state). The KV rows of the
     // dropped columns stay; they are rewritten before they are read.
-    void commit(int n) {
+    // One graph per DeltaNet state parity, kept columns and whether the state is replayed (n short of the window): the
+    // commit's ~70 small launches cost ~0.3 ms of host time launched one by one.
+    std::array<std::array<std::array<cudaGraphExec_t, 2>, kMaxColumns + 1>, 2> commit_graphs{};
+
+    void enqueue_commit(int n) {
         const int DS = cfg.ssm_head_dim, QK = cfg.ssm_k_heads * DS, HV = cfg.ssm_v_heads, CC = cfg.conv_channels();
         const Buffers& c = cols[0];
         for (int il = 0; il < cfg.n_layer; ++il) {
@@ -706,11 +721,38 @@ struct Model::Impl {
             kernels::conv_commit(c.conv_state[l], c.win_qkv[l], CC, n, stream);
         }
         kernels::ple_commit(c.ple_history, c.ple_x, cfg.hc * cfg.n_embd, c.pos, n, stream);
+    }
+
+    void commit(int n) {
+        cudaGraphExec_t& graph = commit_graphs[static_cast<size_t>(parity)][static_cast<size_t>(n)][n < window ? 1 : 0];
+        if (eager) {
+            enqueue_commit(n);
+        } else {
+            if (graph == nullptr) {
+                cudaGraph_t g = nullptr;
+                TORCH_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                try {
+                    enqueue_commit(n);
+                } catch (...) {
+                    cudaStreamEndCapture(stream, &g);
+                    if (g)
+                        cudaGraphDestroy(g);
+                    throw;
+                }
+                TORCH_CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+                const cudaError_t made = cudaGraphInstantiate(&graph, g, 0);
+                cudaGraphDestroy(g);
+                TORCH_CUDA_CHECK(made);
+            }
+            TORCH_CUDA_CHECK(cudaGraphLaunch(graph, stream));
+        }
         parity ^= 1;
         history.resize(window_start + static_cast<size_t>(n));
         window_open = false;
     }
 
+    std::array<double, 5> hs{};  // measurement: host ms in commit, embedding, before_window, launch, swaps
+    int hs_windows = 0;
     void verify(std::span<const int32_t> tokens) {
         const auto start = Clock::now();
         const int columns = static_cast<int>(tokens.size());
@@ -723,8 +765,11 @@ struct Model::Impl {
                             std::to_string(cfg.n_vocab) + ".");
         if (history.size() + tokens.size() > static_cast<size_t>(context))
             throw Error("The context of " + std::to_string(context) + " tokens is full; start a new sequence.");
+        const auto t_commit = Clock::now();
         if (window_open)
             commit(window);  // the last window was not cut: keep all of it
+        hs[0] += ms(Clock::now() - t_commit);
+        const auto t_embed = Clock::now();
         const int E = cfg.n_embd;
         window_start = history.size();
         window = columns;
@@ -737,16 +782,21 @@ struct Model::Impl {
             history.push_back(token);
             const size_t at = static_cast<size_t>(t) * static_cast<size_t>(E);
             dequant_row(te.type, te.data + static_cast<uint64_t>(token) * te.row_bytes(), E, hb.embd + at);
-            const auto ple_start = Clock::now();
-            ple->read(history, window_start + static_cast<size_t>(t), hb.ple + at);
-            const double ple_ms = ms(Clock::now() - ple_start);
-            times.ple += ple_ms;
-            times.ple_max = std::max(times.ple_max, ple_ms);
-            times.ple_slow += ple_ms > 5.0 ? 1 : 0;
             hb.pos[t] = static_cast<int32_t>(window_start) + t;
         }
+        hs[1] += ms(Clock::now() - t_embed);
+        // All of the window's PLE rows in one batch of reads (rows are E floats a column, hb.ple's layout).
+        const auto ple_start = Clock::now();
+        ple->read_window(history, window_start, columns, hb.ple);
+        const double ple_ms = ms(Clock::now() - ple_start);
+        times.ple += ple_ms;
+        times.ple_max = std::max(times.ple_max, ple_ms);
+        times.ple_slow += ple_ms > 5.0 ? 1 : 0;
 
+        const auto t_bw = Clock::now();
         store->before_window();  // the last window's swaps have landed and its staging buffers are free
+        hs[2] += ms(Clock::now() - t_bw);
+        const auto t_launch = Clock::now();
         cudaGraphExec_t& graph = graphs[static_cast<size_t>(parity)][static_cast<size_t>(columns)];
         if (eager) {
             enqueue(columns);
@@ -769,14 +819,18 @@ struct Model::Impl {
             }
             TORCH_CUDA_CHECK(cudaGraphLaunch(graph, stream));
         }
+        hs[3] += ms(Clock::now() - t_launch);
         const auto gpu_start = Clock::now();
         TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
         TORCH_CUDA_CHECK(cudaGetLastError());
         store->check();
         window_open = true;
         times.gpu += ms(Clock::now() - gpu_start);
+        const auto t_sw = Clock::now();
         if (swaps_per_window > 0)
             swap_missed();
+        hs[4] += ms(Clock::now() - t_sw);
+        ++hs_windows;
         times.total += ms(Clock::now() - start);
     }
 
