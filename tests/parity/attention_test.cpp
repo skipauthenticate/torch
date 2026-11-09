@@ -72,10 +72,10 @@ void check_attention(int pos_value, const std::vector<uint16_t>& kc, const std::
     const float scale = 1.0f / 16.0f;
     DeviceBuffer<float> dqg(qg), dout(static_cast<size_t>(kHeads) * kD);
     DeviceBuffer<uint16_t> dkc(kc), dvc(vc);
-    DeviceBuffer<float> dscratch(static_cast<size_t>(kernels::attention_scratch_floats(kHeads, kMaxCtx)));
+    DeviceBuffer<float> dscratch(static_cast<size_t>(kernels::attention_scratch_floats(kHeads, kMaxCtx, 1)));
     DeviceBuffer<int32_t> dpos(std::vector<int32_t>{pos_value});
     kernels::attention_decode(dqg.get(), dqg.get() + kD, 2 * kD, dkc.get(), dvc.get(), dout.get(), dscratch.get(),
-                              dpos.get(), kHeads, kKvHeads, scale, kMaxCtx, nullptr);
+                              dpos.get(), kHeads, kKvHeads, scale, kMaxCtx, 1, nullptr);
     std::vector<double> want(static_cast<size_t>(kHeads) * kD), mag(want.size());
     for (int h = 0; h < kHeads; ++h) {
         const int kv = h / (kHeads / kKvHeads);
@@ -125,11 +125,59 @@ void check_fused(int pos_value) {
     kernels::rope_neox(k1.get(), kD, kKvHeads, n_rot, pos.get(), base, nullptr);
     kernels::store_kv(k1.get(), v1.get(), kc1.get(), vc1.get(), kRowLen, pos.get(), nullptr);
     kernels::qk_norm_rope_store(q2.get(), 2 * kD, dwq.get(), k2.get(), dwk.get(), v1.get(), kc2.get(), vc2.get(),
-                                kHeads, kKvHeads, n_rot, pos.get(), base, eps, nullptr);
+                                kHeads, kKvHeads, n_rot, pos.get(), base, eps, 1, nullptr);
     const bool same = q1.download() == q2.download() && k1.download() == k2.download() &&
                       kc1.download() == kc2.download() && vc1.download() == vc2.download();
     CHECK(same);
     std::printf("%-40s %s\n", ("qk_norm_rope_store bitwise pos " + std::to_string(pos_value)).c_str(),
+                same ? "ok" : "FAIL");
+}
+
+// A window of `columns` tokens at *pos = first: qk_norm_rope_store and attention_decode over all columns must give,
+// for every column t, bit for bit what the one-token pair gives at position first + t after the earlier columns' rows
+// are in the cache.
+void check_window(int first, int columns) {
+    const int n_rot = 64;
+    const float base = 1e7f, eps = 1e-6f, scale = 1.0f / 16.0f;
+    const size_t q_floats = static_cast<size_t>(kHeads) * 2 * kD, row = static_cast<size_t>(kRowLen);
+    const size_t n = static_cast<size_t>(columns);
+    const std::vector<float> q = test::random_floats(q_floats * n, -2, 2, 50 + first),
+                             k = test::random_floats(row * n, -2, 2, 51 + first),
+                             v = test::random_floats(row * n, -2, 2, 52 + first),
+                             wq = test::random_floats(kD, 0.5f, 1.5f, 53), wk = test::random_floats(kD, 0.5f, 1.5f, 54);
+    std::vector<uint16_t> kc(static_cast<size_t>(kMaxCtx) * kRowLen), vc(kc.size());
+    const std::vector<float> kh = test::random_floats(kc.size(), -1, 1, 55),
+                             vh = test::random_floats(kc.size(), -1, 1, 56);
+    for (size_t i = 0; i < kc.size(); ++i)
+        kc[i] = to_f16(kh[i]), vc[i] = to_f16(vh[i]);
+    DeviceBuffer<float> dwq(wq), dwk(wk),
+        dscratch(static_cast<size_t>(kernels::attention_scratch_floats(kHeads, kMaxCtx, columns)));
+    // the window
+    DeviceBuffer<float> qw(q), kw(k), vw(v), outw(static_cast<size_t>(kHeads) * kD * n);
+    DeviceBuffer<uint16_t> kcw(kc), vcw(vc);
+    DeviceBuffer<int32_t> dpos(std::vector<int32_t>{first});
+    kernels::qk_norm_rope_store(qw.get(), 2 * kD, dwq.get(), kw.get(), dwk.get(), vw.get(), kcw.get(), vcw.get(),
+                                kHeads, kKvHeads, n_rot, dpos.get(), base, eps, columns, nullptr);
+    kernels::attention_decode(qw.get(), qw.get() + kD, 2 * kD, kcw.get(), vcw.get(), outw.get(), dscratch.get(),
+                              dpos.get(), kHeads, kKvHeads, scale, kMaxCtx, columns, nullptr);
+    // one token at a time
+    DeviceBuffer<float> qo(q), ko(k), vo(v), outo(static_cast<size_t>(kHeads) * kD * n);
+    DeviceBuffer<uint16_t> kco(kc), vco(vc);
+    for (size_t t = 0; t < n; ++t) {
+        DeviceBuffer<int32_t> pt(std::vector<int32_t>{first + static_cast<int>(t)});
+        kernels::qk_norm_rope_store(qo.get() + t * q_floats, 2 * kD, dwq.get(), ko.get() + t * row, dwk.get(),
+                                    vo.get() + t * row, kco.get(), vco.get(), kHeads, kKvHeads, n_rot, pt.get(), base,
+                                    eps, 1, nullptr);
+        kernels::attention_decode(qo.get() + t * q_floats, qo.get() + t * q_floats + kD, 2 * kD, kco.get(), vco.get(),
+                                  outo.get() + t * kHeads * kD, dscratch.get(), pt.get(), kHeads, kKvHeads, scale,
+                                  kMaxCtx, 1, nullptr);
+    }
+    const bool same = outw.download() == outo.download() && qw.download() == qo.download() &&
+                      kw.download() == ko.download() && kcw.download() == kco.download() &&
+                      vcw.download() == vco.download();
+    CHECK(same);
+    std::printf("%-40s %s\n",
+                ("window T=" + std::to_string(columns) + " at " + std::to_string(first) + " bitwise").c_str(),
                 same ? "ok" : "FAIL");
 }
 
@@ -140,6 +188,10 @@ int main() {
         for (int pos : {0, 11, 300})
             check_rope(pos);
         check_store_kv();
+        for (int first : {0, 5, 126, 127, 1800, 2040})
+            for (int columns = 1; columns <= 8; ++columns)
+                if (first + columns <= kMaxCtx)
+                    check_window(first, columns);
         for (int pos : {0, 3, 1800, kMaxCtx - 1})
             check_fused(pos);
         std::vector<uint16_t> kc(static_cast<size_t>(kMaxCtx) * kRowLen), vc(kc.size());

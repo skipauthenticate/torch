@@ -38,17 +38,18 @@ project defines (architecture decision 12):
 
 | Property | Value |
 | --- | --- |
-| File name | `Qwen3.8-Flash-Next-MTP-IQ4_XS.gguf` |
+| File name | `draft-iq4.gguf` (what `tools/make_draft.py OUT --experts iq4` writes) |
 | Tensor names | `blk.48.*` for the MTP block (attention, indexer, hyper-connections, router, routed and shared experts) and `blk.48.nextn.{eh_proj, enorm, hnorm, hc_head_norm, hc_head_down, hc_head_up}`, following the main file's naming |
-| Formats | routed experts IQ4_XS; everything else Q8_0 |
-| Size | about 1.3 GiB [est] |
-| Built by | `tools/make_draft.py` from the MTP shards of `Qwen/Qwen3.8-Flash-Next` with this project's writer and quantizers (M4) |
-| sha256 | not yet built |
+| Formats | routed gate and up IQ4_XS, routed down IQ4_NL; attention, shared experts and `eh_proj` Q8_0; router, hyper-connection mixers and indexer BF16; norms F32 |
+| Size | 1,480,786,592 bytes (1.38 GiB) |
+| Built by | `tools/make_draft.py` from the 31 `mtp.*` tensors of `Qwen/Qwen3.8-Flash-Next` at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`, with this project's writer and quantizers (M4) |
+| sha256 | `20a21ef3b118cc2e277938f7da64935368f483a19a36fcd93bc8f57c8ea8d164` (built on 2026-11-05) |
 | Published | not yet; only once the base model's license has been checked for redistribution of derived weights |
 
 ## Disk space
 
-About 85 GB of free NVMe space: the two shards (83.6 GB) and the draft layer (~1.4 GB).
+About 85 GB of free NVMe space: the two shards (83.6 GB) and the draft layer (1.48 GB). Building the draft layer
+also needs 5.2 GB for its BF16 intermediate, which make_draft.py keeps to resume and to quantize from.
 
 ## Verifying
 

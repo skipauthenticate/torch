@@ -14,8 +14,14 @@ __global__ void __launch_bounds__(kThreads)
     norm_kernel(const float* x, int64_t x_stride, const float* w, int64_t w_stride, const float* gate,
                 int64_t gate_stride, float* out, int64_t out_stride, int n, float eps, BlockQ8* q8 = nullptr) {
     const int g = blockIdx.x;
-    x += g * x_stride;
-    out += g * out_stride;
+    // Window column blockIdx.y: its groups follow the previous column's (each column's tensor is groups x stride).
+    const int64_t column_groups = int64_t{blockIdx.y} * gridDim.x;
+    x += (column_groups + g) * x_stride;
+    out += (column_groups + g) * out_stride;
+    if (gate != nullptr)
+        gate += column_groups * gate_stride;
+    if (q8 != nullptr)
+        q8 += column_groups * (n / 32);
     float sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += kThreads)
         sum += x[i] * x[i];
@@ -50,21 +56,23 @@ __global__ void __launch_bounds__(kThreads)
 }  // namespace
 
 void rms_norm(const float* x, int64_t x_stride, const float* w, int64_t w_stride, const float* gate,
-              int64_t gate_stride, float* out, int64_t out_stride, int n, int groups, float eps, cudaStream_t stream) {
-    norm_kernel<false>
-        <<<groups, kThreads, 0, stream>>>(x, x_stride, w, w_stride, gate, gate_stride, out, out_stride, n, eps);
+              int64_t gate_stride, float* out, int64_t out_stride, int n, int groups, float eps, cudaStream_t stream,
+              int columns) {
+    norm_kernel<false><<<dim3(groups, columns), kThreads, 0, stream>>>(x, x_stride, w, w_stride, gate, gate_stride, out,
+                                                                       out_stride, n, eps);
 }
 
 void rms_norm_q8(const float* x, int64_t x_stride, const float* w, int64_t w_stride, const float* gate,
                  int64_t gate_stride, float* out, int64_t out_stride, BlockQ8* q8, int n, int groups, float eps,
-                 cudaStream_t stream) {
-    norm_kernel<false>
-        <<<groups, kThreads, 0, stream>>>(x, x_stride, w, w_stride, gate, gate_stride, out, out_stride, n, eps, q8);
+                 cudaStream_t stream, int columns) {
+    norm_kernel<false><<<dim3(groups, columns), kThreads, 0, stream>>>(x, x_stride, w, w_stride, gate, gate_stride, out,
+                                                                       out_stride, n, eps, q8);
 }
 
 void l2_norm(const float* x, int64_t x_stride, float* out, int64_t out_stride, int n, int groups, float eps,
-             cudaStream_t stream) {
-    norm_kernel<true><<<groups, kThreads, 0, stream>>>(x, x_stride, nullptr, 0, nullptr, 0, out, out_stride, n, eps);
+             cudaStream_t stream, int columns) {
+    norm_kernel<true>
+        <<<dim3(groups, columns), kThreads, 0, stream>>>(x, x_stride, nullptr, 0, nullptr, 0, out, out_stride, n, eps);
 }
 
 }  // namespace torch::kernels

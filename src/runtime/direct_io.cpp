@@ -14,11 +14,6 @@
 namespace torch::runtime {
 namespace {
 
-// At most one device transfer per read. On the Orin's SSD (WD_BLACK SN850X, 128 KiB maximum transfer), single
-// O_DIRECT reads of ~0.9 MiB left a request uncompleted until the driver's 30 s timeout about once in 300 reads at
-// queue depth 1; reads of 128 KiB never stalled in 9,000 tries at queue depths 1 and 8 (2026-11-04).
-constexpr uint64_t kMaxRead = uint64_t{128} << 10;
-
 int open_direct(const std::string& path) {
 #if defined(__APPLE__)
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -77,7 +72,7 @@ uint8_t* DirectFile::read(uint64_t offset, uint64_t n, uint8_t* buffer) const {
     const uint64_t total = span_bytes(offset, n);
     while (done < need) {
         const ssize_t got =
-            ::pread(fd_, buffer + done, std::min(total - done, kMaxRead), static_cast<off_t>(first + done));
+            ::pread(fd_, buffer + done, std::min(total - done, kReadChunk), static_cast<off_t>(first + done));
         const int error = errno;
         if (got < 0 && error == EINTR)
             continue;

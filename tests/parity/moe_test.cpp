@@ -1,5 +1,5 @@
 // Parity of the mixture-of-experts kernels (src/kernels/moe) with a scalar double reference: router_top_k with
-// random logits and with ties (lowest index first), swiglu and moe_combine at the model's sizes.
+// random logits and with ties (lowest index first), swiglu and moe_combine at the model's sizes, and expert_table.
 #include "kernels/moe/moe.h"
 
 #include <algorithm>
@@ -81,6 +81,27 @@ void check_combine() {
     CHECK(test::report("moe_combine", test::worst_relative(dout.download(), want, mag), kTolerance));
 }
 
+// The pointer table of resident experts: slot s of gate, up and down at base + ids[s] * slice.
+void check_table() {
+    const std::vector<int32_t> ids = {511, 0, 7, 300, 4, 130, 9, 260, 400, 1};
+    const kernels::ResidentExperts e{reinterpret_cast<const uint8_t*>(0x100000),
+                                     reinterpret_cast<const uint8_t*>(0x900000),
+                                     reinterpret_cast<const uint8_t*>(0x2000000), 1740800, 870400};
+    DeviceBuffer<int32_t> dids(ids);
+    DeviceBuffer<const uint8_t*> table(3 * kTopK);
+    kernels::expert_table(dids.get(), kTopK, e, table.get(), nullptr);
+    const std::vector<const uint8_t*> got = table.download();
+    bool same = true;
+    for (int s = 0; s < kTopK; ++s) {
+        const uint64_t id = static_cast<uint64_t>(ids[static_cast<size_t>(s)]);
+        same &= got[static_cast<size_t>(s)] == e.gate + id * e.gate_up_slice &&
+                got[static_cast<size_t>(kTopK + s)] == e.up + id * e.gate_up_slice &&
+                got[static_cast<size_t>(2 * kTopK + s)] == e.down + id * e.down_slice;
+    }
+    std::printf("expert_table %s\n", same ? "ok" : "FAIL");
+    CHECK(same);
+}
+
 }  // namespace
 
 int main() {
@@ -95,6 +116,7 @@ int main() {
         check_router("router_top_k ties", ties);
         check_swiglu();
         check_combine();
+        check_table();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "moe_test: %s\n", e.what());

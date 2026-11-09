@@ -2,8 +2,9 @@
 // on every quantized format against dequant_row (src/formats/dequant.h) times the same quantized activations, in
 // double; gemv_bf16 against the reference and bit for bit against its canonical order, and the paired launch; the
 // expert path, which must equal the dense kernel bit for bit and not depend on where an expert's bytes live; and the
-// group launch of matrices that read one input, bit for bit against gemv_q8 on each; and the mixer's SiLU folded into
-// the down projection, bit for bit against silu_scale.
+// group launch of matrices that read one input, bit for bit against gemv_q8 on each; the mixer's SiLU folded into the
+// down projection, bit for bit against silu_scale; and every multi-column kernel (verify windows) at 1 to 8 columns,
+// each column bit for bit the one-column launch on it, the window's routed experts against the per-column path.
 #include "kernels/gemv/gemv.h"
 
 #include <algorithm>
@@ -343,7 +344,265 @@ void check_bf16_silu(int rows, int rows2, int cols) {
     std::printf("%-40s %s\n", "gemv_bf16_pair with silu_scale", same ? "ok" : "FAIL");
 }
 
+// ---- Columns: every column of a T-column launch equals the one-column launch on that column, bit for bit ----------
+
+bool column_same(const std::vector<float>& got, const std::vector<float>& want, int column, int n) {
+    return std::memcmp(got.data() + static_cast<size_t>(column) * n, want.data() + static_cast<size_t>(column) * n,
+                       static_cast<size_t>(n) * sizeof(float)) == 0;
+}
+
+// gemv_q8 at T = 1..8 distinct columns against eight one-column launches.
+void check_columns(Type t, int rows, int cols) {
+    const int units = cols / 32;
+    const std::vector<uint8_t> m = random_matrix(t, rows, cols, 71 + static_cast<uint32_t>(t));
+    const std::vector<BlockQ8> xq = quantize(activations(kernels::kMaxColumns * cols, 73));
+    DeviceBuffer<uint8_t> dm(m);
+    DeviceBuffer<BlockQ8> dx(xq);
+    DeviceBuffer<float> want(static_cast<size_t>(kernels::kMaxColumns) * rows), got(want.bytes() / sizeof(float));
+    for (int c = 0; c < kernels::kMaxColumns; ++c)
+        kernels::gemv_q8(t, dm.get(), rows, cols, dx.get() + c * units, want.get() + c * rows, nullptr);
+    const std::vector<float> w = want.download();
+    bool same = true;
+    for (int T = 1; T <= kernels::kMaxColumns; ++T) {
+        kernels::gemv_q8(t, dm.get(), rows, cols, dx.get(), got.get(), nullptr, T);
+        const std::vector<float> g = got.download();
+        for (int c = 0; c < T; ++c)
+            same = same && column_same(g, w, c, rows);
+    }
+    CHECK(same);
+    const std::string what = "columns 1-8 " + std::string(type_info(static_cast<uint32_t>(t))->name) + " " +
+                             std::to_string(rows) + "x" + std::to_string(cols);
+    std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
+}
+
+// gemv_q8_group (plain and SwiGLU) at T = 1..8 against one-column group launches.
+void check_group_columns(std::initializer_list<std::pair<Type, int>> shape, bool swiglu) {
+    const int cols = 2560, units = cols / 32, T8 = kernels::kMaxColumns;
+    std::vector<std::unique_ptr<DeviceBuffer<uint8_t>>> matrices;
+    std::vector<std::pair<Type, int>> parts_shape(shape);
+    int total = 0;
+    for (auto [t, rows] : parts_shape) {
+        matrices.push_back(std::make_unique<DeviceBuffer<uint8_t>>(random_matrix(t, rows, cols, 81 + total)));
+        total += rows;
+    }
+    const std::vector<BlockQ8> xq = quantize(activations(T8 * cols, 83));
+    DeviceBuffer<BlockQ8> dx(xq);
+    DeviceBuffer<float> want(static_cast<size_t>(T8) * total), got(static_cast<size_t>(T8) * total);
+    // want: part p's column c at its one-column launch; got: part p's [T][rows] block
+    auto parts_at = [&](float* y, bool columns_layout, int c) {
+        std::vector<kernels::Q8Part> parts;
+        size_t at = 0;
+        for (size_t p = 0; p < parts_shape.size(); ++p) {
+            const int rows = parts_shape[p].second;
+            parts.push_back({parts_shape[p].first, matrices[p]->get(), rows,
+                             y + at + (columns_layout ? 0 : static_cast<size_t>(c) * rows)});
+            at += static_cast<size_t>(rows) * T8;
+        }
+        return parts;
+    };
+    for (int c = 0; c < T8; ++c) {
+        const std::vector<kernels::Q8Part> parts = parts_at(want.get(), false, c);
+        kernels::gemv_q8_group(parts.data(), static_cast<int>(parts.size()), cols, dx.get() + c * units, swiglu,
+                               nullptr);
+    }
+    const std::vector<float> w = want.download();
+    bool same = true;
+    for (int T = 1; T <= T8; ++T) {
+        const std::vector<kernels::Q8Part> parts = parts_at(got.get(), true, 0);
+        kernels::gemv_q8_group(parts.data(), static_cast<int>(parts.size()), cols, dx.get(), swiglu, nullptr, T);
+        const std::vector<float> g = got.download();
+        size_t at = 0;
+        for (size_t p = 0; p < parts_shape.size(); ++p) {
+            const int rows = parts_shape[p].second;
+            if (!swiglu || p == 0)
+                for (int c = 0; c < T; ++c)
+                    same =
+                        same && std::memcmp(g.data() + at + static_cast<size_t>(c) * rows,
+                                            w.data() + at + static_cast<size_t>(c) * rows, rows * sizeof(float)) == 0;
+            at += static_cast<size_t>(rows) * T8;
+        }
+    }
+    CHECK(same);
+    std::printf("%-40s %s\n", swiglu ? "columns 1-8 group swiglu" : "columns 1-8 group", same ? "ok" : "FAIL");
+}
+
+// gemv_bf16_pair at T = 1..8 (short rows, and long rows with inject rows and the SiLU) against one-column launches.
+void check_bf16_columns(int rows, int rows2, int cols, float silu) {
+    const int T8 = kernels::kMaxColumns;
+    const std::vector<uint8_t> m = random_bf16(rows, cols, 91), m2 = random_bf16(std::max(rows2, 1), cols, 92);
+    const std::vector<float> x = activations(T8 * cols, 93);
+    DeviceBuffer<uint8_t> dm(m), dm2(m2);
+    DeviceBuffer<float> dx(x), want(static_cast<size_t>(T8) * (rows + rows2)), got(want.bytes() / sizeof(float));
+    for (int c = 0; c < T8; ++c)
+        kernels::gemv_bf16_pair(dm.get(), rows, dm2.get(), rows2, cols, dx.get() + static_cast<size_t>(c) * cols,
+                                want.get() + static_cast<size_t>(c) * rows,
+                                want.get() + static_cast<size_t>(T8) * rows + static_cast<size_t>(c) * rows2, nullptr,
+                                silu);
+    const std::vector<float> w = want.download();
+    bool same = true;
+    for (int T = 1; T <= T8; ++T) {
+        kernels::gemv_bf16_pair(dm.get(), rows, dm2.get(), rows2, cols, dx.get(), got.get(),
+                                got.get() + static_cast<size_t>(T8) * rows, nullptr, silu, T);
+        const std::vector<float> g = got.download();
+        for (int c = 0; c < T; ++c) {
+            same = same && column_same(g, w, c, rows);
+            same = same && std::memcmp(g.data() + static_cast<size_t>(T8) * rows + static_cast<size_t>(c) * rows2,
+                                       w.data() + static_cast<size_t>(T8) * rows + static_cast<size_t>(c) * rows2,
+                                       static_cast<size_t>(rows2) * sizeof(float)) == 0;
+        }
+    }
+    CHECK(same);
+    const std::string what =
+        "columns 1-8 bf16 " + std::to_string(rows) + "+" + std::to_string(rows2) + "x" + std::to_string(cols);
+    std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
+}
+
 }  // namespace
+
+// A window's routes as the window gate numbers them: 10 distinct routes a column out of 24 experts (so columns share
+// experts), unique experts in order of first appearance over (column, rank), with their column masks and ranks.
+struct WindowRoutes {
+    static constexpr int kExperts = 24, kRoutes = 10, kSlots = 80;
+    std::vector<int> ids;     // column c's rank-r expert at c * kRoutes + r
+    std::vector<int> unique;  // unique expert u's expert id
+    std::vector<uint8_t> mask = std::vector<uint8_t>(kSlots, 0);
+    std::vector<int8_t> rank = std::vector<int8_t>(size_t{kSlots} * kernels::kMaxColumns, -1);
+};
+
+WindowRoutes window_routes(int columns, std::mt19937& rng) {
+    WindowRoutes w;
+    for (int c = 0; c < columns; ++c) {
+        std::vector<int> e(WindowRoutes::kExperts);
+        for (int i = 0; i < WindowRoutes::kExperts; ++i)
+            e[i] = i;
+        std::shuffle(e.begin(), e.end(), rng);
+        w.ids.insert(w.ids.end(), e.begin(), e.begin() + WindowRoutes::kRoutes);
+    }
+    for (int c = 0; c < columns; ++c)
+        for (int r = 0; r < WindowRoutes::kRoutes; ++r) {
+            const int e = w.ids[c * WindowRoutes::kRoutes + r];
+            auto it = std::find(w.unique.begin(), w.unique.end(), e);
+            const int u = static_cast<int>(it - w.unique.begin());
+            if (it == w.unique.end())
+                w.unique.push_back(e);
+            w.mask[u] |= static_cast<uint8_t>(1u << c);
+            w.rank[u * kernels::kMaxColumns + c] = static_cast<int8_t>(r);
+        }
+    return w;
+}
+
+// Device pointers to expert e's matrix for each route and each unique expert of w.
+void route_tables(const WindowRoutes& w, const uint8_t* base, uint64_t matrix, std::vector<const uint8_t*>& routes,
+                  std::vector<const uint8_t*>& unique) {
+    routes.clear();
+    for (int e : w.ids)
+        routes.push_back(base + e * matrix);
+    unique.assign(WindowRoutes::kSlots, nullptr);
+    for (size_t u = 0; u < w.unique.size(); ++u)
+        unique[u] = base + w.unique[u] * matrix;
+}
+
+// gemv_q8_experts_window at T = 1..8 against the per-column path (gemv_q8_experts on each column's 10 routes), byte
+// for byte.
+void check_experts_window(Type t, int rows, int cols) {
+    constexpr int kExperts = WindowRoutes::kExperts, kRoutes = WindowRoutes::kRoutes, kSlots = WindowRoutes::kSlots;
+    const int units = cols / 32;
+    const uint64_t matrix = row_bytes(*type_info(static_cast<uint32_t>(t)), cols) * rows;
+    const std::vector<uint8_t> gate = random_matrix(t, rows * kExperts, cols, 81),
+                               up = random_matrix(t, rows * kExperts, cols, 82);
+    DeviceBuffer<uint8_t> dgate(gate), dup(up);
+    const std::vector<BlockQ8> xq = quantize(activations(kernels::kMaxColumns * cols, 83));
+    DeviceBuffer<BlockQ8> dx(xq);
+    std::mt19937 rng(84);
+    bool same = true;
+    for (int T = 1; T <= kernels::kMaxColumns; ++T) {
+        const WindowRoutes w = window_routes(T, rng);
+        std::vector<const uint8_t*> g_routes, u_routes, g_unique, u_unique;
+        route_tables(w, dgate.get(), matrix, g_routes, g_unique);
+        route_tables(w, dup.get(), matrix, u_routes, u_unique);
+        const std::vector<int32_t> count = {static_cast<int32_t>(w.unique.size())};
+        DeviceBuffer<const uint8_t*> dgr(g_routes), dur(u_routes), dgu(g_unique), duu(u_unique);
+        DeviceBuffer<uint8_t> dmask(w.mask);
+        DeviceBuffer<int8_t> drank(w.rank);
+        DeviceBuffer<int32_t> dcount(count);
+        DeviceBuffer<float> want(static_cast<size_t>(T) * kRoutes * rows), got(want.bytes() / sizeof(float));
+        for (int c = 0; c < T; ++c)
+            kernels::gemv_q8_experts(t, dgr.get() + c * kRoutes, dur.get() + c * kRoutes, kRoutes, rows, cols,
+                                     dx.get() + c * units, 0, want.get() + static_cast<size_t>(c) * kRoutes * rows,
+                                     nullptr);
+        TORCH_CUDA_CHECK(cudaMemset(got.get(), 0xff, got.bytes()));
+        kernels::gemv_q8_experts_window(t, dgu.get(), duu.get(), dmask.get(), drank.get(), dcount.get(),
+                                        std::min(T * kRoutes, kSlots), kRoutes, rows, cols, dx.get(), got.get(), T,
+                                        nullptr);
+        same = same && same_bits(got.download(), want.download());
+    }
+    CHECK(same);
+    const std::string what = "experts window 1-8 " + std::string(type_info(static_cast<uint32_t>(t))->name) + " " +
+                             std::to_string(rows) + "x" + std::to_string(cols);
+    std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
+}
+
+// gemv_q8_experts_down_window at T = 1..8 against gemv_q8_experts on each column's 10 routes (each (column, rank)
+// slot with its own input), byte for byte.
+void check_down_window(Type t, int rows, int cols) {
+    constexpr int kExperts = WindowRoutes::kExperts, kRoutes = WindowRoutes::kRoutes, kSlots = WindowRoutes::kSlots;
+    const int units = cols / 32;
+    const uint64_t matrix = row_bytes(*type_info(static_cast<uint32_t>(t)), cols) * rows;
+    DeviceBuffer<uint8_t> dm(random_matrix(t, rows * kExperts, cols, 93));
+    DeviceBuffer<BlockQ8> dx(quantize(activations(kSlots * cols, 94)));
+    std::mt19937 rng(95);
+    bool same = true;
+    for (int T = 1; T <= kernels::kMaxColumns; ++T) {
+        const WindowRoutes w = window_routes(T, rng);
+        std::vector<const uint8_t*> routes, unique;
+        route_tables(w, dm.get(), matrix, routes, unique);
+        const std::vector<int32_t> count = {static_cast<int32_t>(w.unique.size())};
+        DeviceBuffer<const uint8_t*> droutes(routes), dunique(unique);
+        DeviceBuffer<uint8_t> dmask(w.mask);
+        DeviceBuffer<int8_t> drank(w.rank);
+        DeviceBuffer<int32_t> dcount(count);
+        DeviceBuffer<float> want(static_cast<size_t>(T) * kRoutes * rows), got(want.bytes() / sizeof(float));
+        for (int c = 0; c < T; ++c)
+            kernels::gemv_q8_experts(t, droutes.get() + c * kRoutes, nullptr, kRoutes, rows, cols,
+                                     dx.get() + c * kRoutes * units, units,
+                                     want.get() + static_cast<size_t>(c) * kRoutes * rows, nullptr);
+        TORCH_CUDA_CHECK(cudaMemset(got.get(), 0xff, got.bytes()));
+        kernels::gemv_q8_experts_down_window(t, dunique.get(), dmask.get(), drank.get(), dcount.get(),
+                                             std::min(T * kRoutes, kSlots), kRoutes, rows, cols, dx.get(), got.get(), T,
+                                             nullptr);
+        same = same && same_bits(got.download(), want.download());
+    }
+    CHECK(same);
+    const std::string what = "down window 1-8 " + std::string(type_info(static_cast<uint32_t>(t))->name) + " " +
+                             std::to_string(rows) + "x" + std::to_string(cols);
+    std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
+}
+
+// The routed down projection of a window, gemv_q8_experts on 8 x 10 slots each with its own activations (past one
+// launch's 48 KB of shared memory), against eight launches of 10 slots, byte for byte.
+void check_experts_down_window(Type t, int rows, int cols) {
+    constexpr int kSlots = 80, kRoutes = 10;
+    const int units = cols / 32;
+    const uint64_t matrix = row_bytes(*type_info(static_cast<uint32_t>(t)), cols) * rows;
+    const std::vector<uint8_t> down = random_matrix(t, rows * kSlots, cols, 91);
+    DeviceBuffer<uint8_t> dm(down);
+    std::vector<const uint8_t*> table;
+    for (int s = 0; s < kSlots; ++s)
+        table.push_back(dm.get() + (s * 37 % kSlots) * matrix);
+    DeviceBuffer<const uint8_t*> dtable(table);
+    DeviceBuffer<BlockQ8> dx(quantize(activations(kSlots * cols, 92)));
+    DeviceBuffer<float> want(static_cast<size_t>(kSlots) * rows), got(want.bytes() / sizeof(float));
+    for (int c = 0; c < kSlots / kRoutes; ++c)
+        kernels::gemv_q8_experts(t, dtable.get() + c * kRoutes, nullptr, kRoutes, rows, cols,
+                                 dx.get() + c * kRoutes * units, units,
+                                 want.get() + static_cast<size_t>(c) * kRoutes * rows, nullptr);
+    kernels::gemv_q8_experts(t, dtable.get(), nullptr, kSlots, rows, cols, dx.get(), units, got.get(), nullptr);
+    const bool same = same_bits(got.download(), want.download());
+    CHECK(same);
+    const std::string what = "experts down 80 slots " + std::string(type_info(static_cast<uint32_t>(t))->name) + " " +
+                             std::to_string(rows) + "x" + std::to_string(cols);
+    std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
+}
 
 int main() {
     try {
@@ -375,6 +634,26 @@ int main() {
         check_group({{Type::Q4_K, 37}, {Type::IQ4_XS, 37}}, true);                   // the shared expert's gate and up
         check_group({{Type::Q6_K, 37}, {Type::Q5_K, 37}}, true);
         check_group({{Type::Q6_K, 37}, {Type::Q6_K, 37}}, true);
+        // verify-window columns
+        for (Type t : {Type::Q8_0, Type::Q2_0, Type::IQ4_NL, Type::IQ4_XS, Type::Q4_K, Type::Q5_K, Type::Q6_K,
+                       Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S}) {
+            check_columns(t, 37, 2560);
+            if (type_info(static_cast<uint32_t>(t))->block_elements <= 64)
+                check_columns(t, 37, 640);
+        }
+        check_columns(Type::Q6_K, 37, 6144);  // eight columns of activations past 48 KB of shared memory
+        check_group_columns({{Type::IQ4_XS, 61}, {Type::Q6_K, 7}, {Type::Q5_K, 9}}, false);
+        check_group_columns({{Type::Q4_K, 37}, {Type::IQ4_XS, 37}}, true);
+        check_bf16_columns(37, 0, 320, 0.0f);
+        check_bf16_columns(320, 4, 10240, 0.25f);
+        check_bf16_columns(37, 5, 2560, 0.0f);
+        for (Type t : {Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S, Type::IQ4_XS})
+            check_experts_window(t, 37, 2560);  // gate and up of the routed experts, 37 rows of 2,560
+        for (Type t : {Type::IQ4_NL, Type::Q2_0})
+            check_experts_down_window(t, 37, 640);
+        for (Type t : {Type::IQ4_NL, Type::Q2_0})
+            check_down_window(t, 37, 640);  // routed down: rows of 640
+        check_down_window(Type::IQ4_NL, 2560, 640);
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "gemv_test: %s\n", e.what());

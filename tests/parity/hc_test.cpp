@@ -87,6 +87,53 @@ void check_combine_norm() {
     std::printf("%-40s %s\n", "hc_combine_norm = combine + rms_norm", same ? "ok" : "FAIL");
 }
 
+// Every kernel's multi-column launch (a verify window) equals, column by column and bit for bit, its one-column
+// launch on that column.
+void check_columns() {
+    constexpr int kT = 5;
+    const size_t HCD = static_cast<size_t>(kHc) * kN;
+    const std::vector<float> xn = test::random_floats(kT * HCD, -2, 2, 31),
+                             gate = test::random_floats(kT * HCD, -3, 3, 32);
+    const std::vector<float> res = test::random_floats(kT * HCD, -2, 2, 33),
+                             out = test::random_floats(kT * kN, -2, 2, 34);
+    const std::vector<float> inject = test::random_floats(kT * kHc, -6, 6, 35),
+                             w = test::random_floats(HCD, 0.5, 1.5, 36);
+    const std::vector<float> x = test::random_floats(kT * kN, -2, 2, 37);
+    bool same = true;
+    // all columns at once
+    DeviceBuffer<float> dxn(xn), dgate(gate), dmixed(kT * kN), dres(res), dres2(res), dout(out), dinject(inject), dw(w),
+        dxn2(kT * HCD), dx(x), dbroad(kT * HCD);
+    DeviceBuffer<kernels::BlockQ8> dq8(kT * kN / 32);
+    kernels::hc_collapse(dxn.get(), dgate.get(), dmixed.get(), dq8.get(), kN, kHc, nullptr, kT);
+    kernels::hc_combine(dres.get(), dout.get(), dinject.get(), kN, kHc, nullptr, kT);
+    kernels::hc_combine_norm(dres2.get(), dout.get(), dinject.get(), dw.get(), dxn2.get(), kN, kHc, 1e-6f, nullptr, kT);
+    kernels::hc_broadcast(dx.get(), dbroad.get(), kN, kHc, nullptr, kT);
+    const std::vector<float> mixed = dmixed.download(), res_c = dres.download(), res_n = dres2.download(),
+                             xn_n = dxn2.download(), broad = dbroad.download();
+    const std::vector<kernels::BlockQ8> q8 = dq8.download();
+    for (int t = 0; t < kT; ++t) {  // one column at a time
+        const auto part = [&](const std::vector<float>& v, size_t n) {
+            return std::vector<float>(v.begin() + static_cast<std::ptrdiff_t>(t * n),
+                                      v.begin() + static_cast<std::ptrdiff_t>((t + 1) * n));
+        };
+        DeviceBuffer<float> cxn(part(xn, HCD)), cgate(part(gate, HCD)), cmixed(kN), cres(part(res, HCD)),
+            cres2(part(res, HCD)), cout(part(out, kN)), cinject(part(inject, kHc)), cxn2(HCD), cx(part(x, kN)),
+            cbroad(HCD);
+        DeviceBuffer<kernels::BlockQ8> cq8(kN / 32);
+        kernels::hc_collapse(cxn.get(), cgate.get(), cmixed.get(), cq8.get(), kN, kHc, nullptr);
+        kernels::hc_combine(cres.get(), cout.get(), cinject.get(), kN, kHc, nullptr);
+        kernels::hc_combine_norm(cres2.get(), cout.get(), cinject.get(), dw.get(), cxn2.get(), kN, kHc, 1e-6f, nullptr);
+        kernels::hc_broadcast(cx.get(), cbroad.get(), kN, kHc, nullptr);
+        same = same && cmixed.download() == part(mixed, kN) && cres.download() == part(res_c, HCD) &&
+               cres2.download() == part(res_n, HCD) && cxn2.download() == part(xn_n, HCD) &&
+               cbroad.download() == part(broad, HCD);
+        const std::vector<kernels::BlockQ8> one = cq8.download();
+        same = same && std::memcmp(one.data(), q8.data() + t * (kN / 32), one.size() * sizeof(kernels::BlockQ8)) == 0;
+    }
+    CHECK(same);
+    std::printf("%-40s %s\n", "5 columns = 5 one-column launches", same ? "ok" : "FAIL");
+}
+
 void check_broadcast() {
     const std::vector<float> x = test::random_floats(kN, -2, 2, 7);
     DeviceBuffer<float> dx(x), dres(static_cast<size_t>(kHc) * kN);
@@ -108,6 +155,7 @@ int main() {
         check_collapse();
         check_combine();
         check_combine_norm();
+        check_columns();
         check_broadcast();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

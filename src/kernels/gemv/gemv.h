@@ -26,6 +26,7 @@
 #include <cstdint>
 
 #include "formats/types.h"
+#include "kernels/columns.h"
 
 namespace torch::kernels {
 
@@ -48,8 +49,13 @@ void upload_iq_tables();
 // IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS).
 bool gemv_q8_supports(Type type);
 
+// Columns (verify windows): the dense entry points take `columns` (1 to kMaxColumns = 8) inputs and outputs, column
+// after column (x[t * cols / 32 + u] or x[t * cols + i], y[t * rows + r]), and each column's output is bitwise what
+// the one-column call computes on that column. A row's weights are read once for all its columns.
+
 // y[r] = W[r] . x for r < rows, with x as cols / 32 blocks.
-void gemv_q8(Type type, const uint8_t* w, int rows, int cols, const BlockQ8* x, float* y, cudaStream_t stream);
+void gemv_q8(Type type, const uint8_t* w, int rows, int cols, const BlockQ8* x, float* y, cudaStream_t stream,
+             int columns = 1);
 
 // One dense matrix of a group launch.
 struct Q8Part {
@@ -65,16 +71,17 @@ bool gemv_q8_groups(Type type);
 // Up to 3 dense matrices of one width that read the same activations, in one launch, each row bitwise as gemv_q8
 // computes it: parts[i].y = W_i x. With `swiglu` (2 parts of equal rows, gate then up): parts[0].y = silu(W_0 x) *
 // (W_1 x), bitwise as swiglu (kernels/moe) of the two products. Every part's format must pass gemv_q8_groups.
-void gemv_q8_group(const Q8Part* parts, int count, int cols, const BlockQ8* x, bool swiglu, cudaStream_t stream);
+void gemv_q8_group(const Q8Part* parts, int count, int cols, const BlockQ8* x, bool swiglu, cudaStream_t stream,
+                   int columns = 1);
 
 // y[r] = W[r] . x for BF16 weights and F32 activations, accumulated in F32 (cols % 8 == 0, rows 16-byte aligned).
-void gemv_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, cudaStream_t stream);
+void gemv_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, cudaStream_t stream, int columns = 1);
 
 // Two BF16 matrices of the same width and input in one launch: y = W x (rows rows) and y2 = W2 x (rows2 rows), each
 // row bitwise as gemv_bf16 computes it. A non-zero silu_scale makes y = silu(silu_scale * W x), bitwise as
 // silu_scale (kernels/hc) applied to it: a mixer's low-rank activation, with its inject rows as W2.
 void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, int cols, const float* x, float* y,
-                    float* y2, cudaStream_t stream, float silu_scale = 0.0f);
+                    float* y2, cudaStream_t stream, float silu_scale = 0.0f, int columns = 1);
 
 // Routed experts. For each slot s < slots, W_s = table[s] (a device-readable pointer table, so a resident expert and
 // one read into a staging slot run the same code) and x_s = x + s * x_stride blocks:
@@ -82,5 +89,28 @@ void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, in
 //   up_table != nullptr: y[s * rows + r] = silu(W_s[r] . x_s) * (U_s[r] . x_s), U_s = up_table[s]  (gate and up)
 void gemv_q8_experts(Type type, const uint8_t* const* table, const uint8_t* const* up_table, int slots, int rows,
                      int cols, const BlockQ8* x, int64_t x_stride, float* y, cudaStream_t stream);
+
+// The routed gate and up projections of a verify window of `window` columns (1 to kMaxColumns), each unique expert's
+// rows read once for all the columns that routed it. Unique expert u < *count (device memory; at most `slots`) has gate
+// matrix gate[u] and up matrix up[u]; bit t of columns[u] is set when column t routed it, at rank rank[u * kMaxColumns
+// + t] (the window gate's GateTables: gate = table, up = table + kGateSlots). For each such (u, t) and row r < rows:
+//   h[(t * k + rank) * rows + r] = silu(G_u[r] . x_t) * (U_u[r] . x_t),   x_t = x + t * cols / 32 blocks,
+// bitwise what gemv_q8_experts computes for column t's routes (its h, K slots of rows), so h is [window][k][rows].
+// The down projection then runs on h quantized in one launch (gemv_q8_experts_down_window). One column runs
+// gemv_q8_experts itself (unique index = rank).
+void gemv_q8_experts_window(Type type, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* columns,
+                            const int8_t* rank, const int32_t* count, int slots, int k, int rows, int cols,
+                            const BlockQ8* x, float* h, int window, cudaStream_t stream);
+
+// The routed down projections of a verify window, each unique expert's down matrix read once for all the columns
+// that routed it (rows of fewer than 1,024 values, the model's 640). Unique expert u < *count has down matrix down[u]
+// (GateTables: table + 2 * kGateSlots); columns and rank as for gemv_q8_experts_window. For each routed (u, t) at rank
+// r and row i < rows, with slot s = t * k + r:
+//   y[s * rows + i] = D_u[i] . x_s,   x_s = x + s * cols / 32 blocks (h of slot s, quantized),
+// bitwise what gemv_q8_experts(type, down_routes, nullptr, window * k, rows, cols, x, cols / 32, y) computes, so y is
+// [window * k][rows] and moe_combine reads it unchanged. One column runs gemv_q8_experts itself.
+void gemv_q8_experts_down_window(Type type, const uint8_t* const* down, const uint8_t* columns, const int8_t* rank,
+                                 const int32_t* count, int slots, int k, int rows, int cols, const BlockQ8* x, float* y,
+                                 int window, cudaStream_t stream);
 
 }  // namespace torch::kernels

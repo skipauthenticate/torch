@@ -20,7 +20,12 @@ struct ArgmaxResult {
 
 inline constexpr int kArgmaxBlocks = 64;
 
-// out = the largest x[i] for i < n and its lowest index. scratch holds kArgmaxBlocks results.
-void argmax(const float* x, int n, ArgmaxResult* scratch, ArgmaxResult* out, cudaStream_t stream);
+// out = the largest x[i] for i < n and its lowest index. scratch holds kArgmaxBlocks results. With `columns`, a
+// window's logits [T][n] in one launch: out[t] for column t, scratch [T][kArgmaxBlocks].
+void argmax(const float* x, int n, ArgmaxResult* scratch, ArgmaxResult* out, cudaStream_t stream, int columns = 1);
+
+// prob = 1 / (sum over i < n of expf(x[i] - best->value)): the softmax probability of the largest of n logits, as
+// argmax found it. One block; a fixed-order sum, so the result never depends on timing.
+void argmax_prob(const float* x, int n, const ArgmaxResult* best, float* prob, cudaStream_t stream);
 
 }  // namespace torch::kernels

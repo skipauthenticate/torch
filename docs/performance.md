@@ -5,7 +5,7 @@ experts it routes to, and the GPU can stream about 180 GB/s. This page turns tha
 every milestone has a target we can check.
 
 Sizes on this page are in GB (10^9 bytes) so they divide by GB/s; file sizes elsewhere are in GiB. **[file]**,
-**[M2]**, **[M3]** and **[est]** mean what they mean in [architecture.md](architecture.md).
+**[M2]**, **[M3]**, **[M4]** and **[est]** mean what they mean in [architecture.md](architecture.md).
 
 ## Bytes per token
 
@@ -140,6 +140,103 @@ On the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz), 2026-11-03 and 2026-1
   71.8 ms reading the ~71 missed experts (about 1 ms each), 12.7 ms other host work. With every expert read from the
   SSD, a token takes 0.42-0.55 s.
 
+## M4: verify windows and the draft layer
+
+Measured on the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz) on 2026-11-05 [M4]. Prompts are the M3 prompts of
+1,455-1,520 tokens and 256 generated tokens, unless stated otherwise.
+
+### Window cost by width
+
+The kernel harness (`bench/kernels.cu --columns T`), ms per window, at position 1,800 for attention:
+
+| Part of a window | T = 1 | T = 2 | T = 4 | T = 8 |
+| --- | ---: | ---: | ---: | ---: |
+| Dense matrices (every matrix but the routed experts) | 26.3 | 28.4 | 34.3 | 52.5 |
+| Routed experts, routes drawn uniformly from 256 (almost no sharing) | 6.97 | 16.1 | 31.8 | not measured |
+| Attention, 12 layers (`attention_decode`) | 0.51 | 0.80 | 1.42 | 2.63 |
+| DeltaNet recurrence, 36 layers (`gdn`) | 1.30 | 1.50 | 1.88 | 2.67 |
+| The whole window, end to end (model, not harness) | 40.3 | 51.0 | 73.6 | 123.5 |
+
+- The end-to-end row is the model itself, teacher-forced (`torch run --window T`, review prompt 1, `calib.txt`),
+  measured with stage timestamps on 2026-11-05 before the window down projection and the two-row dense kernels.
+- The routed-expert row was measured before the down projection read each unique expert once; real windows share
+  experts between columns, which that row does not.
+- Every dense kernel at 8 columns takes less than twice its 4-column time. The output head (Q6_K, 248,320 x 2,560)
+  takes 3,156 us at T = 1, 3,277 at 2, 3,989 at 4 and 5,662 at 8.
+- The 6,144-wide Q6_K projections take 85.2 us at T = 1 and 125.2 at T = 4, since a lane group takes two rows at 3
+  and 4 columns.
+
+### The draft layer
+
+- **Acceptance**: eager, one column, from the 9 benchmark prompts, 128 generated tokens, at depth 7. Acceptance at
+  depth j is given every earlier draft right; "mean (3)" counts the leading right drafts of 3. It was measured with the
+  8-bit draft file and the full head (`bench/draft_acceptance.py`):
+
+  | Workload | d1 | d2 | d3 | d7 | Mean (3) | Mean (7) |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | Code review | 85.1 | 80.6 | 78.7 | 75.6 | 2.08 | 3.18 |
+  | Prose | 83.7 | 78.9 | 74.2 | 62.7 | 1.99 | 2.85 |
+  | Repetition | 100.0 | 99.7 | 98.1 | 91.1 | 2.98 | 6.32 |
+
+  - One RMS over all four streams instead of one per stream: depth 1 falls from 89.6% to 86.0% over all workloads.
+  - The 40,960-row head subset: 2.33 against 2.35 accepted drafts of 3.
+  - A draft's own probability predicts its acceptance: 65% of drafts have p >= 0.99, and 98% of those are accepted,
+    against 29-31% below p = 0.5.
+- **Tokens per window**, greedy speculation with 3 drafts on all of them: code review 2.99, prose 3.15, repetition
+  3.97. The generated ids are the same as without speculation on all nine prompts.
+- **Drafting time per window**, 3 drafts, the IQ4 draft file:
+  - 7.5 ms eager.
+  - 6.6 ms eager with fc_hidden read once per pass (the four streams as four columns).
+  - 6.2 ms with the passes as CUDA graphs, measured against 6.6 eager in the same session.
+  - With the adaptive-stop policy and up to 5 drafts: 4.6-5.8 ms on prose.
+- **The IQ4 draft file** against the all-Q8_0 one, the same binary on the review prompts: 33.75 / 31.92 / 30.15 ->
+  35.45 / 33.48 / 31.68 tok/s; 636 more trunk experts resident and about half the misses.
+
+### Residency during generation
+
+`--swap N`: after each window, up to N missed experts take the slots of the least recently routed ones. On the
+review prompts, each prompt running every setting in one session, tok/s and misses during generation:
+
+| Prompt | No swaps | --swap 8 | --swap 16 | --swap 32 | --swap 16 --swap-prompt 0 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Code review 1 | 32.72 (1,674) | 32.89 (1,319) | 36.08 (756) | 36.32 (684) | 36.10 (622) |
+| Code review 2 | 31.47 (1,616) | 29.69 (1,982) | 32.44 (957) | 33.26 (847) | 33.78 (729) |
+| Code review 3 | 27.94 (2,546) | 29.68 (1,808) | 31.48 (1,134) | 31.85 (1,006) | 32.01 (924) |
+
+- In a later session, `--swap 32 --swap-prompt 0` beat `--swap 16 --swap-prompt 0` on all three prompts (35.14
+  against 34.39 tok/s on the mean), and became the benchmark setting.
+- Swaps cost 0.25-0.40 ms per generated window. A swap was 0.4 ms while `cudaMemcpyAsync` copied between two mapped
+  pinned buffers on the CPU, and is about 0.05 ms as a GPU copy kernel.
+- The prompt's own swaps did not help.
+- Trunk residency varies by up to ~1,300 experts between runs of a session, with whatever else holds memory at load,
+  which is worth about +-2% tok/s.
+
+### The sampler
+
+`sample_columns` with penalties, top-k, top-p and min-p takes 1.11 ms per window at T = 1, 1.20 at T = 4 and 1.57 at
+T = 8, and with temperature only 0.23, 0.33 and 0.46 ms. Each column is one block, and its sweeps over the 1 MB of
+probabilities are latency-bound.
+
+### M4 decode
+
+The benchmark command is `bench/run_workloads.py` with `--placement calib-spec.txt` and `--spec-args "--draft DRAFT
+--draft-variants stream:40960 --draft-vocab VOCAB --spec 5 --spec-policy adaptive-stop --swap 32 --swap-prompt 0"`.
+Medians of three requests:
+
+| Workload | Speculative tok/s | Tokens per window | One token at a time |
+| --- | ---: | ---: | ---: |
+| Code review | 37.23 | 2.63 | 24.15 |
+| Prose | 40.32 | 2.93 | 24.42 |
+| Repetition | 53.85 | 5.71 | 23.75 |
+
+- Measured on 2026-11-08 at 9dd7fb8 (`bench/results/2026-11-08-9dd7fb8-spec.json` and `2026-11-08-9dd7fb8.json`).
+  The generated ids of all nine requests are identical with and without speculation.
+- Residency decides much of code review's speed. In these runs MemAvailable was 14.9 GiB after loading, the
+  top-up filled it to ~22,800-22,900 resident experts, and 99.95-99.98% of routes hit. On 2026-11-05 the same
+  configuration loaded ~20,700 experts and code review measured a 35.5 median. Compare runs within one session.
+- The one-token column uses `calib.txt`; the speculative one uses `calib-spec.txt`, route counts from the held-out
+  calibration prompts decoded speculatively (`run_workloads.py --calibrate`).
+
 ## Targets
 
 Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in
@@ -152,6 +249,8 @@ request; it may not close with a failed gate.
 | M4, verify windows + MTP | 45 | | | |
 | M5, copy mode + residency | 50 | 40 | 100 | |
 | M6, long context | | | | 1,000 (about 4 s to the first token) |
+
+M4 measured 37.2 on code review against its goal of 45; the goal carries to M5.
 
 M3's 30 tok/s is 86% of the physical ceiling across roughly a thousand launches, which is why its gate is 27:
 that is ambitious [est]. M3 measured 25.4 on code review (25.7 prose, 24.3 repetition) and merged below its gate by

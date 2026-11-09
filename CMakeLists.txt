@@ -56,9 +56,11 @@ endif()
 add_library(torch_core STATIC
   src/core/budget.cpp
   src/core/placement.cpp
+  src/core/swaps.cpp
   src/formats/types.cpp
   src/gguf/gguf.cpp
   src/model/config.cpp
+  src/model/window_policy.cpp
   src/runtime/direct_io.cpp
   src/runtime/hedged_reads.cpp
   src/runtime/ple_rows.cpp)
@@ -88,6 +90,8 @@ if(TORCH_CUDA)
     src/kernels/norm/norm.cu
     src/kernels/ple/ple.cu
     src/kernels/sampling/argmax.cu
+    src/model/draft.cpp
+    src/kernels/sampling/sample.cu
     src/model/model.cpp
     src/model/weights.cpp
     src/runtime/expert_gate.cu

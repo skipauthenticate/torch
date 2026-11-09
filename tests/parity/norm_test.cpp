@@ -82,6 +82,59 @@ void check_rms_q8() {
     std::printf("%-40s %s\n", "rms_norm_q8 = rms_norm + quantize_q8", same ? "ok" : "FAIL");
 }
 
+// A multi-column launch equals, column by column and bit for bit, the one-column launch on that column: the mixer's
+// norm (a weight per group), the gated norm with Q8 output, and the L2 norm.
+void check_columns() {
+    constexpr int kT = 3;
+    bool same = true;
+    struct Shape {
+        int n, groups, w_stride;
+        bool gated;
+    };
+    for (const Shape sh : {Shape{2560, 4, 2560, false}, Shape{128, 48, 0, true}}) {
+        const size_t per = static_cast<size_t>(sh.n) * sh.groups;
+        const std::vector<float> x = test::random_floats(kT * per, -3, 3, 41),
+                                 gate = test::random_floats(kT * per, -4, 4, 42);
+        const std::vector<float> w = test::random_floats(sh.w_stride ? per : static_cast<size_t>(sh.n), 0.5f, 1.5f, 43);
+        DeviceBuffer<float> dx(x), dgate(gate), dw(w), dout(kT * per), dl2(kT * per);
+        DeviceBuffer<kernels::BlockQ8> dq8(kT * per / 32);
+        const float* g = sh.gated ? dgate.get() : nullptr;
+        if (sh.n <= 256)  // rms_norm_q8 needs n <= 256; the wide shape runs rms_norm
+            kernels::rms_norm_q8(dx.get(), sh.n, dw.get(), sh.w_stride, g, sh.n, dout.get(), sh.n, dq8.get(), sh.n,
+                                 sh.groups, 1e-6f, nullptr, kT);
+        else
+            kernels::rms_norm(dx.get(), sh.n, dw.get(), sh.w_stride, g, sh.n, dout.get(), sh.n, sh.n, sh.groups, 1e-6f,
+                              nullptr, kT);
+        kernels::l2_norm(dx.get(), sh.n, dl2.get(), sh.n, sh.n, sh.groups, 1e-6f, nullptr, kT);
+        const std::vector<float> out = dout.download(), l2 = dl2.download();
+        const std::vector<kernels::BlockQ8> q8 = dq8.download();
+        for (int t = 0; t < kT; ++t) {
+            const auto part = [&](const std::vector<float>& v) {
+                return std::vector<float>(v.begin() + static_cast<std::ptrdiff_t>(t * per),
+                                          v.begin() + static_cast<std::ptrdiff_t>((t + 1) * per));
+            };
+            DeviceBuffer<float> cx(part(x)), cgate(part(gate)), cout(per), cl2(per);
+            DeviceBuffer<kernels::BlockQ8> cq8(per / 32);
+            const float* cg = sh.gated ? cgate.get() : nullptr;
+            if (sh.n > 256)
+                kernels::rms_norm(cx.get(), sh.n, dw.get(), sh.w_stride, cg, sh.n, cout.get(), sh.n, sh.n, sh.groups,
+                                  1e-6f, nullptr);
+            else
+                kernels::rms_norm_q8(cx.get(), sh.n, dw.get(), sh.w_stride, cg, sh.n, cout.get(), sh.n, cq8.get(), sh.n,
+                                     sh.groups, 1e-6f, nullptr);
+            kernels::l2_norm(cx.get(), sh.n, cl2.get(), sh.n, sh.n, sh.groups, 1e-6f, nullptr);
+            same = same && cout.download() == part(out) && cl2.download() == part(l2);
+            if (sh.n <= 256) {
+                const std::vector<kernels::BlockQ8> one = cq8.download();
+                same = same &&
+                       std::memcmp(one.data(), q8.data() + t * (per / 32), one.size() * sizeof(kernels::BlockQ8)) == 0;
+            }
+        }
+    }
+    CHECK(same);
+    std::printf("%-40s %s\n", "3 columns = 3 one-column launches", same ? "ok" : "FAIL");
+}
+
 void check_l2() {
     const int n = 128, groups = 16;
     const float eps = 1e-6f;
@@ -112,6 +165,7 @@ int main() {
         check_rms({"rms_norm no weight", 2560, 2, 2560, 0, 0, false, false, false}, 13);
         check_rms({"rms_norm 48 x 128 strided, gate", 128, 48, 256, 0, 128, true, true, false}, 17);
         check_rms_q8();
+        check_columns();
         check_l2();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

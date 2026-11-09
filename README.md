@@ -5,11 +5,13 @@ An inference engine for one model on one device: **Qwen3.8-Flash-Next** on the *
 Supporting a single device lets every kernel, memory decision and default be tuned for the Orin's unified memory,
 small L2 cache and 16 streaming multiprocessors, with no compromises for other hardware.
 
-> **Status: early development (milestone M3).** The engine decodes one token at a time, each token one CUDA graph,
-> at 25.4 tok/s on code review, 25.7 on prose and 24.3 on repetitive text on the Orin (2026-11-04), with output that
-> does not depend on which experts are resident and matches the reference within the parity gate. Speculative
-> decoding is next (M4), and contexts are limited to 2,048 tokens until M6. The [roadmap](docs/roadmap.md) lists what each milestone delivers; the
-> [performance model](docs/performance.md) lists what has been measured and what we expect.
+> **Status: early development (milestone M4).** The engine decodes speculatively: the model's own draft layer
+> proposes up to 5 tokens, one verify window of up to 8 columns checks them, and the generated tokens are the same as
+> one at a time. On the Orin it runs at 37.2 tok/s on code review, 40.3 on prose and 53.9 on repetitive text (medians of three
+> requests, 2026-11-08), with
+> output that does not depend on which experts are resident and matches the reference within the parity gate.
+> Contexts are limited to 2,048 tokens until M6. The [roadmap](docs/roadmap.md) lists what each milestone delivers;
+> the [performance model](docs/performance.md) lists what has been measured and what we expect.
 
 ## Goals
 
@@ -24,12 +26,12 @@ small L2 cache and 16 streaming multiprocessors, with no compromises for other h
 
 - Jetson AGX Orin 64 GB developer kit or module
 - JetPack 7 (L4T R39, CUDA 13)
-- ~85 GB of free NVMe space for the model files: 51.0 GiB of weights, 26.8 GiB of n-gram table, ~1.3 GiB of draft
+- ~85 GB of free NVMe space for the model files: 51.0 GiB of weights, 26.8 GiB of n-gram table, 1.38 GiB of draft
   layer ([model files](docs/model-files.md) has exact sizes and sha256s)
 - The model: `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000{1,2}-of-00002.gguf` from
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-  at revision `ed59f920` (see [the model](docs/architecture.md#the-model)), plus the draft-layer file this project
-  publishes (not yet built)
+  at revision `ed59f920` (see [the model](docs/architecture.md#the-model)), plus the draft-layer file, which
+  `tools/make_draft.py` builds from the original checkpoint (not yet published)
 
 ## Documentation
 

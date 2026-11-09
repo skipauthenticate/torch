@@ -30,7 +30,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, cc: gcc-13, cxx: g++-13, sanitize: OFF, type: Release }
           - { os: ubuntu-24.04, cc: clang-18, cxx: clang++-18, sanitize: ON, type: Debug }
-          - { os: macos-14, cc: clang, cxx: clang++, sanitize: OFF, type: Release }
+          - { os: macos-15, cc: clang, cxx: clang++, sanitize: OFF, type: Release }
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.cc }}
@@ -61,6 +61,8 @@ jobs:
       - run: |
           cmp "$RUNNER_TEMP/fixtures/quant_blocks.bin" tests/fixtures/quant_blocks.bin
           cmp "$RUNNER_TEMP/fixtures/tiny.gguf" tests/fixtures/tiny.gguf
+      - run: python tests/tools/make_draft_test.py
+      - run: python tests/tools/run_workloads_test.py
 
   fuzz:
     runs-on: ubuntu-24.04

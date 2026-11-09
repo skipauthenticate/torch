@@ -1,5 +1,5 @@
 // Parity of the GPU argmax with a scalar scan: random logits, ties (the lowest index must win), the largest value at
-// the first and the last index, and a NaN that must never win.
+// the first and the last index, and a NaN that must never win. And argmax_prob against a double softmax.
 #include "kernels/sampling/argmax.h"
 
 #include <cmath>
@@ -30,6 +30,18 @@ int got(const std::vector<float>& x) {
     return out.download()[0].index;
 }
 
+// The softmax probability of the largest logit, against the double reference.
+void check_prob(const std::vector<float>& x) {
+    DeviceBuffer<float> dx(x), prob(1);
+    DeviceBuffer<ArgmaxResult> scratch(kernels::kArgmaxBlocks), best(1);
+    kernels::argmax(dx.get(), static_cast<int>(x.size()), scratch.get(), best.get(), nullptr);
+    kernels::argmax_prob(dx.get(), static_cast<int>(x.size()), best.get(), prob.get(), nullptr);
+    double sum = 0;
+    for (float v : x)
+        sum += std::exp(static_cast<double>(v) - x[static_cast<size_t>(want(x))]);
+    CHECK(std::fabs(prob.download()[0] / (1.0 / sum) - 1.0) < 1e-5);
+}
+
 }  // namespace
 
 int main() {
@@ -47,7 +59,12 @@ int main() {
         CHECK(got(x) == 0);
         std::vector<float> same(n, 1.0f);  // every logit equal: index 0
         CHECK(got(same) == 0);
-        std::printf("argmax: random, ties, ends and NaN %s\n", test::failures == 0 ? "ok" : "FAIL");
+        check_prob(test::random_floats(n, -20, 20, 2));  // a flat-ish distribution
+        check_prob(test::random_floats(40960, -5, 5, 3));
+        std::vector<float> peaked = test::random_floats(n, -20, 0, 4);
+        peaked[1234] = 30.0f;  // probability ~1
+        check_prob(peaked);
+        std::printf("argmax: random, ties, ends and NaN, and argmax_prob %s\n", test::failures == 0 ? "ok" : "FAIL");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "argmax_test: %s\n", e.what());
         return 1;

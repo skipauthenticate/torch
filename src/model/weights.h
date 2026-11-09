@@ -103,4 +103,41 @@ private:
     uint64_t arena_bytes_ = 0;
 };
 
+// The draft layer (architecture decision 12): blk.<n_layer> of the draft file, an attention layer with its
+// hyper-connection mixers and experts, and blk.<n_layer>.nextn: the hidden-state projection eh_proj, the norms of its
+// two inputs and the head's mixer. The embedding and the output head are the main file's. Everything is read into an
+// arena of its own, the routed experts included: all resident, so the draft needs no gate.
+class DraftWeights {
+public:
+    static uint64_t bytes(const Config& config, const gguf::File& draft);  // the arena
+
+    // Reads the draft file. Throws Error when it is not a draft-layer file or a tensor is missing, has an unexpected
+    // shape or format, or cannot be read.
+    DraftWeights(const Config& config, const gguf::File& draft, const runtime::DirectFile& file,
+                 runtime::ReadPool& pool);
+    DraftWeights(const DraftWeights&) = delete;
+    DraftWeights& operator=(const DraftWeights&) = delete;
+    ~DraftWeights();
+
+    Layer layer;                         // the block; layer.{gate,up,down}_exps give one expert's layout
+    const uint8_t* gate_exps = nullptr;  // expert 0 of each expert tensor, the others back to back
+    const uint8_t* up_exps = nullptr;
+    const uint8_t* down_exps = nullptr;
+    // eh_proj [fc_embedding | fc_hidden], split at load: fc_embedding takes the normalized token embedding,
+    // fc_hidden one normalized stream of the hidden state.
+    Matrix fc_embedding, fc_hidden;
+    const float* enorm = nullptr;         // n_embd
+    const float* hnorm = nullptr;         // hc x n_embd
+    const float* head_hc_norm = nullptr;  // hc x n_embd
+    Matrix head_hc_down, head_hc_up;
+
+private:
+    DraftWeights() = default;  // the dry run of bytes()
+    void bind(WeightLoader& loader, const Config& config);
+
+    Matrix eh_proj;
+    uint8_t* arena_ = nullptr;
+    uint64_t arena_bytes_ = 0;
+};
+
 }  // namespace torch::model

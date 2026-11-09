@@ -7,9 +7,9 @@ This document explains what the engine does and why. [performance.md](performanc
 around, [roadmap.md](roadmap.md) the order in which it is built, and [model-files.md](model-files.md) the files it
 reads.
 
-Numbers marked **[file]** were read from the GGUF headers at revision `ed59f920` on 2026-11-03. **[M2]** and **[M3]**
-were measured on the owner's Orin by this project's benchmarks (2026-11-03 and 2026-11-04). **[est]** is arithmetic that a later milestone replaces with
-a measurement.
+Numbers marked **[file]** were read from the GGUF headers at revision `ed59f920` on 2026-11-03. **[M2]**, **[M3]** and
+**[M4]** were measured on the owner's Orin (JetPack 7, MAXN, GPU at 1.3 GHz) by this project's benchmarks
+(2026-11-03, 2026-11-04 and 2026-11-05). **[est]** is arithmetic that a later milestone replaces with a measurement.
 
 ## Goals
 
@@ -81,18 +81,22 @@ Thirteen formats in all. One expert (gate, up and down) is 2.0 to 2.3 MB dependi
 ## How a token is generated
 
 ```
-prompt ──► prefill (chunked; decision 11) ──► KV, DeltaNet state, indexer keys, PLE history
-                                                    │
-        ┌───────────────────────────────────────────┘
+prompt ──► prefill (one token at a time until M6; decision 11) ──► KV, DeltaNet state, PLE history,
+                                                                    the draft layer's K/V
+        ┌───────────────────────────────────────────────────────────────┘
         ▼
-  draft: MTP chain (adaptive length, up to 7 drafts) or a prompt-lookup copy (up to 15)
+  draft: MTP chain from the trunk's hidden state, stopped when more drafts cannot pay (decision 7);
+         from M5 also a prompt-lookup copy
         ▼
-  verify: one forward pass over the window of T = drafts + 1 tokens
-        │  each weight is read once for the whole window
+  verify: one forward pass over the window of T = drafts + 1 tokens, 1 to 8 columns
+        │  each dense weight row and each unique routed expert read once for the whole window
         ▼
-  accept: greedy, the longest prefix equal to the model's own argmax;
-          sampled, exact rejection sampling position by position (decision 7)
-  roll back DeltaNet state, conv and PLE history, indexer tail and KV to the accepted length; repeat
+  accept: greedy, the longest prefix equal to the model's own argmax, cut at the first EOS;
+          sampled, an exact accept step per column (decision 7)
+  commit the kept columns: DeltaNet state (replayed when the window was cut), convolution and PLE history;
+  K/V rows past them are rewritten before they are read
+  swap the window's missed experts into residency (decision 8); extend the draft layer over the kept positions
+  repeat
 ```
 
 Decode is a loop of **verify windows**. A window of T tokens reads every dense weight once and every expert used by
@@ -122,30 +126,42 @@ MemAvailable fell 37.5 GiB for a planned 45 GiB [M3]), so after loading the engi
 the next-ranked experts resident until it is down to the floor plus 1.5 GiB (except with `--resident`, which tests use
 to fix residency exactly).
 
-### 2. Columns: 1 to 4 in registers, 5 to 16 on int8 tensor cores, one reduction order
+### 2. Columns: 1 to 8, each bitwise the one-column result
 
-A warp-per-row dp4a kernel over K = 2,560 holds 20 `int32` of Q8 activations per lane per column: 80 registers at
-4 columns, 320 at 16. That wall is why register-resident activations stop paying at about four columns [est]; M4
-measures the per-column cost.
+A verify window multiplies every matrix with T columns, 1 to 8 (`kMaxColumns`, `kernels/columns.h`). A row's weights
+are read once for all its columns, and each column is computed with the one-column kernel's integer sums, F32 formula,
+lane placement and reduction, so it is byte for byte the one-column result.
 
-So every matrix-vector kernel (dense, shared expert, hyper-connection, head, routed expert) takes 1 to 4 columns with
-the activations in registers, and 5 to 16 columns (verify windows and copy windows) go through int8 tensor-core tiles
-(`mma.sync.m16n8k16`, sm_87): 16 weight rows, dequantized to int8 in registers, share each activation fragment held
-in shared memory. Both paths compute one canonical order per format. A row is split into 32-element units, the size
-of an activation block: a unit's dot product is an exact `int32` sum, multiplied by the unit's integer sub-scales in
-`int32`, then by the weight and activation scales in F32 (`src/kernels/gemv/dot_q8.cuh` has the formula per format).
-The F32 unit results are added in one fixed order: lane l of a row's warp sums units l, l + 32, l + 64, ..., and the
-32 lane sums are added in a fixed butterfly. Integer sums are exact in any order and every kernel adds the F32 unit
-results in that order, so the two paths and every window width give bitwise-identical logits. That identity is a CI
-gate on the Orin.
+The canonical order, per format: a row is split into 32-element units, the size of an activation block. A unit's dot
+product is an exact `int32` sum, multiplied by the unit's integer sub-scales in `int32`, then by the weight and
+activation scales in F32 (`src/kernels/gemv/dot_q8.cuh` has the formula per format). Lane l of a row's warp sums units
+l, l + 32, l + 64, ... in that order, and the 32 lane sums are added in a fixed butterfly. Every kernel and every
+window width adds the F32 unit results in that order, so the logits do not depend on the width. `gemv_test` checks
+every format, the grouped launches and the BF16 kernels at 1 to 8 columns against the one-column launch, byte for
+byte, on the Orin.
+
+The column kernels decode a weight unit once and apply it to each column; groups stage each column's activations
+once; at 3 and 4 columns a lane group takes two rows, so one read of a staged activation block feeds both. Measured
+[M4]: every dense kernel at 8 columns takes less than twice its 4-column time, and the dense matrices of a window
+take 26.3 ms at one column, 28.4 at two, 34.3 at four and 52.5 at eight (performance.md, "Window cost by width").
+
+Columns 9 to 16, and int8 tensor-core tiles for them, come with copy windows in M5. At the register wall of the
+warp-per-row kernel (20 `int32` of Q8 activations per lane per column at K = 2,560) the staged column kernels
+already reach 8 columns.
 
 ### 3. Experts grouped across the window
 
-The T tokens of a window route to up to 10 x T experts per layer, with overlap. Experts are grouped so each one is
-read once and applied to every token that chose it; the down projection is applied per token (M4 measures whether
-grouping it pays). The file needs six expert kernels, each specialised at compile time:
-gate/up for IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, down for IQ4_NL and Q2_0 [file]. The accumulation order of a token's
-result never depends on which other tokens share its group (see Numerics).
+The T columns of a window route to up to 10 x T experts per layer, with overlap. One gate launch per layer places
+them all (decision 6): it numbers the window's unique experts (at most 80) in order of first appearance, over
+columns then ranks, so a one-column window numbers them by rank, as one token does. For each unique expert it writes
+the pointers of its three matrices, a mask of the columns that routed it and the rank each one gave it, and it posts
+every missing expert of the layer in one request.
+
+Gate and up then run once per unique expert over the columns that chose it (`gemv_q8_experts_window`), and the down
+projection reads each unique expert's matrix once for its columns, except Q2_0, which stays per route. The combine
+sums each column's ten experts in its own rank order, so a column's result never depends on which other columns share
+its experts. The file needs six expert kernels, each specialised at compile time: gate/up for IQ2_S, IQ3_XXS, IQ3_S
+and IQ4_XS, down for IQ4_NL and Q2_0 [file].
 
 ### 4. Fused hyper-connection mixers
 
@@ -156,27 +172,41 @@ so waiting cannot deadlock and no cooperative launch is needed. The reason is la
 bandwidth: the 97 mixers move 1.29 GB per window [file], 8.3 ms at 155 GB/s [M2], and five launches each would be ~485
 launches per window, 2.5-5 ms of launch overhead alone [est].
 
-### 5. DeltaNet: double-buffered state, operand log, replay on rejection
+### 5. DeltaNet: two state buffers, commit after accept, replay by the same kernel
 
 The DeltaNet state is 113 MB (36 layers x 48 heads x 128 x 128 x F32). Writing it after every window position would
-cost T x 113 MB of writes per window (+0.6 ms per column at 180 GB/s) and 1.8 GiB of buffers at T = 16 [est]. Instead
-the recurrence kernel reads the pre-window state once, walks the T positions in registers, writes the post-window
-state to the other of two buffers, and logs each position's update operands (key, decay, beta, error: ~33 KB per
-layer). Accepting the whole window is a pointer swap. Accepting k < T tokens is one replay pass from the pre-window
-state over k operand rows in the original FMA order, bitwise identical to a fresh run and paid only when a draft was
-rejected (~1.3 ms [est]). The convolution history, the
-PLE hash history and the indexer tail are snapshotted the same way.
+cost T x 113 MB of writes per window. Instead `gdn_window` keeps each state column in registers while it walks the T
+columns, reading the state before the window (buffer A) and writing the state after it (buffer B), and writes the
+gates to a buffer of their own rather than over its inputs. The two buffers swap with every window, so there is one
+graph per width and buffer parity.
 
-### 6. One CUDA graph per token, with experts placed on the GPU
+A window commits only what it keeps (`accept(n)`):
 
-A token (and from M4 a verify window of each width) is recorded once as a CUDA graph and replayed. A replayed graph
+- **All T kept**: nothing to redo; B is the state.
+- **n < T**: the same kernel runs again over the first n columns from A, bitwise the state of n one-token steps. Each
+  DeltaNet layer keeps its window's inputs for this, so there is no operand log and no state copy before a window.
+- **The convolution history** (3 rows per layer) and **the PLE ring** (9 rows) are read, never written, during the
+  window. In-window taps read the column buffers, and commit kernels write the kept columns' rows afterwards. So a
+  rejected column never sits where a later window reads.
+- **Attention K/V**: rows of rejected columns stay in the cache and are rewritten before any read.
+
+`deltanet_test` and `ple_test` check every (T, kept) case against one-token steps bit for bit. Measured at position
+1,800 [M4]: `gdn` 36.0 us per launch at T = 1, 41.6 at 2, 52.1 at 4 and 74.3 at 8; each commit 1.6-2.7 us.
+
+### 6. One CUDA graph per window, with experts placed on the GPU
+
+A verify window of each width (and DeltaNet buffer parity, decision 5) is recorded once as a CUDA graph and
+replayed; a one-token decode is a window of one. A replayed graph
 cannot wait for the host, so expert placement happens on the GPU: a device map gives every (layer, expert) pair the
 addresses of its three matrices, or null when the expert is not resident, and after each router a gate kernel writes
 the layer's expert pointer table from it. When a routed expert is absent, the gate kernel posts the layer's misses to
 a mailbox in mapped pinned memory and waits for the expert store's I/O thread, which reads them into staging slots
 and publishes a sequence number; then it points the table at the staged bytes (decision 8). The expert kernels read
 every expert through the table, so they run the same code on the same bytes whatever the residency (goal 4).
-Sequence numbers only grow, so nothing needs resetting between replays.
+Sequence numbers only grow, so nothing needs resetting between replays. The gate runs once per layer for the whole
+window (decision 3): a missing expert is read once however many columns route to it, and all of a layer's misses go
+out in one request. The mailbox and the table hold 80 experts; the staging buffers hold 84 of each matrix kind
+(about 234 MB of mapped memory, within the budget's fixed reservation).
 
 Measured on the Orin [M3]: the GPU-to-host-and-back round trip is 7.6 us without a read (bench/miss_roundtrip.cu),
 against 21.2 us median and 144 us p99 for a host synchronization per layer; a replayed graph costs about 1.1 us per
@@ -185,21 +215,44 @@ ms. The host's work per token is the embedding row, the PLE rows, one graph laun
 
 ### 7. Speculation the hardware can afford
 
-- **MTP chain** with an adaptive length: drafting stops at the first draft whose probability is below a gate, and
-  the window width comes from a cost model fed by the measured per-column cost.
-- **Prompt-lookup copies**: when the recent output matches an earlier span of the context, the continuation of that span
-  is proposed directly and replaces the neural draft (copy windows are accepted whole on repetitive text, up to T tokens
-  per window [est]).
-- The draft layer's experts run at 4 bits (IQ4_XS), built from the original checkpoint (decision 12) [est: 2 bits loses
-  acceptance, 8 bits gains little]; M4 measures acceptance per precision before the file is published. Drafts are
-  verified exactly, so draft precision affects speed only, never the output.
-- **Exact speculative sampling.** Drafts are argmax tokens (point-mass proposals). Greedy requests accept the longest
-  prefix equal to the target's argmax. Sampled requests go position by position: the drafted token x is accepted with
-  probability p(x) under the target's distribution after temperature, top-k, top-p, min-p and penalties; otherwise a
-  token is sampled from p with x removed and renormalised, and the window ends there. This needs the full
-  248,320-logit distribution per window position on the GPU and a seeded counter-based random generator. It yields the
-  target's distribution exactly, so sampled output has the same distribution with speculation on or off, not the same
-  tokens. A window that runs past EOS or a stop string is cut at the first EOS in the accepted prefix.
+- **The MTP draft layer** (decision 12) drafts from the trunk's own state. Its input at position t is the trunk's
+  4-stream residual after the head mixer's combine and the next token's embedding: S_s = fc_hidden(hnorm(H_t)_s) +
+  fc_embedding(enorm(embedding)), with hnorm one RMS per stream. Then one attention and mixture-of-experts block, the
+  head's mixer and the shared output head. A deeper draft runs the same block from its own state and the previous
+  draft, one position further.
+  - At prompt positions, and at every kept position of a window but the last, it runs a K/V-only pass: the attention
+    mixer and the K/V projections, about 15 MB of weights.
+  - Its K/V rows of accepted positions always come from the trunk's own states. `--check-draft-kv` checks that after
+    N windows they equal a fresh K/V-only pass over the accepted history, bit for bit.
+  - Its argmax scores a 40,960-row subset of the output head: the ids generated from the held-out calibration
+    prompts, by frequency, then the rest by id.
+  - Its passes run as CUDA graphs, one per extend width and one per depth step.
+  - Measured [M4]: one RMS per stream accepted 89.6% at depth 1 against 86.0% for one RMS over all four. The 40,960
+    rows lost 0.02 accepted drafts of 3 against the full head, and cut a draft step from 4.8 to 2.1 ms (eager).
+- **The window policy** chooses how many drafts a window verifies. It picks the d that maximises expected tokens per
+  millisecond, E(d) / cost(d):
+  - E(d) = 1 + q_1 + ... + q_d, with q_i the product of the learned acceptance rates of the drafts' probability
+    buckets: 8 buckets over [0, 1], with priors.
+  - The cost of each width follows the measured times as a moving average.
+  - With `adaptive-stop`, drafting stops once one or two more drafts could not beat the best window so far.
+  - It is deterministic and changes only how many drafts are verified. The benchmarks use `--spec 5 --spec-policy
+    adaptive-stop`: at most 5 drafts, 2.0-2.8 verified on average [M4].
+- **Prompt-lookup copies** (M5): when the recent output matches an earlier span of the context, the continuation of
+  that span is proposed directly, up to T tokens per window [est].
+- **Draft precision**: the draft layer's routed experts are 4-bit. On the review prompts they took the same number
+  of windows as the 8-bit file on two prompts, and one more (81 against 80) on the third [M4]. Drafts are verified
+  exactly, so draft precision affects speed only, never the output.
+- **Exact speculative sampling** (kernels, M4; end to end with the server, M7):
+  - Each column's full 248,320-token distribution is built on the GPU (`sample_columns`): penalties, temperature,
+    exact top-k and top-p, min-p. The token is drawn by an inverse transform with a Philox-4x32-10 number keyed by
+    (seed, position).
+  - `accept_drafts` keeps the longest prefix of drafts equal to the drawn tokens, plus the first token that differs
+    (or the bonus token). A draft x is then accepted with probability q(x), and otherwise the token is a draw from q
+    with x removed and renormalised. So a sampled window gives the very tokens the same seed gives without
+    speculation, for any drafts.
+  - `sample_test` checks this over 30,000 seeds for each of four parameter sets: chi-square z-scores below 1.3 against
+    a double-precision reference.
+  - A window that runs past EOS or a stop string is cut at the first EOS in the accepted prefix.
 
 ### 8. Expert residency and the miss path
 
@@ -211,18 +264,29 @@ keeps as many resident as the budget allows and reads the rest from the SSD:
   (core/placement.h). Each resident matrix sits in a slot of its own layer's exact size. Measured [M3]: with the same
   85% of experts resident, ranking by counts from 800 calibration tokens raised a held-out prompt's hits from 85.4%
   to 95.0% and its decode from 8.65 to 12.48 tok/s.
-- **Prompt-informed warming.** After prefill, the experts the prompt routed to most are swapped in before decoding:
-  a summary or a copy of the prompt uses the same experts as the prompt. A profile learned on one workload serves the
-  others worse [est]; the engine reports hit rate per workload. Misses dominate below ~99% hits.
+- **Residency follows use.** After each window, up to 32 of the experts it read from the SSD take the slots of the
+  least recently routed resident experts of their layers (`--swap 32`, `core/swaps.h`). Ties go to the lower
+  calibration count, and memory stays constant.
+  - The gate kernel stamps every routed (layer, expert) with its window.
+  - The newcomer's bytes are still in the staging buffers, so a GPU copy kernel moves them into the victim's slots on
+    the store's own stream, while the drafter runs, and the map entries change in place. The next window waits for
+    the copies.
+  - None run during the prompt's one-token windows (`--swap-prompt 0`), which measured better.
+  - Measured [M4]: generation misses fell 40-76% on the nine benchmark prompts. A swap costs about 0.05 ms, 0.25-0.40
+    ms per generated window.
+  - Warming from the prompt's own route counts, before generation, ended with more misses than no swaps, and the
+    online swaps subsume it.
+  - Misses still dominate below ~99% hits.
 - **Misses are computed by the same kernel.** The missing expert is read into a staging slot in mapped pinned memory
-  (`O_DIRECT` reads of a 4 KiB-aligned superset in 128 KiB pieces, since GGUF aligns tensors to 32 bytes; 16 reads in
-  flight) and the kernel reads the slot through the pointer table (decision 6). Output does not depend on residency
-  (goal 4). The development Orin's SSD occasionally leaves one read uncompleted until the NVMe driver's 30 s timeout
-  (about once in 240,000 reads of 128 KiB); a miss read still pending after 50 ms is therefore issued again into a
-  spare buffer and the first copy is used, and the late read's buffer stays out of use until it completes.
-- **Prefetch is lossless and measured.** An unpredicted miss costs its layer's segment the SSD latency. Reads start
-  before the router runs, from predictors that only move bytes: prompt-informed warming, the draft chain's own routing
-  for the drafted positions, and the previous windows' experts. A predictor that moves bytes without raising the hit
+  (`O_DIRECT` reads of a 4 KiB-aligned superset in 128 KiB chunks, since GGUF aligns tensors to 32 bytes; the chunks
+  of a request are read in parallel, up to 16 in flight) and the kernel reads the slot through the pointer table
+  (decision 6). Output does not depend on residency (goal 4). The development Orin's SSD occasionally leaves one read
+  uncompleted until the NVMe driver's 30 s timeout (about once in 240,000 reads of 128 KiB); a miss read still pending
+  after 50 ms is therefore issued again into a spare buffer and the first copy is used, and the late read's buffer
+  stays out of use until it completes.
+- **Prefetch is lossless and measured** (M5). An unpredicted miss costs its layer's segment the SSD latency. Reads
+  start before the router runs, from predictors that only move bytes: the draft chain's own routing for the drafted
+  positions, and the previous windows' experts. A predictor that moves bytes without raising the hit
   rate only costs bandwidth, so the engine reports each predictor's hit rate separately from residency and keeps only
   what measures well.
 - **The SSD**: random 2 MiB reads issued as 128 KiB pieces take 1.56 ms median at queue depth 1 and reach 5.4 GB/s at
@@ -258,12 +322,31 @@ indexer tail. Without that every chat turn would re-prefill. The C API cancels a
 
 ### 12. The draft-layer file
 
-The draft layer ships as a separate GGUF whose tensor names follow the main file's convention: `blk.48.*` for the MTP
+The draft layer is a separate GGUF whose tensor names follow the main file's convention: `blk.48.*` for the MTP
 block's attention, hyper-connections, router, routed experts and shared expert, and `blk.48.nextn.{eh_proj, enorm,
-hnorm, hc_head_norm, hc_head_down, hc_head_up}`. Routed experts are IQ4_XS, everything else Q8_0, about 1.3 GiB [est].
-`tools/make_draft.py` builds it from the MTP shards of the original checkpoint with this project's writer and
-quantizers (M4). [model-files.md](model-files.md) lists it; it is published
-only once the base model's license allows redistribution (the Hugging Face card says "other").
+hnorm, hc_head_norm, hc_head_down, hc_head_up}`. `tools/make_draft.py` builds it, with this project's writer and
+quantizers.
+
+- **The source**: the 31 BF16 `mtp.*` tensors of the original checkpoint at a pinned revision, read with HTTP range
+  requests (5.2 GB of the 360 GB; each read must return 206 with the asked Content-Range).
+- **The layout**: the main file's names, `eh_proj` = [fc_embedding | fc_hidden] per row, and the indexer projection and
+  the experts' gate_up split. The nine Gemma-style norm gammas are stored as 1 + w.
+- **A check**: the BF16 intermediate equals an independently converted BF16 file in all 32 tensors, names, shapes,
+  types and every byte [M4].
+- **The file the engine runs** (`--experts iq4`):
+  - routed gate and up are IQ4_XS, and routed down IQ4_NL (its 640-wide rows do not divide into IQ4_XS's 256-value
+    blocks);
+  - attention, shared experts and `eh_proj` are Q8_0;
+  - the router, hyper-connection mixers and indexer are BF16, and the norms F32;
+  - 1,480,786,592 bytes (1.38 GiB), a budget line of 1.46 GiB against 2.61 GiB for the all-Q8_0 file.
+- **The IQ4 quantizers**: a per-block search for the scale that minimises squared error over nearest-level
+  assignments, with exact nearest levels for the F16 scale it picks. IQ4_XS also has 6-bit sub-block scales. Round
+  trip on the real experts: 7.5-7.6% RMS relative error.
+- **Speed** [M4]: against the Q8_0 draft on the review prompts, the IQ4 draft left 636 more trunk experts resident and
+  about half the misses, for 5% more tok/s.
+
+[model-files.md](model-files.md) lists it. It is published only once the base model's license allows redistribution
+(the Hugging Face card says "other").
 
 ### 13. Tokenizer, chat template and sampling
 
@@ -301,7 +384,7 @@ asks for.
 - **Unit tests**: GGUF parsing (valid, corrupt, truncated and split files, plus a fuzz target); dequantization of
   all 13 formats against fixtures generated by the project's numpy reference and regenerated in CI.
 - **Kernel parity**: every GPU kernel against a scalar CPU reference in float, within a stated relative tolerance;
-  GPU against GPU **bitwise** across window widths 1 to 16, across the register and tensor-core paths, across expert
+  GPU against GPU **bitwise** across window widths 1 to 8 (16 and the tensor-core path from M5), across expert
   grouping, and across residency (a run with every expert resident and one with half of them give identical logits:
   goal 4).
 - **Model parity**: next-token log-probabilities on fixed prompts against the committed reference log-probabilities
@@ -309,7 +392,9 @@ asks for.
   rule, and a mean per-position KL divergence within twice the reference's own spread between two runs with
   different numerics. M2 fixed the values (development.md, "Model parity").
 - **Speculation is invisible**: greedy output with speculation on equals greedy output with it off, token for token,
-  on every benchmark prompt; M4 adds a distribution test for sampled output.
+  on every benchmark prompt, with and without swaps (M4: the nine prompts, 256 tokens). The draft layer's K/V after
+  N windows equals a fresh pass over the accepted history, bit for bit (`--check-draft-kv`). The sampler passes a
+  distribution test (`sample_test`).
 - **Long context**: needle retrieval at 32K, 128K and 256K.
 
 ## Source layout
