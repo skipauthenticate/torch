@@ -6,6 +6,8 @@
 // its down projection's launch, and the matrices that read one input in the launches model.cpp groups them into:
 // gemv_q8_group with one quantize_q8, BF16 pairs) and the routed experts (gemv_q8_experts with the model's slot count,
 // gate and up fused, and down), each deduplicated by (kernel, formats, shapes) with the number of launches per token.
+// With --columns T > 1 the matrices run on T columns at once and the routed gate+up and down on a window's unique
+// experts (gemv_q8_experts_window and _down_window, each column keeping half its predecessor's experts).
 // The small kernels (norms, hyper-connection helpers, DeltaNet, rotary embedding, attention, router, PLE) are timed
 // once per token shape with their per-token counts.
 //
@@ -23,7 +25,7 @@
 // the token and PLE row reads, the routing wait, expert reads on a miss, the copies, and the gaps between launches
 // in the real forward pass.
 //
-// usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s, default 180]
+// usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s, default 180] [--columns 1-8]
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -288,6 +290,10 @@ struct Row {
     double ms_per_token() const { return count * us / 1000.0; }
 };
 
+// Columns of a verify window (--columns): the dense matrix products run on this many inputs at once; bytes count the
+// weights once and the inputs and outputs per column.
+int g_columns = 1;
+
 // A matrix-vector product the forward pass runs.
 struct Matvec {
     std::string kernel;  // gemv_q8, gemv_bf16, gemv_q8_group or gemv_q8_experts
@@ -510,26 +516,27 @@ Row time_matrix(const Matvec& c, cudaStream_t stream, Rng& rng) {
     for (uint64_t i = 1; i < copies; ++i)
         std::memcpy(weights.host() + i * stride, weights.host(), matrix_bytes);
     const int launches = static_cast<int>(std::max<uint64_t>(kMinLaunches, copies));
-    Device<float> y(static_cast<size_t>(c.rows + c.rows2));
+    const int T = g_columns;
+    Device<float> y(static_cast<size_t>(c.rows + c.rows2) * T);
 
     Row row{c.kernel, c.name, c.format(), c.shape()};
     row.weight_bytes = static_cast<double>(matrix_bytes);
     row.count = c.count;
     if (c.type == Type::BF16) {
-        Device<float> x = random_floats(static_cast<size_t>(c.cols), -1.0f, 1.0f, rng);
-        row.bytes = row.weight_bytes + 4.0 * (c.cols + c.rows + c.rows2);
+        Device<float> x = random_floats(static_cast<size_t>(c.cols) * T, -1.0f, 1.0f, rng);
+        row.bytes = row.weight_bytes + 4.0 * T * (c.cols + c.rows + c.rows2);
         row.us = time_graph(stream, launches, [&](int i) {
             const uint8_t* w = weights.device() + stride * (static_cast<uint64_t>(i) % copies);
             kernels::gemv_bf16_pair(w, c.rows, w + c.rows * row_size, c.rows2, c.cols, x.get(), y.get(),
-                                    y.get() + c.rows, stream, c.silu_scale);
+                                    y.get() + static_cast<size_t>(c.rows) * T, stream, c.silu_scale, T);
         });
     } else {
         const size_t blocks = static_cast<size_t>(c.cols) / 32;
-        Device<BlockQ8> x = random_q8(blocks, rng);
-        row.bytes = row.weight_bytes + static_cast<double>(blocks * sizeof(BlockQ8)) + 4.0 * c.rows;
+        Device<BlockQ8> x = random_q8(blocks * T, rng);
+        row.bytes = row.weight_bytes + T * (static_cast<double>(blocks * sizeof(BlockQ8)) + 4.0 * c.rows);
         row.us = time_graph(stream, launches, [&](int i) {
             kernels::gemv_q8(c.type, weights.device() + stride * (static_cast<uint64_t>(i) % copies), c.rows, c.cols,
-                             x.get(), y.get(), stream);
+                             x.get(), y.get(), stream, T);
         });
     }
     return row;
@@ -557,24 +564,25 @@ Row time_group(const Matvec& c, cudaStream_t stream, Rng& rng) {
         std::memcpy(weights.host() + i * group_bytes, weights.host(), group_bytes);
     const int launches = static_cast<int>(std::max<uint64_t>(kMinLaunches, copies));
     const size_t blocks = static_cast<size_t>(c.cols) / 32;
-    Device<BlockQ8> x = random_q8(blocks, rng);
-    Device<float> y(static_cast<size_t>(c.rows));
+    const int T = g_columns;
+    Device<BlockQ8> x = random_q8(blocks * T, rng);
+    Device<float> y(static_cast<size_t>(c.rows) * T);
 
     Row row{c.kernel, c.name, c.format(), c.shape()};
     row.weight_bytes = weight_bytes;
-    row.bytes =
-        weight_bytes + static_cast<double>(blocks * sizeof(BlockQ8)) + 4.0 * (c.fused ? c.parts[0].second : c.rows);
+    row.bytes = weight_bytes +
+                T * (static_cast<double>(blocks * sizeof(BlockQ8)) + 4.0 * (c.fused ? c.parts[0].second : c.rows));
     row.count = c.count;
     row.us = time_graph(stream, launches, [&](int i) {
         kernels::Q8Part parts[3];
-        int at = 0;
+        size_t at = 0;
         for (size_t p = 0; p < c.parts.size(); ++p) {
             parts[p] = {c.parts[p].first,
                         weights.device() + group_bytes * (static_cast<uint64_t>(i) % copies) + offsets[p],
                         c.parts[p].second, y.get() + at};
-            at += c.parts[p].second;
+            at += static_cast<size_t>(c.parts[p].second) * T;
         }
-        kernels::gemv_q8_group(parts, static_cast<int>(c.parts.size()), c.cols, x.get(), c.fused, stream);
+        kernels::gemv_q8_group(parts, static_cast<int>(c.parts.size()), c.cols, x.get(), c.fused, stream, T);
     });
     return row;
 }
@@ -616,6 +624,95 @@ Row time_experts(const Matvec& c, int slots, cudaStream_t stream, Rng& rng) {
     row.us = time_graph(stream, launches, [&](int i) {
         kernels::gemv_q8_experts(c.type, table(0, i), c.fused ? table(1, i) : nullptr, slots, c.rows, c.cols, x.get(),
                                  x_stride, y.get(), stream);
+    });
+    return row;
+}
+
+// The routed gate and up (gemv_q8_experts_window) or down (gemv_q8_experts_down_window, c.fused false) of a window of
+// T = g_columns columns: each column routes `k` distinct
+// experts: each of the previous column's experts with probability 1/2, the rest drawn uniformly from `experts`
+// (about 25 unique experts of 40 routes at T = 4; review measured 26). Deduplicated as the window gate does; the row
+// reports the mean unique count. Bytes count each unique expert's matrices once.
+Row time_experts_window(const Matvec& c, int k, int experts, cudaStream_t stream, Rng& rng) {
+    constexpr int kSlots = 80;
+    const int T = g_columns;
+    const uint64_t slice = static_cast<uint64_t>(c.rows) * row_bytes(*type_info(static_cast<uint32_t>(c.type)), c.cols);
+    const uint64_t pool_slices = std::max<uint64_t>(kSlots, copies_for(slice * (c.fused ? 2 : 1)));
+    const int launches = static_cast<int>(std::max<uint64_t>(kMinLaunches, (pool_slices + kSlots - 1) / kSlots));
+    std::vector<std::unique_ptr<Pinned>> pools;
+    const int parts = c.fused ? 2 : 1;
+    for (int p = 0; p < parts; ++p) {
+        pools.push_back(std::make_unique<Pinned>(slice * pool_slices));
+        fill_weights(c.type, pools.back()->host(), slice, rng);
+        for (uint64_t s = 1; s < pool_slices; ++s)
+            std::memcpy(pools.back()->host() + s * slice, pools.back()->host(), slice);
+    }
+    // per launch: gate[80], up[80] pointers, then columns[80], rank[80 * 8], count
+    struct Tables {
+        const uint8_t* gate[kSlots];
+        const uint8_t* up[kSlots];
+        uint8_t columns[kSlots];
+        int8_t rank[kSlots * kernels::kMaxColumns];
+        int32_t count;
+    };
+    Pinned tables(sizeof(Tables) * static_cast<size_t>(launches));
+    auto* host = reinterpret_cast<Tables*>(tables.host());
+    double unique = 0;
+    for (int i = 0; i < launches; ++i) {
+        Tables& t = host[i];
+        std::memset(&t, 0, sizeof t);
+        std::memset(t.rank, -1, sizeof t.rank);
+        std::vector<int> seen, ids_prev;
+        for (int col = 0; col < T; ++col) {
+            std::vector<int> routes;
+            for (int r = 0; col > 0 && r < k; ++r) {
+                const int e = ids_prev[static_cast<size_t>(r)];
+                if (rng.next() % 2 == 0)
+                    routes.push_back(e);
+            }
+            while (static_cast<int>(routes.size()) < k) {
+                const int e = static_cast<int>(rng.next() % static_cast<uint64_t>(experts));
+                if (std::find(routes.begin(), routes.end(), e) == routes.end())
+                    routes.push_back(e);
+            }
+            ids_prev = routes;
+            for (int r = 0; r < k; ++r) {
+                auto it = std::find(seen.begin(), seen.end(), routes[r]);
+                const int u = static_cast<int>(it - seen.begin());
+                if (it == seen.end()) {
+                    seen.push_back(routes[r]);
+                    const uint64_t at = slice * ((static_cast<uint64_t>(i) * kSlots + u) % pool_slices);
+                    t.gate[u] = pools[0]->device() + at;
+                    t.up[u] = pools[static_cast<size_t>(parts - 1)]->device() + at;
+                }
+                t.columns[u] |= static_cast<uint8_t>(1u << col);
+                t.rank[u * kernels::kMaxColumns + col] = static_cast<int8_t>(r);
+            }
+        }
+        t.count = static_cast<int32_t>(seen.size());
+        unique += static_cast<double>(seen.size()) / launches;
+    }
+    const size_t units = static_cast<size_t>(c.cols) / 32;
+    const size_t inputs = c.fused ? static_cast<size_t>(T) : static_cast<size_t>(T) * k;  // down: one a slot
+    Device<BlockQ8> x = random_q8(units * inputs, rng);
+    Device<float> h(static_cast<size_t>(T) * k * c.rows);
+    const auto* dev = reinterpret_cast<const Tables*>(tables.device());
+
+    char name[96];
+    std::snprintf(name, sizeof name, "%s x%d, %.1f unique", c.name.c_str(), k, unique);
+    Row row{c.fused ? "gemv_q8_experts_window" : "gemv_q8_experts_down_window", name, format_name(c.type),
+            shape_name(c.rows, c.cols)};
+    row.weight_bytes = static_cast<double>(slice) * parts * unique;
+    row.bytes = row.weight_bytes + static_cast<double>(units * inputs * sizeof(BlockQ8)) + 4.0 * T * k * c.rows;
+    row.count = c.count;
+    row.us = time_graph(stream, launches, [&](int i) {
+        const Tables& t = dev[i];
+        if (c.fused)
+            kernels::gemv_q8_experts_window(c.type, t.gate, t.up, t.columns, t.rank, &t.count, std::min(T * k, kSlots),
+                                            k, c.rows, c.cols, x.get(), h.get(), T, stream);
+        else
+            kernels::gemv_q8_experts_down_window(c.type, t.gate, t.columns, t.rank, &t.count, std::min(T * k, kSlots),
+                                                 k, c.rows, c.cols, x.get(), h.get(), T, stream);
     });
     return row;
 }
@@ -733,6 +830,40 @@ void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quan
             });
     }
 
+    // Gated DeltaNet in a window of T columns (count 0: not part of a token; divide the time by T for a column).
+    {
+        constexpr int kT = 8;
+        Device<float> state = floats(static_cast<size_t>(3 * CC)), x = floats(static_cast<size_t>(kT * CC)),
+                      w = floats(static_cast<size_t>(4 * CC)), out(static_cast<size_t>(kT * CC));
+        Device<float> beta = floats(static_cast<size_t>(kT * HV)), alpha = floats(static_cast<size_t>(kT * HV)),
+                      dt = floats(static_cast<size_t>(HV)), a = floats(static_cast<size_t>(HV), -1.0f, -0.01f),
+                      gates(static_cast<size_t>(kT * HV * 2));
+        const size_t state_floats = static_cast<size_t>(HV) * DS * DS;
+        const uint64_t copies = std::max<uint64_t>(copies_for(state_floats * sizeof(float)), 2);
+        Device<float> states(state_floats * copies), o(static_cast<size_t>(kT * HV * DS));
+        TORCH_CUDA_CHECK(cudaMemset(states.get(), 0, states.count() * sizeof(float)));
+        const float scale = 1.0f / std::sqrt(static_cast<float>(DS));
+        for (int t : {2, 4, 8}) {
+            const std::string at_t = ", T=" + std::to_string(t);
+            add("conv_silu_l2_window", "channels=" + std::to_string(CC) + at_t, std::to_string(CC),
+                (3.0 * CC + t * (CC + 4.0 * CC + CC)) * F, 0, kLaunches, [&](int) {
+                    kernels::conv_silu_l2_window(state.get(), x.get(), w.get(), out.get(), CC, 2 * QK, cfg.eps, t,
+                                                 stream);
+                });
+            add("conv_commit", "channels=" + std::to_string(CC) + at_t, std::to_string(CC), 6.0 * CC * F, 0, kLaunches,
+                [&](int) { kernels::conv_commit(state.get(), x.get(), CC, t, stream); });
+            add("gdn_window", "heads=" + std::to_string(HV) + at_t, shape_name(HV, DS),
+                2.0 * state_floats * F + t * (2.0 * QK + 2.0 * HV * DS + 6.0 * HV) * F, 0, static_cast<int>(copies),
+                [&](int i) {
+                    const size_t from = state_floats * (static_cast<uint64_t>(i) % copies);
+                    const size_t to = state_floats * (static_cast<uint64_t>(i + 1) % copies);
+                    kernels::gdn_window(states.get() + from, states.get() + to, out.get(), out.get() + QK,
+                                        out.get() + 2 * QK, CC, alpha.get(), beta.get(), dt.get(), a.get(), gates.get(),
+                                        o.get(), KH, HV, scale, t, stream);
+                });
+        }
+    }
+
     // Full attention. The cache rotates through copies, one per layer's worth of bytes.
     {
         const size_t cache_elements = static_cast<size_t>(kAttentionContext) * KV;
@@ -745,16 +876,17 @@ void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quan
             k_cache.upload(row, c * cache_elements), v_cache.upload(row, c * cache_elements);
         Device<int32_t> pos(1);
         pos.upload({kAttentionPosition});
-        Device<float> q = floats(static_cast<size_t>(2 * H * D)), kk = floats(static_cast<size_t>(KV)),
-                      vv = floats(static_cast<size_t>(KV)), out(static_cast<size_t>(H * D));
-        Device<float> scratch(static_cast<size_t>(kernels::attention_scratch_floats(H, kAttentionContext)));
+        constexpr int kT = 8;  // the buffers hold a full window of columns; T = 1 uses the first one
+        Device<float> q = floats(static_cast<size_t>(kT * 2 * H * D)), kk = floats(static_cast<size_t>(kT * KV)),
+                      vv = floats(static_cast<size_t>(kT * KV)), out(static_cast<size_t>(kT * H * D));
+        Device<float> scratch(static_cast<size_t>(kernels::attention_scratch_floats(H, kAttentionContext, kT)));
         const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
         Device<float> wq = floats(static_cast<size_t>(D), 0.5f, 1.5f), wk = floats(static_cast<size_t>(D), 0.5f, 1.5f);
         add("qk_norm_rope_store", "q and k heads", shape_name(H + HKV, D),
             (2.0 * H * D + 2.0 * KV + KV + 2.0 * D) * F + 2.0 * KV * sizeof(uint16_t), attention, kLaunches, [&](int) {
                 kernels::qk_norm_rope_store(q.get(), 2 * D, wq.get(), kk.get(), wk.get(), vv.get(), k_cache.get(),
-                                            v_cache.get(), H, HKV, cfg.n_rot, pos.get(), cfg.rope_base, cfg.eps,
+                                            v_cache.get(), H, HKV, cfg.n_rot, pos.get(), cfg.rope_base, cfg.eps, 1,
                                             stream);
             });
         add("attention_decode", "position " + std::to_string(kAttentionPosition), shape_name(H, D),
@@ -762,9 +894,29 @@ void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quan
             static_cast<int>(copies), [&](int i) {
                 const size_t at = cache_elements * (static_cast<uint64_t>(i) % copies);
                 kernels::attention_decode(q.get(), q.get() + D, 2 * D, k_cache.get() + at, v_cache.get() + at,
-                                          out.get(), scratch.get(), pos.get(), H, HKV, scale, kAttentionContext,
+                                          out.get(), scratch.get(), pos.get(), H, HKV, scale, kAttentionContext, 1,
                                           stream);
             });
+        // Verify windows of T columns at the same position: the K and V rows are read once per window. These rows
+        // are not part of a token (count 0); divide the time by T for the cost per column.
+        for (int t : {2, 4, 8}) {
+            const std::string at_t = ", T=" + std::to_string(t);
+            add("qk_norm_rope_store", "q and k heads" + at_t, shape_name(H + HKV, D),
+                t * ((2.0 * H * D + 2.0 * KV + KV + 2.0 * D) * F + 2.0 * KV * sizeof(uint16_t)), 0, kLaunches,
+                [&](int) {
+                    kernels::qk_norm_rope_store(q.get(), 2 * D, wq.get(), kk.get(), wk.get(), vv.get(), k_cache.get(),
+                                                v_cache.get(), H, HKV, cfg.n_rot, pos.get(), cfg.rope_base, cfg.eps, t,
+                                                stream);
+                });
+            add("attention_decode", "position " + std::to_string(kAttentionPosition) + at_t, shape_name(H, D),
+                2.0 * (kAttentionPosition + t) * KV * sizeof(uint16_t) + t * (2.0 * H * D + H * D) * F, 0,
+                static_cast<int>(copies), [&](int i) {
+                    const size_t at = cache_elements * (static_cast<uint64_t>(i) % copies);
+                    kernels::attention_decode(q.get(), q.get() + D, 2 * D, k_cache.get() + at, v_cache.get() + at,
+                                              out.get(), scratch.get(), pos.get(), H, HKV, scale, kAttentionContext, t,
+                                              stream);
+                });
+        }
     }
 
     // Experts' glue and the shared expert's activation.
@@ -802,6 +954,19 @@ void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quan
         add("ple_conv", "channels=" + std::to_string(HCD), std::to_string(HCD), 12.0 * HCD * F, 1, kLaunches, [&](int) {
             kernels::ple_conv(res.get(), gated.get(), x.get(), hist.get(), w.get(), HCD, pos.get(), stream);
         });
+        Device<float> hist_w = floats(static_cast<size_t>(9 * HCD));
+        Device<float> res_w = floats(static_cast<size_t>(8 * HCD)), gated_w = floats(static_cast<size_t>(8 * HCD)),
+                      x_w = floats(static_cast<size_t>(8 * HCD));
+        for (int t : {2, 4, 8}) {
+            const std::string at_t = ", T=" + std::to_string(t);
+            add("ple_conv_window", "channels=" + std::to_string(HCD) + at_t, std::to_string(HCD),
+                (t * 12.0 - 2.0 * t) * HCD * F, 0, kLaunches, [&](int) {
+                    kernels::ple_conv_window(res_w.get(), gated_w.get(), x_w.get(), hist_w.get(), w.get(), HCD,
+                                             pos.get(), t, stream);
+                });
+            add("ple_commit", "channels=" + std::to_string(HCD) + at_t, std::to_string(HCD), 2.0 * t * HCD * F, 0,
+                kLaunches, [&](int) { kernels::ple_commit(hist_w.get(), x_w.get(), HCD, pos.get(), t, stream); });
+        }
     }
 }
 
@@ -865,7 +1030,8 @@ void write_json(const char* path, const std::vector<Row>& rows, const Totals& t,
                  json_string(TORCH_GIT_SHA).c_str(),
                  json_string(std::filesystem::path(model).filename().string()).c_str(),
                  json_string(power_mode).c_str());
-    std::fprintf(f, "  \"gpu_clock_peak_mhz\": %ld,\n  \"ceiling_gbs\": %.1f,\n  \"cases\": [\n", peak_mhz, ceiling);
+    std::fprintf(f, "  \"gpu_clock_peak_mhz\": %ld,\n  \"ceiling_gbs\": %.1f,\n  \"columns\": %d,\n  \"cases\": [\n",
+                 peak_mhz, ceiling, g_columns);
     for (size_t i = 0; i < rows.size(); ++i) {
         const Row& r = rows[i];
         std::fprintf(f,
@@ -908,11 +1074,14 @@ int run(const std::string& model, const char* json_path, double ceiling) {
         std::fprintf(stderr, "  %-16s %-34s %-8s %s x%d\n", c.kernel.c_str(), c.name.c_str(), c.format().c_str(),
                      c.shape().c_str(), c.count);
         if (c.kernel == "gemv_q8_experts") {
-            rows.push_back(time_experts(c, cfg.n_expert_used, stream, rng));
+            // a window's gate and up run on its unique experts, its down on every (column, rank)
+            const int T = torch::bench::g_columns;
+            rows.push_back(T > 1 ? time_experts_window(c, cfg.n_expert_used, cfg.n_expert, stream, rng)
+                                 : time_experts(c, cfg.n_expert_used, stream, rng));
             // Gate and up read the mixed input as hc_collapse quantized it; the activated experts are quantized for
             // down.
             if (!c.fused)
-                quantize_counts[cfg.n_expert_used * c.cols] += c.count;
+                quantize_counts[cfg.n_expert_used * torch::bench::g_columns * c.cols] += c.count;
         } else {
             rows.push_back(c.kernel == "gemv_q8_group" ? time_group(c, stream, rng) : time_matrix(c, stream, rng));
             if (c.kernel != "gemv_bf16" && c.quantizes)
@@ -944,13 +1113,17 @@ int main(int argc, char** argv) {
             json_path = argv[++i];
         else if (arg == "--ceiling" && i + 1 < argc)
             ceiling = std::atof(argv[++i]);
+        else if (arg == "--columns" && i + 1 < argc)
+            torch::bench::g_columns = std::atoi(argv[++i]);
         else if (arg.rfind("--", 0) != 0 && model.empty())
             model = arg;
         else
             model.clear(), ceiling = 0;
     }
-    if (model.empty() || ceiling <= 0) {
-        std::fprintf(stderr, "usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s]\n");
+    if (model.empty() || ceiling <= 0 || torch::bench::g_columns < 1 || torch::bench::g_columns > 8) {
+        std::fprintf(stderr,
+                     "usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s] "
+                     "[--columns 1-8]\n");
         return 2;
     }
     try {

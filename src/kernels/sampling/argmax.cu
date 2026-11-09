@@ -37,6 +37,7 @@ __device__ void block_best(float& v, int& i) {
 }
 
 __global__ void __launch_bounds__(kThreads) stripes(const float* x, int n, ArgmaxResult* scratch) {
+    x += int64_t{blockIdx.y} * n, scratch += blockIdx.y * kArgmaxBlocks;  // the window column
     float v = -INFINITY;
     int i = INT32_MAX;
     for (int j = blockIdx.x * kThreads + threadIdx.x; j < n; j += gridDim.x * kThreads) {
@@ -49,6 +50,7 @@ __global__ void __launch_bounds__(kThreads) stripes(const float* x, int n, Argma
 }
 
 __global__ void __launch_bounds__(kThreads) final_pass(const ArgmaxResult* scratch, ArgmaxResult* out) {
+    scratch += blockIdx.x * kArgmaxBlocks, out += blockIdx.x;  // the window column
     float v = -INFINITY;
     int i = INT32_MAX;
     if (threadIdx.x < kArgmaxBlocks)
@@ -58,11 +60,25 @@ __global__ void __launch_bounds__(kThreads) final_pass(const ArgmaxResult* scrat
         *out = {i, v};
 }
 
+__global__ void __launch_bounds__(kThreads) prob_kernel(const float* x, int n, const ArgmaxResult* best, float* prob) {
+    const float peak = best->value;
+    float sum = 0;
+    for (int j = threadIdx.x; j < n; j += kThreads)
+        sum += expf(x[j] - peak);
+    sum = block_sum(sum);
+    if (threadIdx.x == 0)
+        *prob = 1.0f / sum;
+}
+
 }  // namespace
 
-void argmax(const float* x, int n, ArgmaxResult* scratch, ArgmaxResult* out, cudaStream_t stream) {
-    stripes<<<kArgmaxBlocks, kThreads, 0, stream>>>(x, n, scratch);
-    final_pass<<<1, kThreads, 0, stream>>>(scratch, out);
+void argmax_prob(const float* x, int n, const ArgmaxResult* best, float* prob, cudaStream_t stream) {
+    prob_kernel<<<1, kThreads, 0, stream>>>(x, n, best, prob);
+}
+
+void argmax(const float* x, int n, ArgmaxResult* scratch, ArgmaxResult* out, cudaStream_t stream, int columns) {
+    stripes<<<dim3(kArgmaxBlocks, columns), kThreads, 0, stream>>>(x, n, scratch);
+    final_pass<<<columns, kThreads, 0, stream>>>(scratch, out);
 }
 
 }  // namespace torch::kernels

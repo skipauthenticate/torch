@@ -1,5 +1,6 @@
 #include "runtime/hedged_reads.h"
 
+#include <algorithm>
 #include <exception>
 
 namespace torch::runtime {
@@ -20,8 +21,10 @@ struct HedgedReads::Buffer {
 
 struct HedgedReads::Task {
     Buffer* buffer = nullptr;
-    uint64_t offset = 0, n = 0;
-    std::atomic<int> status{0};  // 0 pending, 1 done, 2 failed
+    uint64_t first = 0, bytes = 0;       // the page-aligned start of the read and the bytes to read from it
+    std::atomic<uint32_t> remaining{0};  // chunks not yet read
+    std::atomic<bool> failed{false};
+    std::atomic<int> status{0};  // 0 pending, 1 done, 2 failed: set when the last chunk completes
     const uint8_t* result = nullptr;
 };
 
@@ -53,36 +56,45 @@ int HedgedReads::add_pool(uint8_t* base, uint64_t buffer_bytes, int count) {
 
 void HedgedReads::work() {
     for (;;) {
-        std::shared_ptr<Task> task;
+        Chunk chunk;
         {
             std::unique_lock lock(mutex_);
             wake_.wait(lock, [&] { return stop_ || !queue_.empty(); });
             if (stop_ && queue_.empty())
                 return;
-            task = std::move(queue_.front());
+            chunk = std::move(queue_.front());
             queue_.pop_front();
         }
+        Task& task = *chunk.task;
+        const uint64_t at = uint64_t{chunk.j} * kReadChunk;
         try {
-            task->result = file_.read(task->offset, task->n, task->buffer->base);
-            task->status.store(1, std::memory_order_release);
+            // a page-aligned start, so the chunk's bytes land at the same offset in the buffer
+            file_.read(task.first + at, std::min(kReadChunk, task.bytes - at), task.buffer->base + at);
         } catch (const std::exception&) {
-            task->status.store(2, std::memory_order_release);
+            task.failed.store(true, std::memory_order_relaxed);
         }
-        int late = kLate;  // a read that lost to its hedge frees its buffer only now
-        task->buffer->state.compare_exchange_strong(late, kFree);
+        if (task.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {  // the last chunk
+            task.status.store(task.failed.load() ? 2 : 1, std::memory_order_release);
+            int late = kLate;  // a read that lost to its hedge frees its buffer only now
+            task.buffer->state.compare_exchange_strong(late, kFree);
+        }
     }
 }
 
 std::shared_ptr<HedgedReads::Task> HedgedReads::submit(const Request& r) {
     auto task = std::make_shared<Task>();
     task->buffer = take(r.pool);
-    task->offset = r.offset;
-    task->n = r.n;
+    task->first = page_floor(r.offset);
+    task->bytes = r.offset + r.n - task->first;
+    task->result = task->buffer->base + (r.offset - task->first);
+    const uint32_t chunks = static_cast<uint32_t>(std::max<uint64_t>(1, (task->bytes + kReadChunk - 1) / kReadChunk));
+    task->remaining.store(chunks);
     {
         std::lock_guard lock(mutex_);
-        queue_.push_back(task);
+        for (uint32_t j = 0; j < chunks; ++j)
+            queue_.push_back({task, j});
     }
-    wake_.notify_one();
+    wake_.notify_all();
     return task;
 }
 

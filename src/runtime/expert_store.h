@@ -10,11 +10,21 @@
 //
 // Miss reads are hedged (hedged_reads.h): one still pending after 50 ms is issued again into a spare staging buffer,
 // because the development Orin's SSD occasionally leaves a read uncompleted for 30 s.
+//
+// Swaps (core/swaps.h) change which experts are resident while memory stays constant: between windows, a miss of the
+// last window, still in its staging buffers, is copied into the slots of a resident expert of its layer, which stops
+// being resident, and the map entries follow. Same-layer slots have the same size and keep the file's offset within a
+// page. The copies run on the store's own stream, overlapping whatever the caller does before its next window
+// (drafting); before_window() waits for them and frees the staging buffers, which stay reserved until then (or until a
+// request would not fit), so a window's misses can still be copied after it. The gate kernel stamps each routed
+// (layer, expert) with its window in last_use(), the recency swaps go by.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -49,13 +59,14 @@ public:
 
     // What the gate kernel and the expert kernels read; all device-accessible.
     const uint8_t* const* map() const noexcept { return map_; }
-    const uint8_t** table(int layer) const noexcept { return tables_ + int64_t{3} * layer * slots_; }
-    int slots() const noexcept { return slots_; }
+    // The tables the gate kernel writes for a layer's window (expert_gate.h).
+    GateTables gate_tables(int layer) const noexcept;
     Mailbox* mailbox() const noexcept { return mailbox_; }
     uint32_t* seq() const noexcept { return seq_; }
     unsigned long long* counters() const noexcept { return counters_; }
     unsigned long long* route_counts() const noexcept { return route_counts_; }
     const uint8_t* zeros() const noexcept { return zeros_; }
+    uint32_t* last_use() const noexcept { return last_use_; }  // [layer][expert], mapped pinned: read by the host too
 
     // Routed experts found resident and read from the SSD so far, and how often each (layer, expert) was routed
     // (both wait for the GPU).
@@ -67,27 +78,57 @@ public:
     // Throws Error when a miss could not be served (a failed read or the GPU's 2 s timeout); call after a token.
     void check() const;
 
+    // An expert whose gate, up and down matrices are in the staging buffers.
+    struct Staged {
+        int layer, expert;
+        const uint8_t* data[3];
+    };
+    bool resident(int layer, int expert) const noexcept;
+    // The window stamps the gate kernel writes, n_layer * n_expert of them (wait for the GPU before reading).
+    std::span<const uint32_t> stamps() const noexcept { return {last_use_, n_route_counts_}; }
+    void clear_stamps();  // a new sequence: its positions start again at 0
+    // The misses served since the last before_window(), in order. Call between windows (the GPU idle), as the rest.
+    std::vector<Staged> staged() const;
+    // Queues the copy of staged expert `in` into the slots of resident expert `out` of the same layer and changes the
+    // map: `in` becomes resident and `out` not. Throws Error when `in` is resident or `out` is not.
+    void swap_in(const Staged& in, int out);
+    // Marks the end of the swaps queued since the last before_window(), which waits for their copies.
+    void end_swaps();
+    // Before a window: waits for the swaps' copies and map entries, then frees the staging buffers.
+    void before_window();
+
 private:
     void load(const std::vector<std::vector<int32_t>>& resident);  // reads them and updates the device map
     void serve();
 
     const std::vector<model::Layer>& layers_;
     const DirectFile& file_;
-    int slots_;
+    int k_;  // routes per token
     int n_expert_;
     ReadPool pool_;                               // loads the resident experts
     std::vector<uint8_t*> arenas_;                // resident experts, mapped pinned: one allocation per load
     std::vector<const uint8_t*> host_map_;        // the device map's contents
     uint8_t* staging_ = nullptr;                  // the staging buffers, mapped pinned
     std::unique_ptr<HedgedReads> io_;             // the miss reads, into the staging buffers
-    const uint8_t** map_ = nullptr;               // device: [layer][expert][kind]
-    const uint8_t** tables_ = nullptr;            // device: [layer][kind][slot]
+    const uint8_t** map_ = nullptr;               // mapped pinned: [layer][expert][kind]
+    const uint8_t** tables_ = nullptr;            // device: [layer][3][kGateSlots]
+    const uint8_t** down_routes_ = nullptr;       // device: [layer][3][kGateColumns * k]: down, gate, up routes
+    uint8_t* columns_ = nullptr;                  // device: [layer][kGateSlots]
+    int8_t* ranks_ = nullptr;                     // device: [layer][kGateSlots][kGateColumns]
+    int32_t* counts_ = nullptr;                   // device: [layer]
     Mailbox* mailbox_ = nullptr;                  // mapped pinned
     uint32_t* seq_ = nullptr;                     // device
     unsigned long long* counters_ = nullptr;      // device: hits, misses
     unsigned long long* route_counts_ = nullptr;  // device: [layer][expert]
     size_t n_route_counts_ = 0;
-    uint8_t* zeros_ = nullptr;  // device: a zero matrix for timed-out requests
+    uint8_t* zeros_ = nullptr;       // device: a zero matrix for timed-out requests
+    mutable std::mutex io_mutex_;    // io_, staged_ and held_: the I/O thread and swaps between windows
+    std::vector<Staged> staged_;     // misses served since the last before_window()
+    int held_ = 0;                   // experts whose staging buffers are reserved
+    cudaStream_t copies_ = nullptr;  // the swaps' copies
+    cudaEvent_t copied_ = nullptr;   // recorded after them
+    bool pending_ = false;           // swaps queued since the last before_window()
+    uint32_t* last_use_ = nullptr;   // mapped pinned: [layer][expert] window stamps
     std::atomic<bool> stop_{false};
     std::atomic<bool> failed_{false};
     std::atomic<uint64_t> read_ns_{0};

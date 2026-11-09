@@ -21,6 +21,11 @@ namespace torch::runtime {
 
 inline constexpr uint64_t kPage = 4096;
 
+// The most bytes one read call asks the device for. On the Orin's SSD (WD_BLACK SN850X, 128 KiB maximum transfer),
+// single O_DIRECT reads of ~0.9 MiB left a request uncompleted until the driver's 30 s timeout about once in 300
+// reads at queue depth 1; reads of 128 KiB never stalled in 9,000 tries at queue depths 1 and 8 (2026-11-04).
+inline constexpr uint64_t kReadChunk = uint64_t{128} << 10;
+
 constexpr uint64_t page_floor(uint64_t x) {
     return x / kPage * kPage;
 }

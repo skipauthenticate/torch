@@ -7,6 +7,29 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Milestone M4, verify windows and speculative decoding:
+  - `Model::verify(tokens)` runs 1 to 8 tokens as one window, one CUDA graph per width, and `accept(n)` keeps the
+    first n. Every kernel takes the window's columns, and each column is bitwise the one-column result.
+  - Window sequence state: attention writes the window's K/V rows and then attends per column in the one-token
+    order. DeltaNet walks the window in registers from one state buffer into the other and replays the kept columns
+    with the same kernel when a window is cut. The convolution history and the PLE ring are committed after the
+    accept decision.
+  - Routed experts across the window: one gate launch per layer numbers the window's unique experts. Gate and up run
+    once per unique expert over its columns, down once per unique expert (Q2_0 per route), and misses are read once,
+    in 128 KiB chunks in parallel.
+  - The draft layer:
+    - `tools/make_draft.py` builds it from the original checkpoint's MTP tensors with HTTP range reads, as an all-Q8_0
+      file or (`--experts iq4`) with IQ4_XS/IQ4_NL routed experts, using this project's quantizers.
+    - `model::Draft` runs it on the trunk's stream: a K/V-only pass at prompt and kept positions, then the full block
+      and a 40,960-row head subset, as CUDA graphs.
+  - `torch run --spec D` generates speculatively (greedy), with `--spec-policy` choosing the window width from
+    learned acceptance and measured cost. `--check-draft-kv` checks the draft layer's K/V invariant, and
+    `--draft-depth`/`--acceptance-report` measure acceptance per depth.
+  - Exact speculative sampling kernels (`sample_columns`, `accept_drafts`) with a distribution test.
+  - `--swap N` / `--swap-prompt N`: after each window, missed experts take the slots of the least recently routed
+    resident ones. The GPU stamps recency and a GPU copy kernel moves the bytes.
+  - Benchmarks: `bench/run_workloads.py --spec-args`, which also records the speculative summary and MemAvailable;
+    `bench/draft_acceptance.py`; the kernel harness at 1 to 8 columns.
 - Milestone M3, fast decode of one token at a time:
   - Each token runs as one CUDA graph. After each router a gate kernel writes the layer's expert pointer table on
     the GPU from a device map of resident experts; misses go through a mailbox in mapped memory to the expert store's

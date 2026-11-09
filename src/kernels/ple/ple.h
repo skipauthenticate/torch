@@ -28,4 +28,19 @@ void ple_gated_value(const float* value, const float* gate, float* gated, int n,
 void ple_conv(float* res, const float* gated, const float* x, float* hist, const float* w, int channels,
               const int32_t* pos, cudaStream_t stream);
 
+// A window of `columns` (1 to 8) tokens at positions *pos .. *pos + columns - 1: gated, x and res are
+// [columns][channels]. Column t does what ple_conv does at position *pos + t, except that a tap at position *pos + t -
+// b comes from column t - b of x when that is inside the window and from the committed ring otherwise, and the ring is
+// only read. A window that accepts fewer columns than it ran must not leave a rejected column's x in the ring (the next
+// window's tap 9 would read it): ple_commit writes the accepted columns afterwards.
+void ple_conv_window(float* res, const float* gated, const float* x, const float* hist, const float* w, int channels,
+                     const int32_t* pos, int columns, cudaStream_t stream);
+
+// hist row (*pos + t) % 9 = column t of x, for the first `accepted` (1 to 8) columns.
+void ple_commit(float* hist, const float* x, int channels, const int32_t* pos, int accepted, cudaStream_t stream);
+
+// The same with the count in device memory (an int32 holding 1 to 8), so the commit can be captured in a graph.
+void ple_commit(float* hist, const float* x, int channels, const int32_t* pos, const int32_t* accepted,
+                cudaStream_t stream);
+
 }  // namespace torch::kernels

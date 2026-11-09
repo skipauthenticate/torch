@@ -1,6 +1,7 @@
 #include <algorithm>
 
 #include "core/cuda_check.h"
+#include "core/error.h"
 #include "kernels/common.cuh"
 #include "kernels/gemv/dot_q8.cuh"
 #include "kernels/gemv/gemv.h"
@@ -53,8 +54,8 @@ struct Q8Args {
 
 // Shared memory of one block: the format's IQ grid, the activations as Act (one set per slot unless shared), and
 // each slot's matrices (gate, then up): the copies are read once per block instead of once per row group.
-// shortcut: launches ask for no more than the default 48 KB (about 850 activation blocks; the model's largest is the
-// down projection's 200), so a caller with far more slots or columns would need cudaFuncSetAttribute first.
+// Launches stay within the default 48 KB: gemv_q8_experts splits its slots to fit (about 1,000 activation blocks a
+// launch; one token's down projection stages 200, a window of 8 columns 1,600).
 template <Type T>
 size_t q8_shared_bytes(const Q8Args& a) {
     return kGridBytes<T> + sizeof(Act) * static_cast<size_t>(a.x_stride == 0 ? 1 : a.slots) * a.units +
@@ -167,9 +168,16 @@ __global__ void __launch_bounds__(kThreads) gemv_q8_direct_kernel(Q8Args a) {
 // idles. Such a row has at most one unit per canonical lane, so each unit is a canonical lane's whole sum; the sums go
 // through shared memory to the 4 lanes of their row, lane q holding canonical lanes q, q + 4, ..., q + 28 (zero past
 // the row's units) for row_sum<4>.
+constexpr int kQ8ShortRows = 8, kQ8ShortPitch = kWarp + 4;  // the pitch puts the 32 lanes' reads in 32 banks
+
+// gemv_q8_short_kernel's static shared memory (its lane sums), besides q8_shared_bytes.
+constexpr size_t q8_short_static_bytes(bool swiglu) {
+    return sizeof(float) * (kThreads / kWarp) * (swiglu ? 2 : 1) * kQ8ShortRows * kQ8ShortPitch;
+}
+
 template <Type T, bool kSwiglu>
 __global__ void __launch_bounds__(kThreads, kQ8ShortBlocksPerSm) gemv_q8_short_kernel(Q8Args a) {
-    constexpr int kRows = 8, kPitch = kWarp + 4;  // the pitch puts the 32 lanes' reads in 32 banks
+    constexpr int kRows = kQ8ShortRows, kPitch = kQ8ShortPitch;
     constexpr int kParts = kSwiglu ? 2 : 1;
     extern __shared__ uint4 shared[];
     __shared__ float lane_sums[kThreads / kWarp][kParts][kRows * kPitch];
@@ -324,11 +332,11 @@ struct Bf16Rows {
     __device__ const uint4* row(int r) const {
         return reinterpret_cast<const uint4*>(r < rows ? w + r * row_bytes : w2 + (r - rows) * row_bytes);
     }
-    __device__ void store(int r, float sum) const {
+    __device__ void store(int r, float sum, int column = 0) const {
         if (r >= rows)
-            y2[r - rows] = sum;
+            y2[int64_t{column} * (total - rows) + r - rows] = sum;
         else
-            y[r] = scale != 0.0f ? silu(sum * scale) : sum;  // as silu_scale (kernels/hc) of the stored sum
+            y[int64_t{column} * rows + r] = scale != 0.0f ? silu(sum * scale) : sum;  // as silu_scale of the sum
     }
 };
 
@@ -397,6 +405,546 @@ __global__ void __launch_bounds__(kThreads) gemv_bf16_short_kernel(Bf16Rows m, i
         const float sum = row_sum<kShortLanes>(acc);
         if (j == 0 && first + s * kGroups < m.total)
             m.store(first + s * kGroups, sum);
+    }
+}
+
+// ---- Several columns (a verify window) ----------------------------------------------------------------------------
+//
+// The kernels below read each row's weights once and multiply them with up to kCols columns of activations, x and y
+// holding the columns one after the other. Per column they compute exactly what the one-column kernels compute for
+// it: the same integer sums and F32 formula per unit, the same lane placement and row_sum, so every column is bitwise
+// the one-column result (dot_q8.cuh: decode_unit and apply_unit). A column count rounds up to the kernel's kCols of 2,
+// 4 or 8; the columns past it are skipped. One column runs the one-column kernels.
+
+template <int kCols>
+__device__ __forceinline__ bool column_on(int c, int columns) {
+    return c < kCols && c < columns;
+}
+
+// Stages `columns` columns of `units` activation blocks (x[c * units + u]) as Act in the format's word order.
+template <Type T>
+__device__ void stage_columns(const BlockQ8* x, int units, int columns, Act* act) {
+    for (int i = threadIdx.x; i < columns * units; i += kThreads)
+        act[i] = act_of<T>(x[i]);
+}
+
+template <Type T>
+__device__ void stage_grid(uint4* shared) {
+    if constexpr (kGridBytes<T> > 0) {
+        const auto* source = static_cast<const uint4*>(grid_source<T>());
+        for (int i = threadIdx.x; i < kGridBytes<T> / static_cast<int>(sizeof(uint4)); i += kThreads)
+            shared[i] = source[i];
+    }
+}
+
+// What a multi-column dense launch multiplies.
+struct ColumnsArgs {
+    const uint8_t* w;
+    int rows, units;
+    int64_t row_bytes;
+    const BlockQ8* x;  // columns x units blocks
+    float* y;          // columns x rows
+    int columns;
+};
+
+// A warp's run of 8 short rows (fewer than 32 units; gemv_q8_short_kernel's placement) from `first` times the columns
+// c with bit c of `mask`, column c's activations at xs[c * units + u]: a lane's units decoded once and kept per column
+// in registers, then each column's sums go through the warp's lane_sums (zero past the units) to their rows' lanes in
+// turn; store(c, row, sum) for each row of the run.
+template <Type T, int kCols, class Store>
+__device__ __forceinline__ void short_run_columns(const uint8_t* w, int rows, int64_t row_bytes, int units, int first,
+                                                  const Act* xs, unsigned mask, const uint32_t* grid, float* lane_sums,
+                                                  Store store) {
+    constexpr int kRows = kQ8ShortRows, kPitch = kQ8ShortPitch, kPairs = kRows;  // a lane's units: kRows * units / 32
+    const int lane = threadIdx.x % kWarp;
+    float v[kPairs][kCols];
+    int at[kPairs];
+    int r = lane / units, u = lane % units;
+#pragma unroll
+    for (int p = 0; p < kPairs; ++p) {
+        at[p] = r < kRows ? r * kPitch + u : -1;
+        if (r < kRows) {
+            const Unit unit = decode_unit<T>(w + min(first + r, rows - 1) * row_bytes, u, grid);
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                float acc = 0.0f;
+                if ((mask >> c & 1) != 0)
+                    acc += apply_unit<T>(unit, xs[c * units + u]);
+                v[p][c] = acc;
+            }
+        }
+        for (u += kWarp; u >= units; u -= units)
+            ++r;
+    }
+    const int row = lane / 4, q = lane % 4;
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        if ((mask >> c & 1) == 0)
+            continue;
+#pragma unroll
+        for (int p = 0; p < kPairs; ++p)
+            if (at[p] >= 0)
+                lane_sums[at[p]] = v[p][c];
+        __syncwarp();
+        float sums[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            sums[k] = lane_sums[row * kPitch + q + 4 * k];
+        __syncwarp();  // the next column overwrites lane_sums
+        const float sum = row_sum<4>(sums);
+        if (q == 0 && first + row < rows)
+            store(c, first + row, sum);
+    }
+}
+
+// Rows of fewer than 32 units: a warp's run of 8 rows (short_run_columns), the columns staged once per block and taken
+// kCols at a time; a later pass rereads the run's rows, which its first pass has just brought into L1 (shared down
+// 2560x640 at 6 columns: 27.3 us, against 33.1 as two launches).
+template <Type T, int kCols>
+__global__ void __launch_bounds__(kThreads) gemv_q8_short_columns_kernel(ColumnsArgs a) {
+    extern __shared__ uint4 shared[];
+    __shared__ float lane_sums[kThreads / kWarp][kQ8ShortRows * kQ8ShortPitch];
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
+    for (int i = lane; i < kQ8ShortRows * kQ8ShortPitch; i += kWarp)
+        lane_sums[warp][i] = 0.0f;
+    stage_grid<T>(shared);
+    Act* act = reinterpret_cast<Act*>(shared + kGridBytes<T> / sizeof(uint4));
+    stage_columns<T>(a.x, a.units, a.columns, act);
+    __syncthreads();
+    const int first = (blockIdx.x * (kThreads / kWarp) + warp) * kQ8ShortRows;
+    if (first >= a.rows)
+        return;  // the whole warp
+    for (int pass = 0; pass < a.columns; pass += kCols)
+        short_run_columns<T, kCols>(a.w, a.rows, a.row_bytes, a.units, first, act + pass * a.units,
+                                    (1u << min(kCols, a.columns - pass)) - 1, reinterpret_cast<const uint32_t*>(shared),
+                                    lane_sums[warp],
+                                    [&](int c, int row, float sum) { a.y[int64_t{pass + c} * a.rows + row] = sum; });
+}
+
+// An Act staged in value order, regrouped into IQ4_NL / IQ4_XS nibble order (act_of's permutation).
+__device__ __forceinline__ Act nibble_order(const Act& a) {
+    Act n = a;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        n.q[2 * k] = static_cast<int>(__byte_perm(a.q[k], a.q[k + 4], 0x5140));
+        n.q[2 * k + 1] = static_cast<int>(__byte_perm(a.q[k], a.q[k + 4], 0x7362));
+    }
+    return n;
+}
+
+// kRows rows of format T on kLanes lanes for the columns c with bit c of `mask` (q8_row's work), row i's sums in
+// out[i][c], the rows' units read in one loop (a SwiGLU's gate and up, as gemv_q8_kernel reads them); xs holds the
+// columns' activations in value order (an IQ4_XS row regroups them unit by unit) or, without kValueOrder, in the
+// format's order. With `at`, slot c multiplies column at[c].
+template <Type T, int kLanes, int kCols, bool kValueOrder, int kRows>
+__device__ __forceinline__ void q8_rows_columns(const uint8_t* const (&rows)[kRows], const Act* xs, int units, int j,
+                                                unsigned mask, const uint32_t* grid, float (&out)[kRows][kCols],
+                                                const int* at = nullptr) {
+    constexpr int kSums = kWarp / kLanes;
+    float acc[kRows][kCols][kSums] = {};
+    for (int base = j; base < units; base += kWarp) {
+#pragma unroll
+        for (int k = 0; k < kSums; ++k) {
+            const int u = base + kLanes * k;
+            if (u < units) {
+                Unit unit[kRows];
+#pragma unroll
+                for (int i = 0; i < kRows; ++i)
+                    unit[i] = decode_unit<T>(rows[i], u, grid);
+#pragma unroll
+                for (int c = 0; c < kCols; ++c)
+                    if ((mask >> c & 1) != 0) {
+                        const Act& x = xs[(at != nullptr ? at[c] : c) * units + u];
+                        const Act a = kValueOrder && T == Type::IQ4_XS ? nibble_order(x) : x;
+#pragma unroll
+                        for (int i = 0; i < kRows; ++i)
+                            acc[i][c][k] += apply_unit<T>(unit[i], a);
+                    }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kRows; ++i)
+#pragma unroll
+        for (int c = 0; c < kCols; ++c)
+            out[i][c] = (mask >> c & 1) != 0 ? row_sum<kLanes>(acc[i][c]) : 0.0f;
+}
+
+// Rows of at least 32 units on kLanes lanes (gemv_q8_kernel's placement). A lane group takes kRowsPerGroup rows that
+// share each unit's activations: one read of a column's activation block serves both rows, which halves the shared
+// memory reads that bound the kernel at 3 and 4 columns (Q6_K 2560x6144 at 4 columns: 135 us with one row, see
+// the commit). Each row's units still go lane by lane in the one-column order, so its sums are unchanged.
+// Two columns keep the one-row form: its smaller blocks of work measured faster there (Q6_K 2560x6144, 88 us against
+// 108).
+template <int kCols>
+inline constexpr int kColumnRows = kCols <= 2 ? 1 : 2;
+
+template <Type T, int kLanes, int kCols>
+__global__ void __launch_bounds__(kThreads) gemv_q8_columns_kernel(ColumnsArgs a) {
+    constexpr int kGroups = kWarp / kLanes;
+    extern __shared__ uint4 shared[];
+    stage_grid<T>(shared);
+    Act* act = reinterpret_cast<Act*>(shared + kGridBytes<T> / sizeof(uint4));
+    stage_columns<T>(a.x, a.units, a.columns, act);
+    __syncthreads();
+    const int lane = threadIdx.x % kWarp, j = lane % kLanes;
+    constexpr int kRowsEach = kColumnRows<kCols>;
+    const int warp_first = (blockIdx.x * (kThreads / kWarp) + threadIdx.x / kWarp) * kGroups * kRowsEach;
+    if (warp_first >= a.rows)
+        return;  // the whole warp
+    const int first = warp_first + lane / kLanes * kRowsEach;
+    const auto* grid = reinterpret_cast<const uint32_t*>(shared);
+    const uint8_t* rows[kRowsEach];
+#pragma unroll
+    for (int i = 0; i < kRowsEach; ++i)
+        rows[i] = a.w + int64_t{min(first + i, a.rows - 1)} * a.row_bytes;
+    float sums[kRowsEach][kCols];
+    q8_rows_columns<T, kLanes, kCols, false, kRowsEach>(rows, act, a.units, j, (1u << a.columns) - 1, grid, sums);
+#pragma unroll
+    for (int i = 0; i < kRowsEach; ++i)
+#pragma unroll
+        for (int c = 0; c < kCols; ++c)
+            if (column_on<kCols>(c, a.columns) && j == 0 && first + i < a.rows)
+                a.y[int64_t{c} * a.rows + first + i] = sums[i][c];
+}
+
+// kRowsEach rows of a part of any format gemv_q8_groups takes (q8_rows_columns), the columns' activations in value
+// order.
+template <int kLanes, int kCols, int kRowsEach>
+__device__ void group_rows_columns(Type type, const uint8_t* const (&rows)[kRowsEach], const Act* plain, int units,
+                                   int j, int columns, float (&out)[kRowsEach][kCols]) {
+    const unsigned mask = (1u << columns) - 1;
+    switch (type) {
+        case Type::Q4_K:
+            return q8_rows_columns<Type::Q4_K, kLanes, kCols, true, kRowsEach>(rows, plain, units, j, mask, nullptr,
+                                                                               out);
+        case Type::Q5_K:
+            return q8_rows_columns<Type::Q5_K, kLanes, kCols, true, kRowsEach>(rows, plain, units, j, mask, nullptr,
+                                                                               out);
+        case Type::Q6_K:
+            return q8_rows_columns<Type::Q6_K, kLanes, kCols, true, kRowsEach>(rows, plain, units, j, mask, nullptr,
+                                                                               out);
+        default:
+            return q8_rows_columns<Type::IQ4_XS, kLanes, kCols, true, kRowsEach>(rows, plain, units, j, mask, nullptr,
+                                                                                 out);
+    }
+}
+
+// gemv_q8_group_kernel for several columns: the columns' activations staged once in value order (eight columns of
+// 2,560 in 31 KB), part p's outputs at y[c * rows + r].
+template <bool kSwiglu, int kCols, int kLanes, int kRowsEach>
+__global__ void __launch_bounds__(kThreads) gemv_q8_group_columns_kernel(Q8GroupArgs a, int columns) {
+    constexpr int kGroups = kWarp / kLanes;
+    extern __shared__ uint4 shared[];
+    Act* plain = reinterpret_cast<Act*>(shared);
+    for (int i = threadIdx.x; i < columns * a.units; i += kThreads)
+        plain[i] = act_of<Type::Q6_K>(a.x[i]);
+    __syncthreads();
+    const int item = blockIdx.x * (kThreads / kWarp) + threadIdx.x / kWarp;
+    if (item >= a.items[kSwiglu ? 1 : kGroupParts])
+        return;  // the whole warp
+    int p = 0;
+    while (item >= a.items[p + 1])
+        ++p;
+    const int lane = threadIdx.x % kWarp, j = lane % kLanes;
+    const Q8Part& part = a.part[p];
+    const int first = ((item - a.items[p]) * kGroups + lane / kLanes) * kRowsEach;
+    const uint8_t* rows[kRowsEach];
+    const uint8_t* ups[kRowsEach];
+#pragma unroll
+    for (int i = 0; i < kRowsEach; ++i) {
+        const int64_t r = min(first + i, part.rows - 1);
+        rows[i] = part.w + r * a.row_bytes[p];
+        ups[i] = kSwiglu ? a.part[1].w + r * a.row_bytes[1] : nullptr;
+    }
+    float sum[kRowsEach][kCols], up[kRowsEach][kCols];
+    group_rows_columns<kLanes, kCols, kRowsEach>(part.type, rows, plain, a.units, j, columns, sum);
+    if constexpr (kSwiglu)
+        group_rows_columns<kLanes, kCols, kRowsEach>(a.part[1].type, ups, plain, a.units, j, columns, up);
+#pragma unroll
+    for (int i = 0; i < kRowsEach; ++i)
+#pragma unroll
+        for (int c = 0; c < kCols; ++c)
+            if (column_on<kCols>(c, columns) && j == 0 && first + i < part.rows)
+                part.y[int64_t{c} * part.rows + first + i] = kSwiglu ? silu(sum[i][c]) * up[i][c] : sum[i][c];
+}
+
+// What gemv_q8_experts_window multiplies (gemv.h).
+struct ExpertsWindowArgs {
+    const uint8_t* const* gate;  // [slots]: unique expert u's gate matrix
+    const uint8_t* const* up;    // [slots]
+    const uint8_t* columns;      // [slots]: bit t when column t routed u
+    const int8_t* rank;          // [slots][kMaxColumns]: the rank column t gave u
+    const int32_t* count;        // unique experts, in device memory
+    int slots, k, rows, units;
+    int64_t row_bytes;
+    const BlockQ8* x;  // window x units blocks
+    float* h;          // (t * k + rank) * rows + r
+    int window;
+};
+
+// The routed gate and up projections of a window's unique experts: a warp's 2 rows of expert u times the columns that
+// routed u, kCols at a time (gemv_q8_kernel's SwiGLU per column: the same unit sums, lane placement and row_sum); a
+// further pass over the same rows mostly hits L1. The columns' activations are staged once per block in the
+// format's order; blocks loop over (expert, row group) items.
+template <Type T, int kCols>
+__global__ void __launch_bounds__(kThreads) gemv_q8_experts_window_kernel(ExpertsWindowArgs a) {
+    constexpr int kLanes = 16, kGroups = kWarp / kLanes;
+    extern __shared__ uint4 shared[];
+    stage_grid<T>(shared);
+    Act* act = reinterpret_cast<Act*>(shared + kGridBytes<T> / sizeof(uint4));
+    stage_columns<T>(a.x, a.units, a.window, act);
+    __syncthreads();
+    const auto* grid = reinterpret_cast<const uint32_t*>(shared);
+    const int lane = threadIdx.x % kWarp, j = lane % kLanes;
+    const int groups = (a.rows + kGroups - 1) / kGroups;
+    const int items = min(*a.count, a.slots) * groups;
+    for (int item = blockIdx.x * (kThreads / kWarp) + threadIdx.x / kWarp; item < items;
+         item += gridDim.x * (kThreads / kWarp)) {
+        const int u = item / groups;
+        const int row = item % groups * kGroups + lane / kLanes;
+        const int64_t offset = min(row, a.rows - 1) * a.row_bytes;
+        const uint8_t* const rows[2] = {a.gate[u] + offset, a.up[u] + offset};
+        for (unsigned left = a.columns[u]; left != 0;) {
+            int at[kCols];
+            unsigned pass = 0;
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                at[c] = left != 0 ? __ffs(static_cast<int>(left)) - 1 : 0;
+                pass |= left != 0 ? 1u << c : 0u;
+                left &= left - 1;
+            }
+            float sums[2][kCols];
+            q8_rows_columns<T, kLanes, kCols, false, 2>(rows, act, a.units, j, pass, grid, sums, at);
+#pragma unroll
+            for (int c = 0; c < kCols; ++c)
+                if ((pass >> c & 1) != 0 && j == 0 && row < a.rows)
+                    a.h[(int64_t{at[c]} * a.k + a.rank[u * kMaxColumns + at[c]]) * a.rows + row] =
+                        silu(sums[0][c]) * sums[1][c];
+        }
+    }
+}
+
+// 8 short rows (fewer than 32 units) from `first` times the columns c with bit c of `mask`, column c's activations at
+// xs[c * units + u], placed for row_sum<4> directly: lane 4i + q takes row first + i and its units q, q + 4, ... (the
+// canonical lanes gemv_q8_short_kernel gathers there through shared memory), so each unit is decoded once and no
+// sums move through shared memory; store(c, row, sum).
+template <Type T, int kCols, class Store>
+__device__ __forceinline__ void short_rows_columns(const uint8_t* w, int rows, int64_t row_bytes, int units, int first,
+                                                   const Act* xs, unsigned mask, const uint32_t* grid, Store store) {
+    const int lane = threadIdx.x % kWarp, q = lane % 4, row = first + lane / 4;
+    const uint8_t* r = w + min(row, rows - 1) * row_bytes;
+    float sums[kCols][8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int u = q + 4 * k;
+        const bool on = u < units;
+        Unit unit{};
+        if (on)
+            unit = decode_unit<T>(r, u, grid);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            float acc = 0.0f;
+            if (on && (mask >> c & 1) != 0)
+                acc += apply_unit<T>(unit, xs[c * units + u]);
+            sums[c][k] = acc;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        if ((mask >> c & 1) == 0)
+            continue;
+        const float sum = row_sum<4>(sums[c]);
+        if (q == 0 && row < rows)
+            store(c, row, sum);
+    }
+}
+
+// What gemv_q8_experts_down_window multiplies (gemv.h).
+struct DownWindowArgs {
+    const uint8_t* const* down;  // [slots]: unique expert u's down matrix
+    const uint8_t* columns;      // [slots]: bit t when column t routed u
+    const int8_t* rank;          // [slots][kMaxColumns]
+    const int32_t* count;        // unique experts, in device memory
+    int slots, k, rows, units;
+    int64_t row_bytes;
+    const BlockQ8* x;  // [window * k][units]: column t's rank-r input at (t * k + r) * units
+    float* y;          // [window * k][rows]
+};
+
+constexpr int kDownColumns = 2;  // columns a pass of gemv_q8_down_window_kernel
+constexpr int kDownRuns = 2;     // runs of 8 rows a warp takes of one expert
+
+// The routed down projections of a window's unique experts (short rows): a warp takes kDownRuns runs of 8 rows of
+// expert u and multiplies each run, read once a pass, with the inputs of the columns that routed u, kDownColumns at a
+// time, staged in the warp's own shared memory. Each (column, rank) slot is computed as gemv_q8_short_kernel computes
+// it (short_rows_columns), so y equals the per-slot launch byte for byte. Measured at T = 3 and 8 (IQ4_NL, us a
+// launch), against 4 columns and 4 runs through shared lane sums: 151 / 361 against 161 / 372; Q2_0 113 / 264
+// against 141 / 323.
+template <Type T>
+__global__ void __launch_bounds__(kThreads) gemv_q8_down_window_kernel(DownWindowArgs a) {
+    constexpr int kCols = kDownColumns;
+    extern __shared__ uint4 shared[];
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
+    stage_grid<T>(shared);
+    __syncthreads();
+    const auto* grid = reinterpret_cast<const uint32_t*>(shared);
+    Act* act = reinterpret_cast<Act*>(shared + kGridBytes<T> / sizeof(uint4)) + warp * kCols * a.units;
+    const int span = kQ8ShortRows * kDownRuns, chunks = (a.rows + span - 1) / span;
+    const int items = min(*a.count, a.slots) * chunks;
+    for (int item = blockIdx.x * (kThreads / kWarp) + warp; item < items; item += gridDim.x * (kThreads / kWarp)) {
+        const int u = item / chunks, first = item % chunks * span;
+        for (unsigned left = a.columns[u]; left != 0;) {
+            int slot[kCols];  // the pass's (column, rank) slots
+            unsigned pass = 0;
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                const int t = left != 0 ? __ffs(static_cast<int>(left)) - 1 : 0;
+                slot[c] = t * a.k + a.rank[u * kMaxColumns + t];
+                pass |= left != 0 ? 1u << c : 0u;
+                left &= left - 1;
+            }
+            __syncwarp();  // the previous pass is done with act
+            for (int i = lane; i < kCols * a.units; i += kWarp) {
+                const int c = i / a.units;
+                int s = slot[0];
+#pragma unroll
+                for (int k = 1; k < kCols; ++k)
+                    s = c == k ? slot[k] : s;
+                if ((pass >> c & 1) != 0)
+                    act[i] = act_of<T>(a.x[int64_t{s} * a.units + i % a.units]);
+            }
+            __syncwarp();
+            const auto store = [&](int c, int row, float sum) { a.y[int64_t{slot[c]} * a.rows + row] = sum; };
+            for (int run = first; run < min(first + span, a.rows); run += kQ8ShortRows)
+                short_rows_columns<T, kCols>(a.down[u], a.rows, a.row_bytes, a.units, run, act, pass, grid, store);
+        }
+    }
+}
+
+// Stages n chunks from `first` of each column's activations (x[c * 2 * chunks + 2 * k + h], h the chunk's half) as
+// xs[(c * 2 + h) * pitch + k - first]: a warp's lanes reading consecutive chunks then read consecutive 16-byte words.
+__device__ __forceinline__ void stage_bf16(const float* x, int chunks, int first, int n, int columns, int pitch,
+                                           float4* xs) {
+    const auto* x4 = reinterpret_cast<const float4*>(x);
+    for (int i = threadIdx.x; i < columns * 2 * n; i += kThreads) {
+        const int c = i / (2 * n), k = i % (2 * n);
+        xs[(c * 2 + k % 2) * pitch + k / 2] = x4[int64_t{c} * 2 * chunks + 2 * first + k];
+    }
+}
+
+// gemv_bf16_short_kernel for several columns: 4 rows a warp on 8 lanes each, kShortSteps times, the weights loaded
+// before the columns' activations are staged; each staged chunk read serves the lane's kShortSteps rows, and each
+// row and column sums in the one-column order.
+template <int kCols>
+__global__ void __launch_bounds__(kThreads)
+    gemv_bf16_short_columns_kernel(Bf16Rows m, int chunks, const float* x, int columns) {
+    constexpr int kGroups = kWarp / kShortLanes, kSums = kWarp / kShortLanes;
+    extern __shared__ float4 xs[];  // columns x 2 halves x chunks
+    const int lane = threadIdx.x % kWarp, j = lane % kShortLanes;
+    const int first = (blockIdx.x * kRowsPerBlock + threadIdx.x / kWarp) * kShortSteps * kGroups + lane / kShortLanes;
+    uint4 v[kShortSteps][kShortChunks];
+#pragma unroll
+    for (int s = 0; s < kShortSteps; ++s) {
+        const uint4* r = m.row(min(first + s * kGroups, m.total - 1));
+#pragma unroll
+        for (int i = 0; i < kShortChunks; ++i)
+            v[s][i] = j + kShortLanes * i < chunks ? r[j + kShortLanes * i] : uint4{};
+    }
+    stage_bf16(x, chunks, 0, chunks, columns, chunks, xs);
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        if (!column_on<kCols>(c, columns))
+            continue;
+        float acc[kShortSteps][kSums] = {};
+#pragma unroll
+        for (int i = 0; i < kShortChunks; ++i) {
+            const int k = j + kShortLanes * i;
+            if (k < chunks) {
+                const float4 lo = xs[2 * c * chunks + k], hi = xs[(2 * c + 1) * chunks + k];
+#pragma unroll
+                for (int s = 0; s < kShortSteps; ++s)
+                    bf16_chunk(acc[s][i % kSums], v[s][i], lo, hi);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kShortSteps; ++s) {
+            const float sum = row_sum<kShortLanes>(acc[s]);
+            if (j == 0 && first + s * kGroups < m.total)
+                m.store(first + s * kGroups, sum, c);
+        }
+    }
+}
+
+// gemv_bf16_kernel for several columns: a warp takes kR rows and a block's warps share each segment of the columns'
+// activations, staged in shared memory (kSegment chunks of every column at a time); each staged chunk read serves
+// the warp's kR rows, and lane l keeps chunks l, l + 32, ... in order per row and column. The next segment's weights
+// load while the current one is multiplied.
+constexpr int kSegment = 128;  // chunks of 8 values: 4 KB of each column
+
+template <int kCols, int kR>
+__global__ void __launch_bounds__(kThreads)
+    gemv_bf16_columns_kernel(Bf16Rows m, int chunks, const float* x, int columns) {
+    constexpr int kPer = kSegment / kWarp;
+    __shared__ float4 xs[kCols * 2 * kSegment];
+    const int first = (blockIdx.x * kRowsPerBlock + threadIdx.x / kWarp) * kR;
+    const int lane = threadIdx.x % kWarp;
+    const uint4* r[kR];
+#pragma unroll
+    for (int q = 0; q < kR; ++q)
+        r[q] = m.row(min(first + q, m.total - 1));
+    uint4 next[kR][kPer];
+    const auto load = [&](int segment) {
+#pragma unroll
+        for (int q = 0; q < kR; ++q)
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int k = segment + lane + kWarp * i;
+                next[q][i] = k < chunks ? r[q][k] : uint4{};
+            }
+    };
+    load(0);
+    float acc[kR][kCols] = {};
+    for (int segment = 0; segment < chunks; segment += kSegment) {
+        const int n = min(kSegment, chunks - segment);
+        uint4 v[kR][kPer];
+#pragma unroll
+        for (int q = 0; q < kR; ++q)
+#pragma unroll
+            for (int i = 0; i < kPer; ++i)
+                v[q][i] = next[q][i];
+        if (segment + kSegment < chunks)
+            load(segment + kSegment);
+        __syncthreads();  // the previous segment is used up
+        stage_bf16(x, chunks, segment, n, columns, kSegment, xs);
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (!column_on<kCols>(c, columns))
+                continue;
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int k = lane + kWarp * i;
+                if (k < n) {
+                    const float4 lo = xs[2 * c * kSegment + k], hi = xs[(2 * c + 1) * kSegment + k];
+#pragma unroll
+                    for (int q = 0; q < kR; ++q)
+                        bf16_chunk(acc[q][c], v[q][i], lo, hi);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < kR; ++q) {
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (column_on<kCols>(c, columns)) {
+                const float sum = warp_sum(acc[q][c]);
+                if (lane == 0 && first + q < m.total)
+                    m.store(first + q, sum, c);
+            }
+        }
     }
 }
 
@@ -496,6 +1044,55 @@ void launch_q8(Type type, const Q8Args& a, cudaStream_t stream) {
     });
 }
 
+// Calls f.template operator()<C>() with the smallest compiled column count C >= columns (2 to 8).
+template <class F>
+void with_columns(int columns, F&& f) {
+    if (columns <= 2)
+        f.template operator()<2>();
+    else if (columns <= 4)
+        f.template operator()<4>();
+    else
+        f.template operator()<8>();
+}
+
+// Lets `kernel` take `bytes` of dynamic shared memory: past the 48 KB default only wide rows at many columns ask.
+template <class K>
+void allow_shared(K kernel, size_t bytes) {
+    if (bytes > 48 * 1024)
+        TORCH_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+}
+
+// Every format stages its columns' activations, Q4_K, Q5_K and Q8_0 too: their unstaged one-column kernel, which
+// converts each column's activations per unit, took Q5_K 2560x6144 at 8 columns 886 us against 652 staged.
+void launch_q8_columns(Type type, const ColumnsArgs& a, cudaStream_t stream) {
+    with_q8_type(type, [&]<Type T>() {
+        if (a.units < kWarp) {
+            // runs of 8 rows keep each column's unit sums in registers: four columns a pass
+            const size_t shared = kGridBytes<T> + sizeof(Act) * static_cast<size_t>(a.columns) * a.units;
+            const int blocks = blocks_for(a.rows, kThreads / kWarp * 8);
+            if (a.columns <= 2)
+                gemv_q8_short_columns_kernel<T, 2><<<blocks, kThreads, shared, stream>>>(a);
+            else
+                gemv_q8_short_columns_kernel<T, 4><<<blocks, kThreads, shared, stream>>>(a);
+        } else if (a.units % 16 == 0) {
+            const size_t shared = kGridBytes<T> + sizeof(Act) * static_cast<size_t>(a.columns) * a.units;
+            with_columns(a.columns, [&]<int C>() {
+                allow_shared(gemv_q8_columns_kernel<T, 16, C>, shared);
+                gemv_q8_columns_kernel<T, 16, C><<<blocks_for(a.rows, kThreads / kWarp * (kWarp / 16) * kColumnRows<C>),
+                                                   kThreads, shared, stream>>>(a);
+            });
+        } else {
+            // shortcut: rows whose units do not fill 16 lanes (no matrix of the model) run one column a launch
+            for (int c = 0; c < a.columns; ++c)
+                launch_q8(type,
+                          {a.w, nullptr, nullptr, 1, a.rows, a.units, a.row_bytes, a.x + int64_t{c} * a.units, 0,
+                           a.y + int64_t{c} * a.rows},
+                          stream);
+        }
+    });
+}
+
 }  // namespace
 
 void quantize_q8(const float* x, int64_t n, BlockQ8* out, cudaStream_t stream) {
@@ -513,15 +1110,20 @@ bool gemv_q8_supports(Type type) {
     return with_q8_type(type, []<Type>() {});
 }
 
-void gemv_q8(Type type, const uint8_t* w, int rows, int cols, const BlockQ8* x, float* y, cudaStream_t stream) {
-    launch_q8(type, {w, nullptr, nullptr, 1, rows, cols / 32, q8_row_bytes(type, cols), x, 0, y}, stream);
+void gemv_q8(Type type, const uint8_t* w, int rows, int cols, const BlockQ8* x, float* y, cudaStream_t stream,
+             int columns) {
+    if (columns <= 1)
+        launch_q8(type, {w, nullptr, nullptr, 1, rows, cols / 32, q8_row_bytes(type, cols), x, 0, y}, stream);
+    else
+        launch_q8_columns(type, {w, rows, cols / 32, q8_row_bytes(type, cols), x, y, columns}, stream);
 }
 
 bool gemv_q8_groups(Type type) {
     return type == Type::Q4_K || type == Type::Q5_K || type == Type::Q6_K || type == Type::IQ4_XS;
 }
 
-void gemv_q8_group(const Q8Part* parts, int count, int cols, const BlockQ8* x, bool swiglu, cudaStream_t stream) {
+void gemv_q8_group(const Q8Part* parts, int count, int cols, const BlockQ8* x, bool swiglu, cudaStream_t stream,
+                   int columns) {
     Q8GroupArgs a{};
     a.units = cols / 32;
     a.x = x;
@@ -533,21 +1135,66 @@ void gemv_q8_group(const Q8Part* parts, int count, int cols, const BlockQ8* x, b
             a.items[p + 1] += (parts[p].rows + kWarp / kGroupLanes - 1) / (kWarp / kGroupLanes);
         }
     }
-    const size_t shared = 2 * sizeof(Act) * static_cast<size_t>(a.units);
-    if (swiglu)
-        gemv_q8_group_kernel<true><<<blocks_for(a.items[1], kThreads / kWarp), kThreads, shared, stream>>>(a);
-    else
-        gemv_q8_group_kernel<false><<<blocks_for(a.items[count], kThreads / kWarp), kThreads, shared, stream>>>(a);
+    const size_t shared = sizeof(Act) * static_cast<size_t>(a.units) * (columns <= 1 ? 2 : columns);
+    const int blocks = blocks_for(swiglu ? a.items[1] : a.items[count], kThreads / kWarp);
+    if (columns <= 1) {
+        if (swiglu)
+            gemv_q8_group_kernel<true><<<blocks, kThreads, shared, stream>>>(a);
+        else
+            gemv_q8_group_kernel<false><<<blocks, kThreads, shared, stream>>>(a);
+        return;
+    }
+    const auto run = [&]<int C, int R>() {
+        Q8GroupArgs b = a;
+        for (int p = 0; p < kGroupParts; ++p)
+            b.items[p + 1] =
+                b.items[p] +
+                (p < count ? (parts[p].rows + kWarp / kGroupLanes * R - 1) / (kWarp / kGroupLanes * R) : 0);
+        const int n = blocks_for(swiglu ? b.items[1] : b.items[count], kThreads / kWarp);
+        if (swiglu) {
+            allow_shared(gemv_q8_group_columns_kernel<true, C, kGroupLanes, R>, shared);
+            gemv_q8_group_columns_kernel<true, C, kGroupLanes, R><<<n, kThreads, shared, stream>>>(b, columns);
+        } else {
+            allow_shared(gemv_q8_group_columns_kernel<false, C, kGroupLanes, R>, shared);
+            gemv_q8_group_columns_kernel<false, C, kGroupLanes, R><<<n, kThreads, shared, stream>>>(b, columns);
+        }
+    };
+    // From 3 columns a plain group's lane group takes two rows that share each activation read (DeltaNet qkv+z Q6_K at
+    // 5 columns: 279 against 326 us; attention q+k+v at 4: 144 against 167). The shared expert's SwiGLU (640 rows)
+    // keeps one: two measured slower (gate+up Q4_K at 4 columns 27.8 against 24.6 us), as do Q6_K-only groups at
+    // exactly 3 columns (qkv+z: 224 against 236 us).
+    const bool q6k_only = std::all_of(parts, parts + count, [](const Q8Part& p) { return p.type == Type::Q6_K; });
+    with_columns(columns, [&]<int C>() {
+        if (C >= 4 && !swiglu && !(columns == 3 && q6k_only))
+            run.template operator()<C, 2>();
+        else
+            run.template operator()<C, 1>();
+    });
 }
 
-void gemv_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, cudaStream_t stream) {
-    gemv_bf16_pair(w, rows, nullptr, 0, cols, x, y, nullptr, stream);
+void gemv_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, cudaStream_t stream, int columns) {
+    gemv_bf16_pair(w, rows, nullptr, 0, cols, x, y, nullptr, stream, 0.0f, columns);
 }
 
 void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, int cols, const float* x, float* y,
-                    float* y2, cudaStream_t stream, float silu_scale) {
+                    float* y2, cudaStream_t stream, float silu_scale, int columns) {
     const Bf16Rows m{w, w2, rows, rows + rows2, int64_t{cols} * 2, y, y2, silu_scale};
     const int chunks = cols / 8;
+    if (columns > 1) {
+        with_columns(columns, [&]<int C>() {
+            if (chunks <= kShortLanes * kShortChunks)
+                gemv_bf16_short_columns_kernel<C>
+                    <<<blocks_for(m.total, kRowsPerBlock * kShortSteps * (kWarp / kShortLanes)), kThreads,
+                       sizeof(float4) * 2 * static_cast<size_t>(chunks) * columns, stream>>>(m, chunks, x, columns);
+            else if (m.total >= 256)  // two rows a warp: 486 against 596 us at 10240x2560, 8 columns
+                gemv_bf16_columns_kernel<C, 2>
+                    <<<blocks_for(m.total, kRowsPerBlock * 2), kThreads, 0, stream>>>(m, chunks, x, columns);
+            else
+                gemv_bf16_columns_kernel<C, 1>
+                    <<<blocks_for(m.total, kRowsPerBlock), kThreads, 0, stream>>>(m, chunks, x, columns);
+        });
+        return;
+    }
     if (chunks <= kShortLanes * kShortChunks) {
         constexpr int kRows = kRowsPerBlock * kShortSteps * (kWarp / kShortLanes);
         gemv_bf16_short_kernel<kShortSteps><<<blocks_for(m.total, kRows), kThreads, 0, stream>>>(m, chunks, x);
@@ -558,8 +1205,83 @@ void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, in
 
 void gemv_q8_experts(Type type, const uint8_t* const* table, const uint8_t* const* up_table, int slots, int rows,
                      int cols, const BlockQ8* x, int64_t x_stride, float* y, cudaStream_t stream) {
-    launch_q8(type, {nullptr, table, up_table, slots, rows, cols / 32, q8_row_bytes(type, cols), x, x_stride, y},
-              stream);
+    // Slots a launch stages within 48 KB of shared memory (q8_shared_bytes, and the short-row kernel's lane sums): a
+    // window's down projection (8 x 10 slots, each with its own activations) runs as two launches; a slot's rows do
+    // not depend on its launch.
+    const int units = cols / 32;
+    int per = slots;
+    with_q8_type(type, [&]<Type T>() {
+        const size_t fixed = kGridBytes<T> + (x_stride == 0 ? sizeof(Act) * units : 0) +
+                             (units < kWarp ? q8_short_static_bytes(up_table != nullptr) : 0);
+        const size_t each = 2 * sizeof(const uint8_t*) + (x_stride == 0 ? 0 : sizeof(Act) * units);
+        per = static_cast<int>(std::min<size_t>(static_cast<size_t>(slots), (48 * 1024 - fixed) / each));
+    });
+    for (int s = 0; s < slots; s += per)
+        launch_q8(type,
+                  {nullptr, table + s, up_table != nullptr ? up_table + s : nullptr, std::min(per, slots - s), rows,
+                   units, q8_row_bytes(type, cols), x + s * x_stride, x_stride, y + int64_t{s} * rows},
+                  stream);
+}
+
+// Columns a pass of gemv_q8_experts_window (an expert routed by more columns takes further passes over its rows, mostly
+// from L1): at 8 columns a pass needs 80 registers and fewer blocks stay resident (IQ2_S at T = 8, half of each
+// column's experts shared: 14.4 us per unique expert in one pass, 11.2 in passes of 4, 12.2 in passes of 2).
+constexpr int kWindowPass = 4;
+
+void gemv_q8_experts_window(Type type, const uint8_t* const* gate, const uint8_t* const* up, const uint8_t* columns,
+                            const int8_t* rank, const int32_t* count, int slots, int k, int rows, int cols,
+                            const BlockQ8* x, float* h, int window, cudaStream_t stream) {
+    if (window <= 1) {  // one column numbers its unique experts by rank: M3's launch
+        gemv_q8_experts(type, gate, up, k, rows, cols, x, 0, h, stream);
+        return;
+    }
+    const ExpertsWindowArgs a{gate, up, columns, rank, count, slots, k, rows, cols / 32, q8_row_bytes(type, cols),
+                              x,    h,  window};
+    const int64_t items = int64_t{slots} * ((rows + 1) / 2);
+    with_q8_type(type, [&]<Type T>() {
+        const size_t shared = kGridBytes<T> + sizeof(Act) * static_cast<size_t>(window) * a.units;
+        with_columns(std::min(window, kWindowPass), [&]<int C>() {
+            const auto kernel = gemv_q8_experts_window_kernel<T, C>;
+            allow_shared(kernel, shared);
+            // as many blocks as are resident at once: a block past them would start its share of the items late
+            static size_t cached_shared = 0;
+            static int per_sm = 0;
+            if (cached_shared != shared) {
+                TORCH_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kThreads, shared));
+                cached_shared = shared;
+            }
+            const int blocks = static_cast<int>(
+                std::min<int64_t>(blocks_for(items, kThreads / kWarp), resident_blocks(std::max(per_sm, 1))));
+            kernel<<<blocks, kThreads, shared, stream>>>(a);
+        });
+    });
+}
+
+void gemv_q8_experts_down_window(Type type, const uint8_t* const* down, const uint8_t* columns, const int8_t* rank,
+                                 const int32_t* count, int slots, int k, int rows, int cols, const BlockQ8* x, float* y,
+                                 int window, cudaStream_t stream) {
+    const int units = cols / 32;
+    if (window <= 1)  // one column numbers its unique experts by rank: M3's launch
+        return gemv_q8_experts(type, down, nullptr, k, rows, cols, x, units, y, stream);
+    if (units >= kWarp)
+        throw Error("gemv_q8_experts_down_window takes rows of fewer than 1,024 values.");
+    const DownWindowArgs a{down, columns, rank, count, slots, k, rows, units, q8_row_bytes(type, cols), x, y};
+    const int64_t items = int64_t{slots} * ((rows + kQ8ShortRows * kDownRuns - 1) / (kQ8ShortRows * kDownRuns));
+    with_q8_type(type, [&]<Type T>() {
+        const size_t shared =
+            kGridBytes<T> + sizeof(Act) * kThreads / kWarp * kDownColumns * static_cast<size_t>(units);
+        const auto kernel = gemv_q8_down_window_kernel<T>;
+        allow_shared(kernel, shared);
+        static size_t cached_shared = 0;
+        static int per_sm = 0;
+        if (cached_shared != shared) {
+            TORCH_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kThreads, shared));
+            cached_shared = shared;
+        }
+        const int blocks = static_cast<int>(
+            std::min<int64_t>(blocks_for(items, kThreads / kWarp), resident_blocks(std::max(per_sm, 1))));
+        kernel<<<blocks, kThreads, shared, stream>>>(a);
+    });
 }
 
 }  // namespace torch::kernels

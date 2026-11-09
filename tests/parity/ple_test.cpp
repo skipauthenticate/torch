@@ -88,6 +88,74 @@ void check_conv() {
     CHECK(test::report("ple_conv 10240 channels, positions 0-11", worst, kTolerance));
 }
 
+// Windows that accept only some of their columns, one after another, against one-token ple_conv over the accepted
+// tokens: the rejected columns' x (junk here) must never reach a later window's taps, including tap 9, whose ring row
+// is the one a rejected column would have overwritten. Each window's accepted columns are compared bit for bit.
+void check_windows() {
+    const int channels = kHc * kN, ring = 9;
+    // (columns run, columns accepted) per window, positions following on from each other; 8 columns wrap the ring
+    const std::vector<std::pair<int, int>> plan{{8, 2}, {8, 3}, {4, 4}, {8, 8}, {8, 1}, {3, 3}, {8, 5}, {2, 1}, {8, 8}};
+    int total = 0;
+    for (auto [run, accepted] : plan)
+        total += accepted;
+    const std::vector<float> w = test::random_floats(static_cast<size_t>(4) * channels, -1, 1, 15);
+    std::vector<std::vector<float>> xs, gateds, ress;  // the true token at each position
+    for (int p = 0; p < total; ++p) {
+        xs.push_back(test::random_floats(channels, -2, 2, 200 + p));
+        gateds.push_back(test::random_floats(channels, -1, 1, 300 + p));
+        ress.push_back(test::random_floats(channels, -1, 1, 400 + p));
+    }
+    // one token at a time
+    DeviceBuffer<float> dw(w), hist_ref(static_cast<size_t>(ring) * channels), res_ref(channels), gated_ref(channels),
+        x_ref(channels);
+    DeviceBuffer<int32_t> pos_ref(1);
+    std::vector<std::vector<float>> want;
+    for (int p = 0; p < total; ++p) {
+        res_ref.upload(ress[p]);
+        gated_ref.upload(gateds[p]);
+        x_ref.upload(xs[p]);
+        pos_ref.upload({p});
+        kernels::ple_conv(res_ref.get(), gated_ref.get(), x_ref.get(), hist_ref.get(), dw.get(), channels,
+                          pos_ref.get(), nullptr);
+        want.push_back(res_ref.download());
+    }
+    // windows
+    DeviceBuffer<float> hist(std::vector<float>(static_cast<size_t>(ring) * channels, 7.0f));  // stale: never read
+    DeviceBuffer<int32_t> pos(1);
+    int p = 0;
+    bool same = true;
+    for (auto [run, accepted] : plan) {
+        std::vector<float> x, gated, res;
+        for (int t = 0; t < run; ++t) {
+            const bool real = t < accepted;
+            const std::vector<float> junk = test::random_floats(channels, -2, 2, 900 + 20 * p + t);
+            const std::vector<float>& xt = real ? xs[p + t] : junk;
+            x.insert(x.end(), xt.begin(), xt.end());
+            const std::vector<float>& gt = real ? gateds[p + t] : junk;
+            gated.insert(gated.end(), gt.begin(), gt.end());
+            const std::vector<float>& rt = real ? ress[p + t] : junk;
+            res.insert(res.end(), rt.begin(), rt.end());
+        }
+        DeviceBuffer<float> dx(x), dgated(gated), dres(res);
+        pos.upload({p});
+        kernels::ple_conv_window(dres.get(), dgated.get(), dx.get(), hist.get(), dw.get(), channels, pos.get(), run,
+                                 nullptr);
+        const std::vector<float> got = dres.download();
+        for (int t = 0; t < accepted; ++t)
+            same = same && std::equal(got.begin() + static_cast<size_t>(t) * channels,
+                                      got.begin() + static_cast<size_t>(t + 1) * channels, want[p + t].begin());
+        if (p % 2 == 0)
+            kernels::ple_commit(hist.get(), dx.get(), channels, pos.get(), accepted, nullptr);
+        else {  // the count in device memory
+            DeviceBuffer<int32_t> count(std::vector<int32_t>{accepted});
+            kernels::ple_commit(hist.get(), dx.get(), channels, pos.get(), count.get(), nullptr);
+        }
+        p += accepted;
+    }
+    CHECK(same);
+    std::printf("%-40s %s\n", "ple_conv windows with rejections", same ? "ok" : "FAIL");
+}
+
 }  // namespace
 
 int main() {
@@ -95,6 +163,7 @@ int main() {
         check_gate();
         check_gated_value();
         check_conv();
+        check_windows();
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "ple_test: %s\n", e.what());

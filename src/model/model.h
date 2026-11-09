@@ -13,12 +13,20 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "core/budget.h"
 #include "core/placement.h"
 #include "model/config.h"
 
+struct CUstream_st;  // cudaStream_t is CUstream_st*
+
 namespace torch::model {
+
+class Weights;
+
+// The widest verify window: tokens run through the model in one pass (architecture decision 2).
+inline constexpr int kMaxColumns = 8;
 
 struct Options {
     std::filesystem::path shard1;  // the weights
@@ -30,6 +38,12 @@ struct Options {
     // Route counts (core/placement.h) ranking which experts to keep resident; without them, and without `resident`,
     // as many of every layer's first experts as the budget allows.
     std::filesystem::path placement;
+    // Memory the caller allocates once the model is built (the draft layer, draft.h): budget lines, and room the
+    // top-up after loading leaves free.
+    std::vector<Reservation> reserve;
+    // After each window, up to this many of the experts it read from the SSD take the slots of the least recently
+    // routed resident experts of their layers (core/swaps.h); 0: residency stays as placed. Output does not change.
+    int swaps_per_window = 0;
     bool logits = true;  // copy every token's 248,320 logits to the host (per-step output, parity tests)
 };
 
@@ -50,6 +64,8 @@ struct DecodeTimes {
     uint64_t ple_hedged = 0;  // PLE row reads issued a second time (hedged_reads.h)
     double gpu = 0;           // waiting for the GPU after the last launch: the work not yet done, including misses
     double expert_reads = 0;  // the I/O thread reading non-resident experts (overlaps `gpu`)
+    uint64_t swaps = 0;       // experts made resident after windows (Options::swaps_per_window)
+    double swap_ms = 0;       // choosing them and queueing their copies, between windows
 };
 
 class Model {
@@ -74,12 +90,30 @@ public:
     // decoding again. A token runs as one replayed CUDA graph, recorded at the first token; TORCH_EAGER=1 launches
     // kernel by kernel instead (the result is the same, bit for bit).
     bool decode(int32_t token) noexcept;
-    // The last token's next-token logits (n_vocab floats, valid until the next decode), or empty when Options::logits
-    // is false.
-    std::span<const float> logits() const noexcept;
-    // The most likely next token after the last decode, computed on the GPU; ties go to the lowest id.
-    int32_t argmax() const noexcept;
+    // Runs 1 to kMaxColumns tokens at the next positions as one window (milestone M4): afterwards argmax(t) and
+    // logits(t) are the results after tokens[0..t], equal bit for bit to decoding the tokens one at a time. All of
+    // them join the sequence until accept() keeps fewer. decode(token) is a window of one. Errors as decode().
+    bool verify(std::span<const int32_t> tokens) noexcept;
+    // Keeps the first n tokens of the last window (1 <= n <= its width), as if only they had been decoded. The
+    // window's results are not valid afterwards: read them first.
+    bool accept(int n) noexcept;
+    // Column t's next-token logits after the last window (n_vocab floats), or empty when Options::logits is false.
+    std::span<const float> logits(int column = 0) const noexcept;
+    // Column t's most likely next token after the last window, computed on the GPU; ties go to the lowest id.
+    int32_t argmax(int column = 0) const noexcept;
     const std::string& error() const noexcept;
+
+    // Changes Options::swaps_per_window from the next window on (for example fewer during a prompt's one-token
+    // windows).
+    void set_swaps_per_window(int n) noexcept;
+
+    // For the draft layer (draft.h), which runs on the model's stream and reads these, never writes them: the
+    // weights (the token embedding and the output head), the stream every window runs on, and column t's 4-stream
+    // residual after the last window on the GPU (hc x n_embd floats: the hidden state after the head mixer's
+    // combine), valid until the next window.
+    const Weights& weights() const noexcept;
+    CUstream_st* stream() const noexcept;
+    const float* residual(int column = 0) const noexcept;
 
     // Starts a new, empty sequence.
     void reset();

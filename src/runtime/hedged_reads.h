@@ -6,6 +6,10 @@
 // again into a spare buffer, and the first copy to arrive is used. The loser's buffer stays out of use until its read
 // completes, so a late write never lands in memory the caller reads.
 //
+// A request is read as page-aligned chunks of kReadChunk (128 KiB) that different workers read at once, so one expert's
+// slices keep many reads in flight on the SSD instead of one at a time. A request is done when its last chunk is; the
+// hedge re-issues the whole request.
+//
 // The buffers are the caller's memory, in pools of equal-sized buffers; a pool needs at least one spare buffer more
 // than the reads one read_all() puts into it.
 #pragma once
@@ -56,6 +60,10 @@ public:
 private:
     struct Buffer;
     struct Task;
+    struct Chunk {
+        std::shared_ptr<Task> task;
+        uint32_t j;  // the chunk's index in its read
+    };
     void work();
     std::shared_ptr<Task> submit(const Request& r);
     Buffer* take(int pool);
@@ -67,7 +75,7 @@ private:
     std::vector<Buffer*> held_;  // the winners' buffers since the last release()
     std::mutex mutex_;
     std::condition_variable wake_;
-    std::deque<std::shared_ptr<Task>> queue_;
+    std::deque<Chunk> queue_;
     bool stop_ = false;
     std::atomic<uint64_t> hedged_{0};
     std::vector<std::thread> workers_;

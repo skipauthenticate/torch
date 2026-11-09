@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "kernels/columns.h"
+
 namespace torch::kernels {
 
 inline constexpr int kWarp = 32;

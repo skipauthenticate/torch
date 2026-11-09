@@ -96,11 +96,31 @@ most-routed experts of a route-count file resident and `--route-counts COUNTS` a
 graph; `TORCH_EAGER=1` launches kernel by kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir
 TORCH_DUMP_STAGES=router,...` writes the named stages' values per position and layer.
 
+### Verify windows and speculative decoding
+
+- `--window T [--accept K]` feeds the prompt in windows of T tokens (1 to 8), keeping K of each. Every position's
+  results must equal `--window 1`'s bit for bit, which tests windows and their rollback.
+- `--draft FILE` loads the draft layer (`tools/make_draft.py OUT --experts iq4` builds it). `--draft-variants
+  stream:40960 --draft-vocab VOCAB` picks one RMS per stream and a 40,960-row head subset; `bench/draft_acceptance.py
+  vocab` writes VOCAB.
+- `--spec D` then generates speculatively, with windows of the last token and up to D drafts (1 to 7).
+  `--spec-policy fixed|adaptive|adaptive-stop` chooses how many a window verifies (default adaptive-stop).
+- `--swap N` makes up to N missed experts resident after each window, and `--swap-prompt M` caps it during the
+  prompt (M4 runs `--spec 5 --swap 32 --swap-prompt 0`).
+- `--check-draft-kv` decodes the history again after a speculative run and requires the draft layer's K/V to match,
+  bit for bit.
+- `--draft-depth D --acceptance-report FILE` measures the draft layer's acceptance per depth, one token at a time.
+- The generated ids are the same with and without `--draft`, `--spec` and `--swap`; only speed changes.
+
 ### Benchmarks
 
 `bench/run_workloads.py --torch build/torch --model MODEL --out RESULT.json --placement COUNTS` runs the three
 workloads of [benchmarking.md](benchmarking.md) and writes the result file; `--calibrate COUNTS` records the route
-counts from the held-out calibration prompts. `build/torch_bench_kernels MODEL --json FILE` times every kernel of a
+counts from the held-out calibration prompts. `--spec-args "ARGS"` passes the speculative-decoding arguments to
+`torch run` in both modes, and the result then records each request's tokens per window, drafts verified and the
+split of a window's time. The M4 runs use `--placement calib-spec.txt` and ARGS `--draft DRAFT --draft-variants
+stream:40960 --draft-vocab VOCAB --spec 5 --spec-policy adaptive-stop --swap 32 --swap-prompt 0`; calib-spec.txt is
+`--calibrate calib-spec.txt --placement calib.txt --calib-n 128` with ARGS up to `adaptive-stop`. `build/torch_bench_kernels MODEL --json FILE` times every kernel of a
 token in GB/s against the 180 GB/s ceiling, and `bench/kernel_gates.py FILE` checks that result against the decode
 gates.
 
@@ -180,7 +200,8 @@ CI runs it for 60 seconds on every pull request. A crash, a sanitizer report or 
 The files in `tests/fixtures/` are small and synthetic, never model data. `make_fixtures.py` writes them with the
 project's numpy reference of the formats (`reference.py`, written from [formats.md](formats.md)) and its GGUF writer
 (`gguf_writer.py`). `requirements.txt` pins numpy, the only dependency, so each run writes the same bytes. CI
-regenerates them and fails if a byte differs from the committed files. After changing the script:
+regenerates them and fails if a byte differs from the committed files, and runs `tests/tools/make_draft_test.py`,
+which checks the draft-layer builder's Q8_0 blocks and writer on synthetic tensors. After changing the script:
 
 ```sh
 python3 -m venv .venv
@@ -246,8 +267,8 @@ See [architecture.md](architecture.md#source-layout) for the source layout. What
 | `src/kernels/` | CUDA kernels, one folder per operation: `gemv`, `norm`, `hc`, `deltanet`, `attention`, `moe`, `ple` |
 | `src/model/` | The model's configuration (`config`), its weights in engine memory (`weights`), the forward pass (`model`) |
 | `src/runtime/` | Direct reads and the read pool, the expert store (residency and the miss path), the PLE row reader |
-| `tools/` | The `torch` command: `torch inspect`, `torch run`, `torch --version`; `tools/check_wording.py` |
-| `bench/` | Microbenchmarks: GPU memory bandwidth by memory type, SSD reads by queue depth |
+| `tools/` | The `torch` command: `torch inspect`, `torch run`, `torch --version`; `tools/check_wording.py`; `tools/make_draft.py` (the draft-layer file) |
+| `bench/` | Microbenchmarks: GPU memory bandwidth by memory type, SSD reads by queue depth; `draft_acceptance.py` (the draft layer's acceptance per depth on the workloads, M4) |
 | `tests/` | Unit tests, kernel parity tests, model parity, the fuzz target, the fixtures and the script that writes them |
 
 When adding code:

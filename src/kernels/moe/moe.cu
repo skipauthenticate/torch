@@ -20,6 +20,7 @@ __device__ __forceinline__ bool better(float v, int i, float best_v, int best_i)
 // then counts among all candidates, which gives its exact overall rank, so the choice, the order and the sum of the
 // chosen p (taken in rank order) are those of k rounds of a block-wide argmax.
 __global__ void router_kernel(const float* logits, int n, int k, int32_t* ids, float* weights) {
+    logits += int64_t{blockIdx.x} * n, ids += blockIdx.x * k, weights += blockIdx.x * k;  // the window column
     __shared__ float p_s[kMaxExperts];
     __shared__ float cand_v[kMaxExperts / kWarp * kMaxTopK];
     __shared__ int cand_i[kMaxExperts / kWarp * kMaxTopK];
@@ -72,6 +73,8 @@ __global__ void swiglu_kernel(const float* g, const float* u, float* h, int n) {
 
 __global__ void moe_combine_kernel(const float* y, const float* w, int k, const float* ys, const float* shared_gate,
                                    float* out, int n) {
+    const int64_t t = blockIdx.y;  // the window column
+    y += t * k * n, w += t * k, ys += t * n, shared_gate += t, out += t * n;
     const int e = blockIdx.x * kThreads + threadIdx.x;
     if (e >= n)
         return;
@@ -81,10 +84,24 @@ __global__ void moe_combine_kernel(const float* y, const float* w, int k, const 
     out[e] = acc + sigmoid(shared_gate[0]) * ys[e];
 }
 
+__global__ void expert_table_kernel(const int32_t* ids, int k, ResidentExperts e, const uint8_t** table) {
+    const int s = threadIdx.x;
+    if (s >= k)
+        return;
+    const uint64_t id = static_cast<uint64_t>(ids[s]);
+    table[s] = e.gate + id * e.gate_up_slice;
+    table[k + s] = e.up + id * e.gate_up_slice;
+    table[2 * k + s] = e.down + id * e.down_slice;
+}
+
 }  // namespace
 
-void router_top_k(const float* logits, int n, int k, int32_t* ids, float* weights, cudaStream_t stream) {
-    router_kernel<<<1, (n + kWarp - 1) / kWarp * kWarp, 0, stream>>>(logits, n, k, ids, weights);
+void router_top_k(const float* logits, int n, int k, int32_t* ids, float* weights, cudaStream_t stream, int columns) {
+    router_kernel<<<columns, (n + kWarp - 1) / kWarp * kWarp, 0, stream>>>(logits, n, k, ids, weights);
+}
+
+void expert_table(const int32_t* ids, int k, ResidentExperts experts, const uint8_t** table, cudaStream_t stream) {
+    expert_table_kernel<<<1, kWarp, 0, stream>>>(ids, k, experts, table);
 }
 
 void swiglu(const float* g, const float* u, float* h, int n, cudaStream_t stream) {
@@ -92,8 +109,9 @@ void swiglu(const float* g, const float* u, float* h, int n, cudaStream_t stream
 }
 
 void moe_combine(const float* y, const float* w, int k, const float* ys, const float* shared_gate, float* out, int n,
-                 cudaStream_t stream) {
-    moe_combine_kernel<<<blocks_for(n, kThreads), kThreads, 0, stream>>>(y, w, k, ys, shared_gate, out, n);
+                 cudaStream_t stream, int columns) {
+    moe_combine_kernel<<<dim3(blocks_for(n, kThreads), columns), kThreads, 0, stream>>>(y, w, k, ys, shared_gate, out,
+                                                                                        n);
 }
 
 }  // namespace torch::kernels
