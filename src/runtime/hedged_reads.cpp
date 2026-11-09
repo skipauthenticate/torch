@@ -94,7 +94,11 @@ std::shared_ptr<HedgedReads::Task> HedgedReads::submit(const Request& r) {
         for (uint32_t j = 0; j < chunks; ++j)
             queue_.push_back({task, j});
     }
-    wake_.notify_all();
+    // One chunk wakes one worker; waking all of them for every small read (the PLE rows) made them contend.
+    if (chunks == 1)
+        wake_.notify_one();
+    else
+        wake_.notify_all();
     return task;
 }
 
