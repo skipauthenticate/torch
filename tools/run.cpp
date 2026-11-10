@@ -40,7 +40,8 @@ constexpr const char* kUsage =
     "  --resident K    keep exactly experts 0 to K - 1 of every layer resident (residency tests)\n"
     "  --placement F   keep the experts most routed in route-count file F resident (default: every layer's first\n"
     "                  experts, as many as fit in memory)\n"
-    "  --route-counts F  after the run, add how often each expert was routed to route-count file F\n"
+    "  --route-counts F  after the run, add how often each expert was routed for the generated tokens (not the\n"
+    "                  prompt) to route-count file F\n"
     "  --logits FILE   write every step's raw F32 logits to FILE\n"
     "  --json FILE     write every step's top log-probabilities to FILE, one JSON object per line\n"
     "  --profile       print where decode time went: PLE rows, the GPU, expert reads, launches\n"
@@ -347,6 +348,9 @@ int run(int argc, char** argv) {
         std::vector<int32_t> sequence = prompt;
         model::ExpertStats at_prompt_end{};  // expert hits and misses when the prompt was in
         model::DecodeTimes times_at_prompt_end{};
+        // The prompt's routing predicts the generation's poorly (code in, English out), so --route-counts records only
+        // the generated tokens: the counts when the prompt was in are subtracted at the end.
+        RouteCounts routes_at_prompt_end{};
         double decode_ms = 0;
         int decoded = 0;
         const size_t n_variants = drafting ? variants.size() : 0;
@@ -414,6 +418,8 @@ int run(int argc, char** argv) {
             if (i == prompt.size()) {  // the prompt is in (once): count the generation's misses and swaps from here
                 at_prompt_end = m.expert_stats();
                 times_at_prompt_end = m.decode_times();
+                if (!route_counts_path.empty())
+                    routes_at_prompt_end = m.route_counts();
                 m.set_swaps_per_window(swap_generate);
             }
             if (next >= 0 && i == sequence.size() && sequence.size() >= prompt.size() &&
@@ -588,6 +594,9 @@ int run(int argc, char** argv) {
             std::fclose(report);
         if (!route_counts_path.empty()) {
             RouteCounts counts = m.route_counts();
+            if (!routes_at_prompt_end.counts.empty())
+                for (size_t e = 0; e < counts.counts.size(); ++e)
+                    counts.counts[e] -= routes_at_prompt_end.counts[e];
             if (std::filesystem::exists(route_counts_path))
                 counts.add(RouteCounts::read(route_counts_path));
             counts.write(route_counts_path);

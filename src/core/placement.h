@@ -1,10 +1,11 @@
 // Which routed experts are resident (architecture decision 8: "placement is a ranking").
 //
 // The experts do not all fit next to the operating system (46.8 GiB), and the model routes some far more often than
-// others. A route-count file records how often each (layer, expert) was routed while decoding calibration text; the
-// placement keeps the most-routed experts resident, across all layers, until the memory the budget leaves for experts
-// is full. Without counts, every layer keeps its experts 0 to k - 1. Output never depends on the placement (the expert
-// store computes every expert with the same kernel), only speed.
+// others. A route-count file records how often each (layer, expert) was routed while generating from calibration
+// prompts (the generated tokens only: the prompt's routing predicts the generation's poorly); the placement keeps the
+// most-routed experts resident, across all layers, until the memory the budget leaves for experts is full. Without
+// counts, every layer keeps its experts 0 to k - 1. Output never depends on the placement (the expert store computes
+// every expert with the same kernel), only speed.
 #pragma once
 
 #include <cstdint>

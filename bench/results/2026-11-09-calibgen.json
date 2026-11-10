@@ -1,0 +1,267 @@
+{
+ "engine_commit": "calibgen",
+ "torch_sha256": "e16bf079c2abc3ac9ddc213f18d55231e5bf655ac9304fdc2705419ad8d13125",
+ "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+ "model_bytes": 54817524224,
+ "placement": "calib-g.txt",
+ "spec_args": "",
+ "generated_per_request": 256,
+ "board": {
+  "host": "localhost.localdomain",
+  "jetpack": "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64, DATE: Fri Aug  7 05:54:22 AM UTC 2026",
+  "power_mode": "NV Power Mode: MAXN",
+  "gpu_max_mhz": "1300500000"
+ },
+ "placement_sha256": "d71eae9162366e5380b59543d0c35b7bf3aa6f7722cc88b0ebd7d3b1571da920",
+ "workloads": {
+  "review": {
+   "median_decode_tok_s": 24.99,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1491,
+     "decode_tok_s": 25.04,
+     "ms_per_token": 39.9,
+     "resident": 22409,
+     "hits": 824640,
+     "misses": 13920,
+     "hedged": 2,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.45,
+     "mem_available_end_gib": 7.45,
+     "generation": {
+      "hits": 122768,
+      "misses": 112,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 103.6,
+     "output_sha256": "5da61c77d4dfb996e12fcc390e92eedd7ce2e5cab4eb5449946387b7a49f4659",
+     "profile": "decode time per token over 1747 steps: 45.23 ms; PLE rows 0.31 (slowest 0.6, 0 over 5 ms, 0 hedged), waiting for the GPU 44.74 (expert reads during it 5.58), launches and other host work 0.17"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1493,
+     "decode_tok_s": 24.99,
+     "ms_per_token": 40.0,
+     "resident": 22416,
+     "hits": 825606,
+     "misses": 13914,
+     "hedged": 3,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122744,
+      "misses": 136,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 104.2,
+     "output_sha256": "d1b0e1f759fa5f3ad558dbfd87c88731bba446e2b623c0b4ee60b92e0fd18276",
+     "profile": "decode time per token over 1749 steps: 45.26 ms; PLE rows 0.31 (slowest 0.8, 0 over 5 ms, 0 hedged), waiting for the GPU 44.78 (expert reads during it 5.60), launches and other host work 0.17"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1455,
+     "decode_tok_s": 24.7,
+     "ms_per_token": 40.5,
+     "resident": 22414,
+     "hits": 807831,
+     "misses": 13449,
+     "hedged": 1,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122589,
+      "misses": 291,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 102.1,
+     "output_sha256": "a60996c989057830266e55fda30e30f360c59c535d5271f5215f84f5030a0e61",
+     "profile": "decode time per token over 1711 steps: 45.17 ms; PLE rows 0.31 (slowest 0.7, 0 over 5 ms, 0 hedged), waiting for the GPU 44.69 (expert reads during it 5.49), launches and other host work 0.16"
+    }
+   ]
+  },
+  "prose": {
+   "median_decode_tok_s": 25.08,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1470,
+     "decode_tok_s": 25.13,
+     "ms_per_token": 39.8,
+     "resident": 22409,
+     "hits": 820196,
+     "misses": 8284,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.43,
+     "mem_available_end_gib": 7.43,
+     "generation": {
+      "hits": 122810,
+      "misses": 70,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 99.6,
+     "output_sha256": "2bb3e10fb0e3e9b5a41f1362dae7a59dd6a9ecbe2000819834ab3f1d91dbe9e2",
+     "profile": "decode time per token over 1726 steps: 43.20 ms; PLE rows 0.31 (slowest 1.9, 0 over 5 ms, 0 hedged), waiting for the GPU 42.71 (expert reads during it 3.58), launches and other host work 0.17"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1517,
+     "decode_tok_s": 25.08,
+     "ms_per_token": 39.9,
+     "resident": 22402,
+     "hits": 842135,
+     "misses": 8905,
+     "hedged": 2,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122793,
+      "misses": 87,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 101.5,
+     "output_sha256": "c78e9a71bb2d754dde77c8fa6025dee8b623b2700cd87e4b75b6eed583775431",
+     "profile": "decode time per token over 1773 steps: 43.42 ms; PLE rows 0.31 (slowest 0.6, 0 over 5 ms, 0 hedged), waiting for the GPU 42.93 (expert reads during it 3.78), launches and other host work 0.17"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1520,
+     "decode_tok_s": 25.0,
+     "ms_per_token": 40.0,
+     "resident": 22395,
+     "hits": 843601,
+     "misses": 8879,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.43,
+     "mem_available_end_gib": 7.43,
+     "generation": {
+      "hits": 122752,
+      "misses": 128,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 101.9,
+     "output_sha256": "f39818ec87256c26164ad73952408a6a09ca1d831378920ba16dd394cb3bb161",
+     "profile": "decode time per token over 1776 steps: 43.35 ms; PLE rows 0.31 (slowest 1.0, 0 over 5 ms, 0 hedged), waiting for the GPU 42.87 (expert reads during it 3.73), launches and other host work 0.17"
+    }
+   ]
+  },
+  "repetition": {
+   "median_decode_tok_s": 25.15,
+   "requests": [
+    {
+     "seed": 1,
+     "prompt_tokens": 1494,
+     "decode_tok_s": 25.15,
+     "ms_per_token": 39.8,
+     "resident": 22390,
+     "hits": 831352,
+     "misses": 8648,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122822,
+      "misses": 58,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 100.5,
+     "output_sha256": "daedec83d55e56640fb218d9d33777d6f10e0a8fe9e8cf9c536f6f43e1347ea4",
+     "profile": "decode time per token over 1750 steps: 43.33 ms; PLE rows 0.34 (slowest 50.2, 1 over 5 ms, 1 hedged), waiting for the GPU 42.81 (expert reads during it 3.69), launches and other host work 0.17"
+    },
+    {
+     "seed": 2,
+     "prompt_tokens": 1479,
+     "decode_tok_s": 25.16,
+     "ms_per_token": 39.7,
+     "resident": 22386,
+     "hits": 823973,
+     "misses": 8827,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122827,
+      "misses": 53,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 100.1,
+     "output_sha256": "1371987452c0a41aa95dcee1fe9fa26534ff8d7e2c383603733cf4a8ce8f19c2",
+     "profile": "decode time per token over 1735 steps: 43.40 ms; PLE rows 0.31 (slowest 1.8, 0 over 5 ms, 0 hedged), waiting for the GPU 42.92 (expert reads during it 3.78), launches and other host work 0.17"
+    },
+    {
+     "seed": 3,
+     "prompt_tokens": 1484,
+     "decode_tok_s": 25.15,
+     "ms_per_token": 39.8,
+     "resident": 22380,
+     "hits": 826787,
+     "misses": 8413,
+     "hedged": 0,
+     "mem_available_after_load_gib": 7.48,
+     "mem_available_lowest_gib": 7.44,
+     "mem_available_end_gib": 7.44,
+     "generation": {
+      "hits": 122825,
+      "misses": 55,
+      "swaps": 0,
+      "swap_ms": 0.0,
+      "swap_ms_per_window": 0.0,
+      "prompt_swaps": 0,
+      "prompt_swap_ms": 0.0
+     },
+     "speculative": null,
+     "wall_s": 99.7,
+     "output_sha256": "57a72ae27a57646cb605f31dc65bbd5f812b3a8df1a83a6137f35d637a3af694",
+     "profile": "decode time per token over 1740 steps: 43.24 ms; PLE rows 0.32 (slowest 1.5, 0 over 5 ms, 0 hedged), waiting for the GPU 42.75 (expert reads during it 3.62), launches and other host work 0.17"
+    }
+   ]
+  }
+ }
+}

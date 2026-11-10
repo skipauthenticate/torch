@@ -79,6 +79,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Expert placement from the routing of generated tokens: `--route-counts` records only the tokens generated after the
+  prompt, and `run_workloads.py --calibrate` generates 256 tokens per held-out prompt. Code review +4.7% (median of
+  three, one session) with the memory a 262,144-token context will take; generation misses fall 40-90%.
 - Milestone M5, host time per window:
   - A verify window's PLE rows are read in one batch of parallel reads, and a single-chunk read wakes one read worker
     instead of all of them: PLE time per token 1.05 to 0.32 ms.
