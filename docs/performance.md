@@ -289,6 +289,41 @@ Same command and placements as M4 decode. Medians of three requests:
   will need), the same binary measured code review at 35.43 tok/s (median of three; 19,100-19,400 resident) against
   38.70 without, in one session: about 1 tok/s per 1,000 resident experts.
 
+### Placement from generated tokens
+
+The placement ranks experts by a route-count file. Until 2026-11-09 the calibration counted every prompt position
+as well as the generated tokens: `calib-spec.txt` held 14,729 positions, about 92% of them prompt tokens (9 held-out
+prompts of ~1,500 tokens, 128 generated each). A prompt's routing predicts its generation's poorly: on the three code
+review prompts, the review's English uses different experts from the code it reads. `--route-counts` now records only
+the generated tokens, and `run_workloads.py --calibrate` generates 256 tokens per held-out prompt.
+
+Static misses of the generated tokens of the three review benchmark prompts (offline, from per-request route counts):
+
+| Placement | 19,400 resident | 22,950 resident |
+| --- | --- | --- |
+| Prompts and generated tokens (old) | 3,870 / 3,090 / 4,010 | 419 / 205 / 338 |
+| Generated tokens only | 739 / 865 / 1,722 | 77 / 122 / 237 |
+| Old counts blended half and half with the request's own prompt routing | 5,300 / 4,150 / 5,201 | 478 / 274 / 380 |
+
+Measured with the tool's own files (`--calibrate` on the held-out prompts), the old placement against the new one,
+alternating in one session on 2026-11-09 with 6.7 GiB taken first (~19,800 resident), ids identical:
+
+| Review request | Old placement | Generation-only | Generation misses |
+| --- | ---: | ---: | --- |
+| 1 | 38.38 | 39.51 | 1,074 to 336 |
+| 2 | 35.93 | 37.62 | 1,133 to 399 |
+| 3 | 34.98 | 36.49 | 1,241 to 678 |
+
+The median rises 4.7%. An earlier A/B, with a placement built offline from the same kind of counts and without the
+6.7 GiB, measured review +2.8% (median of three), prose 1 +1.7% and repetition 1 +3.2%. The full benchmark with the
+tool's files (`bench/results/2026-11-09-calibgen-spec.json` and `2026-11-09-calibgen.json`, a different session from
+M5's with ~700 fewer experts resident at the same MemAvailable) measured speculative review 38.26, prose 42.05 and
+repetition 56.85 tok/s, and one token at a time 24.99, 25.08 and 25.15; generation misses fell 40-90% on every
+request except review 3 (speculative 255 to 281). The prompt misses more, which lengthens prefill.
+
+6.7 GiB is what a 262,144-token context's F16 KV, draft-layer KV and pooled indexer keys will take. Also measured
+there and not kept: `--swap 64` and `--swap 128` (medians 35.65 and 35.70 against 35.58 with 32).
+
 ## Targets
 
 Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in

@@ -91,10 +91,11 @@ FILE` writes every step's top log-probabilities for the parity script. The conte
 milestone M6: below that, the model's sparse attention selects every cell, so dense attention is exact.
 
 `--tokens @FILE` reads the ids from a file (as `bench/workloads/` stores them), `--placement COUNTS` keeps the
-most-routed experts of a route-count file resident and `--route-counts COUNTS` adds this run's routing to one, and
-`--quiet --profile` prints only the speed, the generated ids and where decode time went. Each token runs as one CUDA
-graph; `TORCH_EAGER=1` launches kernel by kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir
-TORCH_DUMP_STAGES=router,...` writes the named stages' values per position and layer.
+most-routed experts of a route-count file resident and `--route-counts COUNTS` adds the routing of this run's generated
+tokens to one (the prompt's routing predicts the generation's poorly), and `--quiet --profile` prints only the speed,
+the generated ids and where decode time went. Each token runs as one CUDA graph; `TORCH_EAGER=1` launches kernel by
+kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir TORCH_DUMP_STAGES=router,...` writes the named
+stages' values per position and layer.
 
 ### Verify windows and speculative decoding
 
@@ -116,13 +117,13 @@ TORCH_DUMP_STAGES=router,...` writes the named stages' values per position and l
 
 `bench/run_workloads.py --torch build/torch --model MODEL --out RESULT.json --placement COUNTS` runs the three
 workloads of [benchmarking.md](benchmarking.md) and writes the result file; `--calibrate COUNTS` records the route
-counts from the held-out calibration prompts. `--spec-args "ARGS"` passes the speculative-decoding arguments to
-`torch run` in both modes, and the result then records each request's tokens per window, drafts verified and the
-split of a window's time. The M4 runs use `--placement calib-spec.txt` and ARGS `--draft DRAFT --draft-variants
-stream:40960 --draft-vocab VOCAB --spec 5 --spec-policy adaptive-stop --swap 32 --swap-prompt 0`; calib-spec.txt is
-`--calibrate calib-spec.txt --placement calib.txt --calib-n 128` with ARGS up to `adaptive-stop`. `build/torch_bench_kernels MODEL --json FILE` times every kernel of a
-token in GB/s against the 180 GB/s ceiling, and `bench/kernel_gates.py FILE` checks that result against the decode
-gates.
+counts from the held-out calibration prompts. `--spec-args "ARGS"` passes the speculative-decoding arguments to `torch
+run` in both modes, and the result then records each request's tokens per window, drafts verified and the split of a
+window's time. The M4 runs use `--placement calib-spec.txt` and ARGS `--draft DRAFT --draft-variants stream:40960
+--draft-vocab VOCAB --spec 5 --spec-policy adaptive-stop --swap 32 --swap-prompt 0`; calib-spec.txt is `--calibrate
+calib-spec.txt --placement calib.txt` with ARGS up to `adaptive-stop`. `build/torch_bench_kernels MODEL --json FILE`
+times every kernel of a token in GB/s against the 180 GB/s ceiling, and `bench/kernel_gates.py FILE` checks that result
+against the decode gates.
 
 ### Model parity
 

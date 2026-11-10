@@ -16,12 +16,12 @@
       updated, so the workloads can run in separate sessions.
 
   run_workloads.py --torch BUILD/torch --model SHARD1 --calibrate COUNTS [--workload review] [--placement START]
-                   [--spec-args "ARGS"] [--calib-n 64]
-      Decodes the held-out calibration prompts (seeds 101-103), generating --calib-n tokens each from placement
-      START and with ARGS when given, and adds their route counts to COUNTS, the input of `--placement`
-      (core/placement.h). The benchmark prompts are never used for calibration. The counts for speculative decoding
-      come from the plain ones: --calibrate calib-spec.txt --placement calib.txt --calib-n 128 --spec-args "the draft
-      file, variant, vocabulary and --spec 5 --spec-policy adaptive-stop".
+                   [--spec-args "ARGS"] [--calib-n 256]
+      Decodes the held-out calibration prompts (seeds 101-103), generating --calib-n tokens each from placement START
+      and with ARGS when given, and adds the route counts of the generated tokens (not the prompts) to COUNTS, the input
+      of `--placement` (core/placement.h). The benchmark prompts are never used for calibration. The counts for
+      speculative decoding come from the plain ones: --calibrate calib-spec.txt --placement calib.txt --spec-args "the
+      draft file, variant, vocabulary and --spec 5 --spec-policy adaptive-stop".
 
 Standard library only.
 """
@@ -129,7 +129,7 @@ def main():
     p.add_argument("--out")
     p.add_argument("--commit", default="", help="the engine commit the binary was built from")
     p.add_argument("-n", type=int, default=256)
-    p.add_argument("--calib-n", type=int, default=64, help="tokens generated per calibration prompt")
+    p.add_argument("--calib-n", type=int, default=256, help="tokens generated per calibration prompt")
     p.add_argument("--spec-args", default="", help="more torch run arguments, for speculative decoding")
     args = p.parse_args()
     names = NAMES if args.workload == "all" else [args.workload]
