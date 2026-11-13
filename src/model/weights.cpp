@@ -234,6 +234,12 @@ void Weights::bind(WeightLoader& w, const Config& c) {
         L.ple = il == c.ple_layer;
 
         bind_layer(w, c, b, L);
+        if (!L.recurrent) {
+            L.idx_q = w.matrix(b + "indexer.q_proj.weight", E, 4 * 128);
+            L.idx_k = w.matrix(b + "indexer.k_proj.weight", E, 128);
+            L.idx_q_norm = w.vector(b + "indexer.q_norm.weight", {128});
+            L.idx_k_norm = w.vector(b + "indexer.k_norm.weight", {128});
+        }
         if (L.ple) {
             L.ple_key = w.matrix(b + "ple_key.weight", E, HCD);
             L.ple_value = w.matrix(b + "ple_value.weight", E, E);

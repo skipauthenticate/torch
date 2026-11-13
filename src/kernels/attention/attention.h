@@ -13,6 +13,7 @@
 
 #include <cstdint>
 
+#include "kernels/indexer/indexer.h"
 namespace torch::kernels {
 
 // NeoX-style rotary embedding. Head h is x + h * head_stride; pairs (i, i + n_rot / 2) for
@@ -31,10 +32,12 @@ void store_kv(const float* k, const float* v, uint16_t* k_cache, uint16_t* v_cac
 // q_stride) and of the k heads (k + (t * kv_heads + h) * 256), rope_neox on both with n_rot at position *pos + t, and
 // store_kv of rows *pos + t from the normed, rotated k and from v (columns * kv_heads * 256 floats). Heads have 256
 // dimensions. q and k are updated in place. Column t is bitwise equal to rms_norm, rope_neox and store_kv run in
-// sequence on that column (tests/parity/attention_test.cpp).
+// sequence on that column (tests/parity/attention_test.cpp). With cache_row, the K/V rows written are *cache_row + t
+// instead (a ring of rows); the rotary embedding still uses *pos + t.
 void qk_norm_rope_store(float* q, int64_t q_stride, const float* q_weight, float* k, const float* k_weight,
                         const float* v, uint16_t* k_cache, uint16_t* v_cache, int heads, int kv_heads, int n_rot,
-                        const int32_t* pos, float base, float eps, int columns, cudaStream_t stream);
+                        const int32_t* pos, float base, float eps, int columns, cudaStream_t stream,
+                        const int32_t* cache_row = nullptr);
 
 // Floats of scratch attention_decode needs for a cache of max_ctx rows and a window of `columns` tokens.
 int64_t attention_scratch_floats(int heads, int max_ctx, int columns);
@@ -56,5 +59,15 @@ int64_t attention_scratch_floats(int heads, int max_ctx, int columns);
 void attention_decode(const float* q, const float* gate, int64_t q_stride, const uint16_t* k_cache,
                       const uint16_t* v_cache, float* out, float* scratch, const int32_t* pos, int heads, int kv_heads,
                       float scale, int max_ctx, int columns, cudaStream_t stream);
+
+// Attention over the cell lists of the sparse indexer (kernels/indexer/indexer.h), for the columns of a window or a
+// prefill batch (any count; scratch per column) whose K and V rows are already in the cache (qk_norm_rope_store):
+// column t attends to the cells of its list, as attention_decode
+// does to rows 0..*pos + t, in chunks of 128 cells merged in ascending order. For a list that is every position in
+// order the result is bitwise attention_decode's. Scratch: attention_cells_scratch_floats floats.
+int64_t attention_cells_scratch_floats(int heads, int columns);
+void attention_decode_cells(const float* q, const float* gate, int64_t q_stride, const uint16_t* k_cache,
+                            const uint16_t* v_cache, float* out, float* scratch, const int32_t* pos, int heads,
+                            int kv_heads, float scale, const IndexCells& cells, int columns, cudaStream_t stream);
 
 }  // namespace torch::kernels

@@ -235,8 +235,21 @@ int main() {
     try {
         check_conv(6);
         check_step(4);
-        for (auto [columns, accepted] : std::vector<std::pair<int, int>>{
-                 {1, 1}, {2, 1}, {2, 2}, {3, 2}, {4, 4}, {5, 3}, {6, 1}, {7, 5}, {8, 1}, {8, 2}, {8, 8}})
+        for (auto [columns, accepted] :
+             std::vector<std::pair<int, int>>{{1, 1},
+                                              {2, 1},
+                                              {2, 2},
+                                              {3, 2},
+                                              {4, 4},
+                                              {5, 3},
+                                              {6, 1},
+                                              {7, 5},
+                                              {8, 1},
+                                              {8, 2},
+                                              {8, 8},
+                                              {33, 33},
+                                              {300, 299},
+                                              {1024, 1024}})  // the last three: prefill chunks
             check_window(columns, accepted);
         TORCH_CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {

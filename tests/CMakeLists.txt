@@ -45,7 +45,7 @@ endif()
 
 # GPU kernels against their CPU references (synthetic data; the Orin only).
 if(TORCH_CUDA)
-  foreach(name gemv norm hc deltanet attention moe ple argmax gate sample)
+  foreach(name gemv gemm norm hc deltanet attention moe ple argmax gate sample indexer)
     add_executable(${name}_test parity/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE torch_engine)
     add_test(NAME ${name} COMMAND ${name}_test)

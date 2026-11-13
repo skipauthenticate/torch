@@ -25,6 +25,8 @@ struct HedgedReads::Task {
     std::atomic<uint32_t> remaining{0};  // chunks not yet read
     std::atomic<bool> failed{false};
     std::atomic<int> status{0};  // 0 pending, 1 done, 2 failed: set when the last chunk completes
+    // when a worker began its first chunk (steady clock ns, 0 before): a read waiting behind a long batch is not late
+    std::atomic<int64_t> started{0};
     const uint8_t* result = nullptr;
 };
 
@@ -66,6 +68,8 @@ void HedgedReads::work() {
             queue_.pop_front();
         }
         Task& task = *chunk.task;
+        int64_t not_yet = 0;
+        task.started.compare_exchange_strong(not_yet, Clock::now().time_since_epoch().count());
         const uint64_t at = uint64_t{chunk.j} * kReadChunk;
         try {
             // a page-aligned start, so the chunk's bytes land at the same offset in the buffer
@@ -81,9 +85,12 @@ void HedgedReads::work() {
     }
 }
 
-std::shared_ptr<HedgedReads::Task> HedgedReads::submit(const Request& r) {
+std::shared_ptr<HedgedReads::Task> HedgedReads::submit(const Request& r, bool wait) {
+    Buffer* buffer = take(r.pool, wait);
+    if (!buffer)
+        return nullptr;
     auto task = std::make_shared<Task>();
-    task->buffer = take(r.pool);
+    task->buffer = buffer;
     task->first = page_floor(r.offset);
     task->bytes = r.offset + r.n - task->first;
     task->result = task->buffer->base + (r.offset - task->first);
@@ -102,14 +109,17 @@ std::shared_ptr<HedgedReads::Task> HedgedReads::submit(const Request& r) {
     return task;
 }
 
-// A free buffer of the pool, marked in use; waits for a late read to finish if all are taken.
-HedgedReads::Buffer* HedgedReads::take(int pool) {
+// A free buffer of the pool, marked in use; waits for a late read to finish if all are taken (or, without `wait`,
+// returns nullptr).
+HedgedReads::Buffer* HedgedReads::take(int pool, bool wait) {
     for (;;) {
         for (const std::unique_ptr<Buffer>& b : pools_[static_cast<size_t>(pool)]) {
             int expected = kFree;
             if (b->state.compare_exchange_strong(expected, kInUse))
                 return b.get();
         }
+        if (!wait)
+            return nullptr;
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
@@ -125,7 +135,6 @@ void HedgedReads::abandon(Task& t) {
 }
 
 void HedgedReads::read_all(std::span<const Request> requests, std::span<const uint8_t*> out) {
-    const auto start = Clock::now();
     struct Pending {
         std::shared_ptr<Task> first, hedge;
     };
@@ -143,9 +152,13 @@ void HedgedReads::read_all(std::span<const Request> requests, std::span<const ui
                 winner = p.first, loser = p.hedge;
             } else if (p.hedge && p.hedge->status.load(std::memory_order_acquire) != 0) {
                 winner = p.hedge, loser = p.first;
-            } else if (!p.hedge && Clock::now() - start > hedge_after_) {
-                p.hedge = submit(requests[i]);
-                ++hedged_;
+            } else if (const int64_t began = p.first->started.load(std::memory_order_relaxed);
+                       !p.hedge && began != 0 &&
+                       Clock::now().time_since_epoch().count() - began > Clock::duration(hedge_after_).count()) {
+                // a hedge takes a spare buffer only if one is free: waiting for one here would stop this loop from
+                // freeing the losers' buffers, so it is tried again on the next pass
+                if ((p.hedge = submit(requests[i], false)))
+                    ++hedged_;
             }
             if (!winner)
                 continue;

@@ -131,6 +131,18 @@ void check_fused(int pos_value) {
     CHECK(same);
     std::printf("%-40s %s\n", ("qk_norm_rope_store bitwise pos " + std::to_string(pos_value)).c_str(),
                 same ? "ok" : "FAIL");
+    // With cache_row (the draft's ring) the same K/V go to that row; the rotary embedding stays at pos.
+    DeviceBuffer<int32_t> row(std::vector<int32_t>{(pos_value + 7) % kMaxCtx});
+    DeviceBuffer<float> q3(q), k3(k);
+    DeviceBuffer<uint16_t> kc3(cache), vc3(cache), kc4(cache), vc4(cache);
+    kernels::store_kv(k1.get(), v1.get(), kc4.get(), vc4.get(), kRowLen, row.get(), nullptr);
+    kernels::qk_norm_rope_store(q3.get(), 2 * kD, dwq.get(), k3.get(), dwk.get(), v1.get(), kc3.get(), vc3.get(),
+                                kHeads, kKvHeads, n_rot, pos.get(), base, eps, 1, nullptr, row.get());
+    const bool ring = q3.download() == q1.download() && k3.download() == k1.download() &&
+                      kc3.download() == kc4.download() && vc3.download() == vc4.download();
+    CHECK(ring);
+    std::printf("%-40s %s\n", ("qk_norm_rope_store cache_row pos " + std::to_string(pos_value)).c_str(),
+                ring ? "ok" : "FAIL");
 }
 
 // A window of `columns` tokens at *pos = first: qk_norm_rope_store and attention_decode over all columns must give,

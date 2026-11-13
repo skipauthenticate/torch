@@ -20,6 +20,7 @@
 // (layer, expert) with its window in last_use(), the recency swaps go by.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -57,6 +58,19 @@ public:
     // Error when a read or an allocation fails, or when an expert is already resident.
     void add(const std::vector<std::vector<int32_t>>& more);
 
+    // An expert in device memory the caller lends (the KV cache's unused tail, torch run --lend-kv): its gate, up and
+    // down slots one after another from `at` (page-aligned), layer_expert_bytes() of its layer in all.
+    struct Tenant {
+        int layer, expert;
+        uint8_t* at;
+    };
+    // Makes the tenants resident, read through pinned bounce buffers and copied to the device. Call between windows.
+    // Throws Error when a read fails or an expert is already resident.
+    void add_tenants(const std::vector<Tenant>& tenants);
+    // Makes every expert with a matrix in [begin, end) not resident (the map entries become null, as a swap's do) and
+    // returns them as (layer, expert); the memory is the caller's again. Call between windows, after before_window().
+    std::vector<std::pair<int, int>> evict(const uint8_t* begin, const uint8_t* end);
+
     // What the gate kernel and the expert kernels read; all device-accessible.
     const uint8_t* const* map() const noexcept { return map_; }
     // The tables the gate kernel writes for a layer's window (expert_gate.h).
@@ -84,6 +98,13 @@ public:
         const uint8_t* data[3];
     };
     bool resident(int layer, int expert) const noexcept;
+    // A resident expert's gate, up and down matrices (all null when it is not resident).
+    std::array<const uint8_t*, 3> resident_matrices(int layer, int expert) const noexcept;
+    // For a prefill chunk's routed experts (milestone M6): reads up to kGateSlots experts of a layer into the staging
+    // buffers, hedged as a miss is, and returns their gate, up and down bytes (3 per expert, in order). The buffers
+    // stay the caller's until the next call or before_window(); the GPU must be done with the previous call's. Call
+    // between windows, as the rest. Throws Error when a read fails.
+    std::vector<const uint8_t*> stage_for_prefill(int layer, std::span<const int32_t> experts);
     // The window stamps the gate kernel writes, n_layer * n_expert of them (wait for the GPU before reading).
     std::span<const uint32_t> stamps() const noexcept { return {last_use_, n_route_counts_}; }
     void clear_stamps();  // a new sequence: its positions start again at 0

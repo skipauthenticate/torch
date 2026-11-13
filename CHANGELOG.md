@@ -7,6 +7,32 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Milestone M6, long context:
+  - The model's sparse indexer above 2,048 tokens of context, to 262,144 (`src/kernels/indexer/`): pooled keys, scores
+    in a fixed order checked bit for bit against a CPU reference, the top 512 blocks with ties to the lower index, and
+    attention over each column's cell list. Up to 2,051 tokens the result is bitwise the dense kernel's.
+  - `--context` up to 262,144, the KV cache, pooled keys and scratch allocated and zeroed at start; the budget prints
+    the KV cache and indexer keys on their own line.
+  - The draft layer attends to the last 16,384 positions from a K/V ring, and `--draft` prompts go in windows like
+    any other.
+  - `--lend-kv` (`--lend-from P` for tests): the KV cache's unused tail holds more experts until the sequence reaches
+    it; output unchanged.
+  - Sessions and cancel: `torch run --then` feeds a second request only its new tokens when it extends the sequence;
+    `Model::cancel()` stops a request between windows (Ctrl-C, `--cancel-after` for tests); a reset lends the KV
+    tail again.
+  - Chunked prefill (`Model::prefill`, `torch run --prefill N`, chunks of 1 to 4,096 tokens), every column bitwise
+    windows of 8. Dense quantized products on the int8 tensor cores (`kernels/gemm`); BF16 x F32 on the FP32 cores in
+    the window order; routed experts grouped by expert, with each layer's non-resident experts read ahead into two
+    pinned pools of 64. The chunk's DeltaNet recurrence runs in one launch, and its attention and indexer run in
+    batches of 128 columns. `TORCH_PREFILL_STAGES=1` prints GPU time per stage. The race's 4,096-token review prompt
+    takes 17.7 s (231 tok/s, 2026-11-13).
+  - Sessions over prefill: the state after each chunk is kept (0.11 GiB); an extending request rewinds to it
+    (`Model::rewind()`, `Model::prefill_end()`) and prefills the tokens generated since with its new ones, bitwise a
+    fresh prefill. `--cancel-prompt-after N` for tests.
+  - The run summary's `prompt:` line: the prompt's routed hits, misses and experts read for prefill chunks.
+  - `bench/needle.py` (needle in a haystack of synthetic prose), `bench/sparse_attention.cu` (attention cost per
+    window, dense against sparse), `tests/model/parity.py` for long prompts (`@FILE` ids, `--window`, `--placement`,
+    `--gaps` for the selection's near-ties), `TORCH_DUMP_FROM`.
 - Milestone M4, verify windows and speculative decoding:
   - `Model::verify(tokens)` runs 1 to 8 tokens as one window, one CUDA graph per width, and `accept(n)` keeps the
     first n. Every kernel takes the window's columns, and each column is bitwise the one-column result.
@@ -76,6 +102,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   of the draft-layer file.
 - `NOTICE` (model licenses) and
   `.github/CODEOWNERS`.
+
+### Fixed
+
+- Hedged reads could hang a batch that takes longer than the hedge delay: reads queued behind the others counted as
+  late, and once the spare buffers were taken a hedge waited for one while nothing freed the losers' buffers. A read
+  is now late only after a worker has had it for the delay, and a hedge waits for a free spare without holding up the
+  batch.
 
 ### Changed
 

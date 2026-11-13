@@ -52,6 +52,11 @@ std::string Budget::table() const {
                       100.0 * (resident + added) / std::max(experts, 1));
         out += line(label, added_bytes);
     }
+    if (tenants > 0) {
+        std::snprintf(label, sizeof label, "KV cache lent from position %d (--lend-kv): %d experts", lend_from,
+                      tenants);
+        out += line(label, lent_bytes);
+    }
     return out;
 }
 

@@ -81,7 +81,7 @@ Thirteen formats in all. One expert (gate, up and down) is 2.0 to 2.3 MB dependi
 ## How a token is generated
 
 ```
-prompt ──► prefill (one token at a time until M6; decision 11) ──► KV, DeltaNet state, PLE history,
+prompt ──► prefill (chunks of up to 4,096 tokens; decision 11) ──► KV, DeltaNet state, PLE history,
                                                                     the draft layer's K/V
         ┌───────────────────────────────────────────────────────────────┘
         ▼
@@ -108,15 +108,16 @@ the tokens it accepts outweigh what the extra columns cost; the engine measures 
 Each decision cites the measurement or the arithmetic that led to it; [performance.md](performance.md) has the
 numbers.
 
-### 1. A written memory budget, and a KV cache that grows with the sequence
+### 1. A written memory budget, and the context allocated up front
 
 On the owner's board about 47 GiB is available to the engine. [performance.md](performance.md#memory-budget) lists
-every reservation: at full 262,144-token capacity the non-expert items take ~15.8 GiB and leave ~31 GiB for experts,
-two thirds of them (~16,400 of 24,576) [est]. Residency decides prose and repetition speed (decision 8), so the KV
-cache (24 MiB per 1,024 tokens for the 12 attention layers in F16), the indexer keys and the draft layer's KV are
-allocated as the sequence grows, in chunks, and the memory they take is freed by evicting the lowest-ranked resident
-experts between windows, never during one. A 4,096-token conversation then runs with ~38 GiB of experts resident
-(82%, ~20,000) instead of 67% [est]. Output never changes with residency (decision 8), only speed.
+every reservation. The KV cache (24 MiB per 1,024 tokens for the 12 attention layers in F16), the indexer's pooled keys
+(64 B per token per layer) and the attention scratch are allocated in full for `--context` at start and zeroed once,
+so the memory a request uses never changes while it runs: at 262,144 tokens they take 6.19 GiB, and 17,400-19,300
+experts stay resident on the development board against 22,466 at 4,096 tokens (measured, M6). Memory that grows with
+the sequence was dropped in M5: the device buffers are one allocation and experts sit in whole arenas, so growth would
+need virtual memory management for both. `--lend-kv` lends the cache's unused tail to more experts until the sequence
+reaches it instead (decision 10). Output never changes with residency (decision 8), only speed.
 
 At start the engine prints its budget: each reservation, the number of experts resident, and the free-memory floor it
 keeps; it refuses to start below the floor, so the operating system never runs short of memory. Weights are read
@@ -303,22 +304,75 @@ experts.
 
 ### 10. Long context at the reference's precision
 
-The KV cache is F16 (24 MiB per 1,024 tokens; 6.0 GiB at 262,144 for the 12 attention layers, plus 0.5 GiB for the
-draft layer). The indexer keeps pooled keys only, 64 MiB per layer at 262K (0.8 GiB for 13 layers), plus the open
-tail of raw keys. Costs at 262K [est]: indexer scoring reads 0.87 GB
-per window (+4.8 ms; 0.11 GB at 32K), the top-512 selection per query breaks ties to the lowest block index, and the
-selected K/V gather is ~50 MB per token. Prefill above 2,048 tokens uses the same sparse path.
+The KV cache is F16: 24 MiB per 1,024 tokens, 6.0 GiB at 262,144 for the 12 attention layers. Up to 2,048 tokens of
+context attention is dense. Above that, each trunk attention layer runs the model's sparse indexer
+(`src/kernels/indexer/`):
+
+- **Pooled keys**: the mean of each 4-token block's raw F16 keys, normed and rotated at the block's first position,
+  kept as F16 (16 MiB per layer at 262K, 0.19 GiB for 12 layers). Raw keys live in a 16-row ring.
+- **Scores**: 4 query heads of 128 against every visible block, in a fixed order (a sequential fmaf per head, ReLU,
+  times 1/sqrt(128), heads summed in order, then + 0.0 so no score is -0.0). A CPU reference checks them bit for bit
+  (`tests/parity/indexer_test.cpp`).
+- **Selection**: each column keeps its 512 best blocks, ties to the lower block index, in ascending order, plus the
+  0-3 open tail cells. Attention reads those 2,051 cells at most, in 128-cell chunks of the column's own list.
+- **The 2,051-token edge**: with at most 2,051 visible tokens every block is selected and attention is bitwise the
+  dense kernel's; the first sparse position is the 2,052nd token.
+- **Windows and rollback**: everything the indexer keeps is indexed by position, so a rejected column needs no undo.
+
+The draft layer attends densely to the last 16,384 positions from a K/V ring of that many rows (32 MiB instead of
+0.5 GiB at 262K). Drafts are verified, so this changes acceptance only, and below 16,384 positions nothing.
+
+`--lend-kv` keeps the rule that the context is allocated up front but lends the bytes of positions 16,384 and up, in
+every K and V array and the pooled keys, to ~2,990 more experts (5.80 GiB at 262K). Before a window writes there, the
+experts in the next 16,384 positions' bytes stop being resident, so the run is the same bit for bit; it is a second,
+labeled number, not the default.
+
+Costs, measured per layer with `bench/sparse_attention.cu` (performance.md has the tables): at 3,848 tokens a window
+of 8 columns costs 1.2 ms more than dense attention at 2,040, mostly the BF16 indexer projections; at 262,144 tokens
+scoring reads the 16.8 MB of pooled keys (113 us at 1 column, 365 at 8), selection takes 124 us and attention over
+the cells 351 us at 8 columns. Against the reference runtime past 2,051 tokens, 95 of 96 greedy steps agree, the other is a near-tie, and
+the mean KL is 0.0012-0.0026 at 4K and 32K.
 
 ### 11. Prefill and sessions
 
-Prefill runs in chunks. On this board it is SSD-bound, not compute-bound: every chunk touches all 512 experts of every
-layer, so the non-resident 18-33% (8-15 GiB) is read from the SSD once per chunk, 3-5 s at ~3 GB/s against ~0.3 s of GPU
-time per 4,096-token chunk [est]. Chunk size therefore sets prompt speed, bounded by the activation memory in the budget
-([performance.md](performance.md#prefill) has the table). Prefill uses the chunked DeltaNet algorithm and, above 2,048
-tokens, the sparse indexer path (decision 10).
+Prompt tokens run as prefill chunks of up to 4,096 tokens (`torch run --prefill N`); generated tokens always run as
+windows. A chunk goes through the model op by op: each block runs over all of the chunk's columns before the next
+block starts. Every column is bitwise what feeding the prompt in windows of 8 gives, so the path never changes the
+output and chunk size is free to follow memory. Per stage:
 
-A request that extends the previous sequence reuses it: KV, DeltaNet and convolution state, PLE hash history and the
-indexer tail. Without that every chat turn would re-prefill. The C API cancels a running request between windows.
+- **Dense quantized products**: the int8 tensor cores (`kernels/gemm`, Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL, Q8_0). Each
+  format's formula and its lane order are the one-column kernel's, so each column is bitwise `gemv_q8`.
+- **BF16 x F32 products** (the hyper-connection mixers, the router and the other BF16 matrices): FP32 cores in the
+  window order
+  (`gemm_bf16`), bitwise `gemv_bf16`. An exact split onto the BF16 tensor cores measured too slow (82-2,695 us per
+  input for the split alone), and accumulating in the tensor cores erred 14-90 times more than the one-column
+  kernel.
+- **Routed experts**: the chunk's N x 10 routes are bucketed by expert in route order. Each expert's gate, up and down
+  rows then run once over its bucket on the int8 tensor cores, and the combine reads the results in rank order.
+- **Non-resident experts**: a chunk of 256 or more columns routes nearly every expert, so all of a layer's
+  non-resident experts are read ahead. A background thread fills two pinned pools of 64 experts (a 0.34 GiB budget
+  line) while the GPU runs the layers before. There is no wait for the layer's router: the host waits only for a pass's
+  reads and its pointer-table slot. Pools of 88 and 120 measured no faster and
+  cost resident experts. Smaller chunks read a layer's misses after its router, 80 at a time.
+- **DeltaNet**: the window recurrence over all columns in one launch, state in registers, the next column's inputs
+  loaded during the current one.
+- **Attention**: all K/V rows, raw indexer keys and pooled keys first; then scores, selection and attention over each
+  column's cells in batches of 128 columns (decision 10).
+- **The head** runs for the chunk's last column only. The draft layer's K/V-only pass reads the chunk's residuals 8
+  columns at a time.
+
+The chunk's activations (1.55 GiB at 4,096 columns) are one allocation with its own budget line.
+Each block's temporaries share one region in turn.
+
+A request that extends the previous sequence reuses it: KV, DeltaNet and convolution state, PLE hash history, the
+indexer's ring and pooled keys and the draft layer's ring all continue, and only the new tokens are fed (`torch run
+--then`). A prompt that does not extend the sequence starts a new one. With prefill, the model also keeps the state
+that is not indexed by position (each DeltaNet state, the convolution and PLE rows, the indexer's raw-key rings) as it
+was after the last chunk: 0.11 GiB, its own budget line, outside the lent tail. An extending request rewinds to that
+point (`Model::rewind()`) and prefills the tokens generated since together with its new ones. Its state is then what
+a fresh prefill of the whole prompt gives, even once prefill and windows stop being bitwise equal.
+`Model::cancel()` stops a request between windows or chunks from any thread and leaves the sequence intact; the C API
+(M7) exposes it.
 
 ### 12. The draft-layer file
 

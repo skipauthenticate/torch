@@ -83,9 +83,11 @@ if(TORCH_CUDA)
   # The GPU engine: kernels (src/kernels/<operation>/), weights, the forward pass and the expert store.
   add_library(torch_engine STATIC
     src/kernels/gemv/gemv.cu
+    src/kernels/gemm/gemm.cu
     src/kernels/attention/attention.cu
     src/kernels/deltanet/deltanet.cu
     src/kernels/hc/hc.cu
+    src/kernels/indexer/indexer.cu
     src/kernels/moe/moe.cu
     src/kernels/norm/norm.cu
     src/kernels/ple/ple.cu
@@ -95,7 +97,8 @@ if(TORCH_CUDA)
     src/model/model.cpp
     src/model/weights.cpp
     src/runtime/expert_gate.cu
-    src/runtime/expert_store.cpp)
+    src/runtime/expert_store.cpp
+    src/runtime/prefill_reads.cpp)
   target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
   # nvcc warns (445) about C++20 template lambdas whose template parameter appears only in the body, which is the
   # with_type() dispatch pattern of src/formats/types.h.
@@ -115,6 +118,10 @@ if(TORCH_CUDA)
   add_executable(torch_bench_kernels bench/kernels.cu)
   target_include_directories(torch_bench_kernels PRIVATE ${PROJECT_BINARY_DIR}/generated)
   target_link_libraries(torch_bench_kernels PRIVATE torch_engine)
+  add_executable(torch_bench_sparse bench/sparse_attention.cu)
+  target_link_libraries(torch_bench_sparse PRIVATE torch_engine)
+  add_executable(torch_bench_deltanet bench/deltanet_chunk.cu)
+  target_link_libraries(torch_bench_deltanet PRIVATE torch_engine)
   add_executable(torch_bench_ssd bench/ssd_reads.cpp)
   target_link_libraries(torch_bench_ssd PRIVATE torch_warnings)
 endif()

@@ -2,14 +2,20 @@
 """Model parity: Torch's next-token log-probabilities against a second implementation of the model on the same file.
 
   parity.py compare --torch BUILD/torch --model SHARD1 --ref tests/model/reference.json [--resident K] [--out FILE]
+                    [--window W] [--placement FILE] [--gaps]
       Runs `torch run` on each reference prompt followed by the reference's own greedy continuation (teacher
-      forcing, so one near-tie cannot derail the rest of the comparison). The gate:
+      forcing, so one near-tie cannot derail the rest of the comparison); the ids go through a file, and a sequence
+      longer than 2,048 tokens gets a context that holds it (sparse attention). --window W runs the prompt in windows
+      of W columns, each bitwise the one-column result. The gate:
         - top-1: at every generated position, Torch's most likely token is the reference's greedy token, or the
           reference itself ranks Torch's choice within --tie of its own (a near-tie);
         - KL: the mean over all positions of KL(reference || Torch), on the reference's top-5 tokens plus the rest of
           the probability mass, is at most --max-mean-kl.
       It also reports, without gating, the largest |log p_torch - log p_ref| on tokens both top-5 lists share: that
       number is dominated by improbable tokens and varies as much between two runs of the reference itself.
+      --gaps: a prompt past 2,051 tokens runs eagerly with the indexer's scores dumped from the first generated position
+      on (the same logits), and each top-1 disagreement prints the selection's relative gap (score_512 - score_513) /
+      score_512 in each attention layer (a near-tie in the selection, where the reference's own order is undefined).
 
   parity.py spread --a REF_A.json --b REF_B.json
       The same numbers between two reference runs made with different numerics (for example with part of the model
@@ -19,8 +25,11 @@ A reference file is a JSON list of {"prompt", "tokens", "steps": [{"id", "top": 
 one entry per prompt. Standard library only.
 """
 import argparse
+import glob
 import json
 import math
+import os
+import struct
 import subprocess
 import sys
 
@@ -69,11 +78,25 @@ def compare(args):
     for i, case in enumerate(ref):
         forced = case["tokens"] + [s["id"] for s in case["steps"][:-1]]
         jsonl = f"{args.work}/parity-{i}.jsonl"
-        cmd = [args.torch, "run", args.model, "--tokens", ",".join(map(str, forced)), "-n", "0", "--top", "5",
-               "--json", jsonl]
+        ids = f"{args.work}/parity-{i}.tokens"
+        with open(ids, "w") as f:
+            f.write(",".join(map(str, forced)))
+        cmd = [args.torch, "run", args.model, "--tokens", "@" + ids, "-n", "0", "--top", "5", "--json", jsonl]
+        if len(forced) > 2048:
+            cmd += ["--context", str(-(-len(forced) // 256) * 256)]
         if args.resident is not None:
             cmd += ["--resident", str(args.resident)]
-        run = subprocess.run(cmd, capture_output=True, text=True)
+        if args.placement:
+            cmd += ["--placement", args.placement]
+        if args.window is not None:
+            cmd += ["--window", str(args.window)]
+        first = len(case["tokens"]) - 1  # the position that predicts the first generated token
+        dumps = f"{args.work}/gaps-{i}" if args.gaps and len(forced) > 2051 else None
+        env = None
+        if dumps:
+            os.makedirs(dumps, exist_ok=True)
+            env = dict(os.environ, TORCH_DUMP_DIR=dumps, TORCH_DUMP_STAGES="index_scores", TORCH_DUMP_FROM=str(first))
+        run = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if run.returncode != 0:
             sys.exit(f"torch run failed ({run.returncode}):\n{run.stdout[-3000:]}{run.stderr[-3000:]}")
         if i == 0:
@@ -81,10 +104,12 @@ def compare(args):
         speed = [l for l in run.stdout.splitlines() if l.startswith("experts:")]
         with open(jsonl) as f:
             lines = [json.loads(l) for l in f]
-        first = len(case["tokens"]) - 1  # the position that predicts the first generated token
         ours = [{t: lp for t, lp in line["top"]} for line in lines[first:]]
-        ok, agree, ties, gap, kls = summarize(case["prompt"][:40], check(case["steps"], ours, args.tie))
+        rows = check(case["steps"], ours, args.tie)
+        ok, agree, ties, gap, kls = summarize(case["prompt"][:40], rows)
         failures += not ok
+        if dumps:
+            selection_gaps(dumps, range(first, first + len(rows)), [first + j for j, r in enumerate(rows) if not r[0]])
         all_kl += kls
         results.append({"prompt": case["prompt"], "positions": len(case["steps"]), "agree": agree,
                         "near_ties": ties, "max_gap": gap, "mean_kl": sum(kls) / len(kls), "ok": ok,
@@ -98,6 +123,28 @@ def compare(args):
             json.dump({"tie": args.tie, "max_mean_kl": args.max_mean_kl, "mean_kl": mean_kl, "results": results}, f,
                       indent=1)
     sys.exit(1 if failures or not kl_ok else 0)
+
+
+def selection_gaps(out, positions, disagree):
+    """Prints (score_512 - score_513) / score_512 per attention layer, from the scores dumped in out, for each position
+    in `disagree`, and the smallest over all `positions`."""
+    smallest = (float("inf"), None, None)
+    for p in positions:
+        gaps = []
+        for path in glob.glob(f"{out}/{p}-*-index_scores.f32"):  # <position>-<layer>-<stage>.f32
+            with open(path, "rb") as f:
+                data = f.read()
+            scores = sorted(struct.unpack(f"{len(data) // 4}f", data), reverse=True)
+            layer = int(os.path.basename(path).split("-")[1])
+            gaps.append((layer, (scores[511] - scores[512]) / scores[511] if scores[511] else 0.0))
+        if not gaps:
+            continue
+        gaps.sort()
+        smallest = min(smallest, *((g, p, l) for l, g in gaps))
+        if p in disagree:
+            print(f"     position {p} disagrees: selection gap per layer " + " ".join(f"{l}:{g:.2e}" for l, g in gaps))
+    print(f"     smallest selection gap over positions {positions[0]}-{positions[-1]}: {smallest[0]:.2e} "
+          f"(position {smallest[1]}, layer {smallest[2]})")
 
 
 def spread(args):
@@ -132,6 +179,9 @@ c.add_argument("--work", default=".")
 c.add_argument("--out")
 c.add_argument("--tie", type=float, default=0.38)
 c.add_argument("--max-mean-kl", type=float, default=0.0041)
+c.add_argument("--window", type=int)
+c.add_argument("--placement")
+c.add_argument("--gaps", action="store_true")
 s = sub.add_parser("spread")
 s.add_argument("--a", required=True)
 s.add_argument("--b", required=True)
