@@ -1,6 +1,7 @@
 // Checks hedged reads: every request's bytes arrive from the right offset, with and without hedging, buffers come back
 // after release(), and a failed read gives nullptr. With a hedge delay of 0 almost every read is issued twice, so the
-// winner-and-loser path (and late buffers) runs on every round.
+// winner-and-loser path (and late buffers) runs on every round; a batch far larger than its spare buffers, all late,
+// still completes.
 //
 // usage: hedged_reads_test DIR (a directory on a disk file system: tmpfs does not support O_DIRECT)
 #include "runtime/hedged_reads.h"
@@ -94,6 +95,33 @@ void check_chunks(const DirectFile& f, const std::vector<uint8_t>& bytes, std::c
     std::free(memory);
 }
 
+// A batch far larger than its pool's spares (one), every read late at once (hedge delay 0): hedges must wait for the
+// spare without stopping the batch from resolving (a hedge that waited for a buffer inside read_all() hung it).
+void check_many_late(const DirectFile& f, const std::vector<uint8_t>& bytes) {
+    constexpr int kReads = 48, kBuffers = kReads + 1;
+    const uint64_t buffer_bytes = span_bytes(1, 40 * kPage);
+    auto* memory = static_cast<uint8_t*>(std::aligned_alloc(kPage, kBuffers * buffer_bytes));
+    {
+        HedgedReads reads(f, 4, std::chrono::microseconds(0));
+        const int pool = reads.add_pool(memory, buffer_bytes, kBuffers);
+        std::mt19937 rng(13);
+        for (int round = 0; round < 20; ++round) {
+            std::vector<HedgedReads::Request> requests;
+            for (int i = 0; i < kReads; ++i) {
+                const uint64_t n = 1 + rng() % (40 * kPage);
+                requests.push_back({pool, rng() % (bytes.size() - n), n});
+            }
+            std::vector<const uint8_t*> out(kReads);
+            reads.read_all(requests, out);
+            for (size_t i = 0; i < kReads; ++i)
+                CHECK(out[i] != nullptr && std::memcmp(out[i], bytes.data() + requests[i].offset, requests[i].n) == 0);
+            reads.release();
+        }
+        CHECK(reads.hedged() > 0);
+    }
+    std::free(memory);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -112,6 +140,7 @@ int main(int argc, char** argv) {
         check(f, bytes, std::chrono::microseconds(0), true);  // hedged almost always
         check_chunks(f, bytes, std::chrono::seconds(10), false);
         check_chunks(f, bytes, std::chrono::microseconds(0), true);
+        check_many_late(f, bytes);
     }
     std::filesystem::remove(path);
     return test::test_exit_code();

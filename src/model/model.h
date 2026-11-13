@@ -27,12 +27,13 @@ class Weights;
 
 // The widest verify window: tokens run through the model in one pass (architecture decision 2).
 inline constexpr int kMaxColumns = 8;
+// The widest prefill chunk (Options::prefill_columns).
+inline constexpr int kMaxPrefillColumns = 4096;
 
 struct Options {
     std::filesystem::path shard1;  // the weights
     std::filesystem::path shard2;  // the PLE n-gram table
-    // Tokens the KV cache holds. Milestone M2 computes attention densely, which is the model's exact attention only
-    // up to indexer_top_k tokens, so the context is capped there.
+    // Tokens the KV cache holds, up to 262,144, allocated at start; above indexer_top_k attention is sparse.
     int context = 2048;
     std::optional<int> resident;  // experts 0 to resident - 1 of every layer resident, exactly, with no top-up (tests)
     // Route counts (core/placement.h) ranking which experts to keep resident; without them, and without `resident`,
@@ -44,7 +45,15 @@ struct Options {
     // After each window, up to this many of the experts it read from the SSD take the slots of the least recently
     // routed resident experts of their layers (core/swaps.h); 0: residency stays as placed. Output does not change.
     int swaps_per_window = 0;
+    // Positions from which the KV cache's unused tail holds more experts (0: none). Before a window writes K/V rows
+    // there, the experts in the next lend_from positions' bytes stop being resident. Output does not change.
+    int lend_from = 0;
     bool logits = true;  // copy every token's 248,320 logits to the host (per-step output, parity tests)
+    // The widest prefill chunk (prefill()), 1 to kMaxPrefillColumns; 0: no prefill, prompts go through windows.
+    int prefill_columns = 0;
+    // Experts each of the two read-ahead pools holds (chunks of 256 tokens and more read every layer's non-resident
+    // experts ahead, in passes of this many); 0: each layer waits for its reads.
+    int prefill_staging = 64;
 };
 
 struct ExpertStats {
@@ -53,6 +62,10 @@ struct ExpertStats {
     uint64_t hits;    // routed experts found resident
     uint64_t misses;  // routed experts read from the SSD
     uint64_t hedged;  // miss reads issued a second time because the first was late (expert_store.h)
+    int tenants;      // of the resident ones, those in the KV cache's tail now (Options::lend_from)
+    // experts read from the SSD for prefill chunks' grouped experts: each non-resident one once per chunk and layer
+    // (all of a layer's when read ahead); their routes count in hits and misses as a window's do
+    uint64_t prefill_reads;
 };
 
 // Where decode time went, summed over every decode() call (host wall-clock, milliseconds).
@@ -97,6 +110,13 @@ public:
     // Keeps the first n tokens of the last window (1 <= n <= its width), as if only they had been decoded. The
     // window's results are not valid afterwards: read them first.
     bool accept(int n) noexcept;
+    // Runs 1 to Options::prefill_columns prompt tokens at the next positions as one prefill chunk (milestone M6) and
+    // keeps them all; every token's state is bitwise what feeding them in windows gives. Afterwards argmax(0) and
+    // logits(0) are the last token's. Errors as decode().
+    bool prefill(std::span<const int32_t> tokens) noexcept;
+    // Copies the 4-stream residual of columns first .. first + n - 1 (n <= kMaxColumns) of the last prefill chunk to
+    // residual(0 .. n - 1), for the draft layer's passes over the chunk. Throws Error when out of range.
+    void stage_residuals(int first, int n);
     // Column t's next-token logits after the last window (n_vocab floats), or empty when Options::logits is false.
     std::span<const float> logits(int column = 0) const noexcept;
     // Column t's most likely next token after the last window, computed on the GPU; ties go to the lowest id.
@@ -115,8 +135,19 @@ public:
     CUstream_st* stream() const noexcept;
     const float* residual(int column = 0) const noexcept;
 
-    // Starts a new, empty sequence.
+    // Starts a new, empty sequence; with Options::lend_from, the KV cache's tail holds experts again from there.
     void reset();
+    // Sessions (milestone M6, option B): the position after the last prefill chunk, whose sequence state is kept, or
+    // -1 (none since reset(), or the last prefill failed).
+    int prefill_end() const noexcept;
+    // Goes back to prefill_end(): the tokens after it leave the sequence, so a request that extends the sequence
+    // prefills the generated tokens again with its new ones, as a fresh prefill of the whole prompt would. Throws
+    // Error when there is no prefill to go back to.
+    void rewind();
+    // From any thread: the next verify() or decode() returns false without running a window, error() says the request
+    // was cancelled and cancelled() is true. The sequence is unchanged, so a later request can extend it.
+    void cancel() noexcept;
+    bool cancelled() const noexcept;  // the last verify() or decode() was cancelled
 
 private:
     struct Impl;

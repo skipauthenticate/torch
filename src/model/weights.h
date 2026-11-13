@@ -5,9 +5,7 @@
 // with no bounce copy (architecture decision 8). Tensors keep the file's bytes exactly, except the one F16 vector
 // (the PLE convolution taps), which is converted to F32 at load because the kernel multiplies it with F32 activations.
 //
-// The arena holds the non-expert tensors. The routed experts are placed by runtime::ExpertStore. Indexer tensors are
-// not loaded: below indexer_top_k tokens sparse attention selects every cell, and decode is limited to that context
-// until M6.
+// The arena holds the non-expert tensors. The routed experts are placed by runtime::ExpertStore.
 #pragma once
 
 #include <cstdint>
@@ -61,6 +59,11 @@ struct Layer {
     Matrix wq, wk, wv, wo;
     const float* q_norm = nullptr;
     const float* k_norm = nullptr;
+    // The sparse indexer of a trunk attention layer (kernels/indexer): BF16 projections to 4 query heads and 1 key head
+    // of 128, and the norms of both (F32, the +1 already added). Loaded for every context; used above 2,048 tokens.
+    Matrix idx_q, idx_k;
+    const float* idx_q_norm = nullptr;
+    const float* idx_k_norm = nullptr;
 
     // Experts: router, the shared expert with its sigmoid gate, the routed experts.
     Matrix router, shared_gate_inp, shared_gate, shared_up, shared_down;

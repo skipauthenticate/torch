@@ -1,5 +1,6 @@
-// Latency and bandwidth of O_DIRECT reads from a model file at queue depths 1 to 16: 2 MiB reads (one expert
-// matrix is 0.6-0.9 MiB, a whole expert 2.0-2.3 MiB) and 4 KiB reads (one PLE row lives in one page). Each queue
+// Latency and bandwidth of O_DIRECT reads from a model file at queue depths 1 to 32: 2 MiB reads (one expert
+// matrix is 0.6-0.9 MiB, a whole expert 2.0-2.3 MiB), single 128 KiB reads (the chunk a miss is read in) and 4 KiB
+// reads (one PLE row lives in one page). Each queue
 // slot is a thread issuing blocking preads at random 4 KiB-aligned offsets, so the page cache is never involved.
 // A read is issued as preads of at most 128 KiB, as the engine reads (src/runtime/direct_io.cpp explains why); the
 // worst column shows any read that stalled.
@@ -92,15 +93,18 @@ int main(int argc, char** argv) {
     std::printf("O_DIRECT random reads from %s (%.1f GiB)\n", argv[1], static_cast<double>(file_size) / 1073741824.0);
     std::printf("  size      depth      GB/s median ms   mean ms    p99 ms  worst ms\n");
     uint64_t seed = 1;
-    for (const size_t size : {size_t{2} << 20, size_t{4096}}) {
+    for (const size_t size : {size_t{2} << 20, kPiece, size_t{4096}}) {
         // 4 KiB reads are latency-bound: read a fixed count rather than a fixed volume
         const int total =
             size == 4096 ? 4096 : std::max(16, static_cast<int>(mib * (1 << 20) / static_cast<double>(size)));
-        for (const int depth : {1, 2, 4, 8, 16}) {
+        for (const int depth : {1, 2, 4, 8, 16, 24, 32}) {
             const Result r = run(fd, file_size, size, depth, std::max(1, total / depth), seed);
             seed += 100;
-            std::printf("  %-8s %6d %9.2f %9.3f %9.3f %9.3f %9.1f\n", size == 4096 ? "4 KiB" : "2 MiB", depth,
-                        r.gb_per_s, r.median_ms, r.mean_ms, r.p99_ms, r.worst_ms);
+            std::printf("  %-8s %6d %9.2f %9.3f %9.3f %9.3f %9.1f\n",
+                        size == 4096     ? "4 KiB"
+                        : size == kPiece ? "128 KiB"
+                                         : "2 MiB",
+                        depth, r.gb_per_s, r.median_ms, r.mean_ms, r.p99_ms, r.worst_ms);
         }
     }
     close(fd);

@@ -49,13 +49,18 @@ private:
     uint64_t used_ = 0;
 };
 
+// The rows of a draft K/V cache: a ring (row = position % rows) of the last kDraftWindow positions at most.
+int ring_rows(int context) {
+    return std::min(context, kDraftWindow);
+}
+
 // The draft's device memory: a K/V cache per variant first (zeroed with `zeros` at start), the inputs of an extend's
-// columns (embedding and position per column), then one column of activations.
+// columns (embedding and positions per column), then one column of activations.
 struct Buffers {
-    std::vector<uint16_t*> k_cache, v_cache;  // per variant: [context][kv heads x head dim], F16
+    std::vector<uint16_t*> k_cache, v_cache;  // per variant: [ring_rows][kv heads x head dim], F16
     float* zeros;                             // hc zeros: the inject that adds e to every stream with weight 1
     uint64_t zeroed = 0;
-    int32_t* pos;  // [kMaxColumns]
+    int32_t* pos;  // [3][kMaxColumns]: positions, their ring rows, and the last ring row attention reads
     float* embd;   // [kMaxColumns][n_embd]
     float *res, *xn, *lo, *hc_gate, *mixed, *inject, *out, *en, *e, *n;
     float *q, *k, *v, *attn, *attn_scratch;
@@ -74,19 +79,21 @@ struct Buffers {
         const size_t SH = static_cast<size_t>(c.n_ff_shared);
         k_cache.assign(variants, nullptr);
         v_cache = k_cache;
+        const size_t rows = static_cast<size_t>(ring_rows(context));
         for (size_t i = 0; i < variants; ++i) {
-            k_cache[i] = d.take<uint16_t>(static_cast<size_t>(context) * KV);
-            v_cache[i] = d.take<uint16_t>(static_cast<size_t>(context) * KV);
+            k_cache[i] = d.take<uint16_t>(rows * KV);
+            v_cache[i] = d.take<uint16_t>(rows * KV);
         }
         zeros = d.take<float>(static_cast<size_t>(c.hc));
         zeroed = d.used();
-        pos = d.take<int32_t>(kMaxColumns), embd = d.take<float>(kMaxColumns * E);
+        pos = d.take<int32_t>(3 * kMaxColumns), embd = d.take<float>(kMaxColumns * E);
         res = d.take<float>(HCD), xn = d.take<float>(HCD);
         lo = d.take<float>(static_cast<size_t>(c.hc_rank)), hc_gate = d.take<float>(HCD), mixed = d.take<float>(E);
         inject = d.take<float>(static_cast<size_t>(c.hc)), out = d.take<float>(E);
         en = d.take<float>(E), e = d.take<float>(E), n = d.take<float>(HCD);
         q = d.take<float>(2 * HD), k = d.take<float>(KV), v = d.take<float>(KV), attn = d.take<float>(HD);
-        attn_scratch = d.take<float>(static_cast<size_t>(kernels::attention_scratch_floats(c.n_head, context, 1)));
+        const int64_t scratch_floats = kernels::attention_scratch_floats(c.n_head, static_cast<int>(rows), 1);
+        attn_scratch = d.take<float>(static_cast<size_t>(scratch_floats));
         router = d.take<float>(static_cast<size_t>(c.n_expert)), weights = d.take<float>(K);
         hx = d.take<float>(K * FF), y = d.take<float>(K * E);
         shared_g = d.take<float>(SH), shared_u = d.take<float>(SH), shared_h = d.take<float>(SH);
@@ -102,18 +109,18 @@ struct Buffers {
 // probability.
 struct Host {
     float* embd;   // [kMaxColumns][n_embd]
-    int32_t* pos;  // [kMaxColumns]
+    int32_t* pos;  // [3][kMaxColumns], as Buffers::pos
     kernels::ArgmaxResult* best;
     float* prob;
 
     static uint64_t bytes(const Config& c) {
-        return kMaxColumns * (static_cast<uint64_t>(c.n_embd) * sizeof(float) + sizeof(int32_t)) +
+        return kMaxColumns * (static_cast<uint64_t>(c.n_embd) * sizeof(float) + 3 * sizeof(int32_t)) +
                sizeof(kernels::ArgmaxResult) + sizeof(float);
     }
     void lay_out(uint8_t* at, const Config& c) {
         embd = reinterpret_cast<float*>(at);
         pos = reinterpret_cast<int32_t*>(embd + static_cast<size_t>(kMaxColumns) * static_cast<size_t>(c.n_embd));
-        best = reinterpret_cast<kernels::ArgmaxResult*>(pos + kMaxColumns);
+        best = reinterpret_cast<kernels::ArgmaxResult*>(pos + 3 * kMaxColumns);
         prob = reinterpret_cast<float*>(best + 1);
     }
 };
@@ -259,9 +266,11 @@ struct Draft::Impl {
         matvec(L.wk, b.mixed, b.k, true);
         matvec(L.wv, b.mixed, b.v, true);
         kernels::qk_norm_rope_store(b.q, 2 * D, L.q_norm, b.k, L.k_norm, b.v, k_cache, v_cache, H, HKV, cfg.n_rot, pos,
-                                    cfg.rope_base, cfg.eps, 1, stream);
-        kernels::attention_decode(b.q, b.q + D, 2 * D, k_cache, v_cache, b.attn, b.attn_scratch, pos, H, HKV,
-                                  1.0f / std::sqrt(static_cast<float>(D)), context, 1, stream);
+                                    cfg.rope_base, cfg.eps, 1, stream, pos + kMaxColumns);
+        // Rows 0 .. min(position, rows - 1) of the ring: every earlier position below kDraftWindow, the last
+        // kDraftWindow positions from there on.
+        kernels::attention_decode(b.q, b.q + D, 2 * D, k_cache, v_cache, b.attn, b.attn_scratch, pos + 2 * kMaxColumns,
+                                  H, HKV, 1.0f / std::sqrt(static_cast<float>(D)), ring_rows(context), 1, stream);
         matvec(L.wo, b.attn, b.out);
     }
 
@@ -310,7 +319,7 @@ struct Draft::Impl {
         kernels::rms_norm(b.k, D, L.k_norm, 0, nullptr, 0, b.k, D, D, HKV, cfg.eps, stream);
         kernels::rope_neox(b.k, D, HKV, cfg.n_rot, b.pos + c, cfg.rope_base, stream);
         kernels::store_kv(b.k, b.v, b.k_cache[static_cast<size_t>(variant)], b.v_cache[static_cast<size_t>(variant)],
-                          HKV * D, b.pos + c, stream);
+                          HKV * D, b.pos + kMaxColumns + c, stream);
     }
 
     // The full pass of slot c from x (H, or the block's own state S' in b.res): the block, the head's mixer (b.res
@@ -337,7 +346,8 @@ struct Draft::Impl {
     void upload(int n) {
         const size_t E = static_cast<size_t>(cfg.n_embd), cols = static_cast<size_t>(n);
         TORCH_CUDA_CHECK(cudaMemcpyAsync(b.embd, hb.embd, sizeof(float) * cols * E, cudaMemcpyHostToDevice, stream));
-        TORCH_CUDA_CHECK(cudaMemcpyAsync(b.pos, hb.pos, sizeof(int32_t) * cols, cudaMemcpyHostToDevice, stream));
+        TORCH_CUDA_CHECK(
+            cudaMemcpyAsync(b.pos, hb.pos, sizeof(int32_t) * 3 * kMaxColumns, cudaMemcpyHostToDevice, stream));
     }
 
     // Slot c's input: the embedding of `token` and position `position`, written on the host (the GPU is idle).
@@ -345,7 +355,9 @@ struct Draft::Impl {
         const Matrix& te = tw.token_embd;
         dequant_row(te.type, te.data + static_cast<uint64_t>(token) * te.row_bytes(), cfg.n_embd,
                     hb.embd + static_cast<size_t>(c) * static_cast<size_t>(cfg.n_embd));
-        hb.pos[c] = position;
+        const int rows = ring_rows(context);
+        hb.pos[c] = position, hb.pos[kMaxColumns + c] = position % rows;
+        hb.pos[2 * kMaxColumns + c] = std::min(position, rows - 1);
     }
 
     // The drafted token of the last full pass, after the GPU has finished.
@@ -463,7 +475,7 @@ Reservation Draft::reservation(const std::filesystem::path& shard1, const std::f
     const uint64_t row = out ? torch::row_bytes(*type_info(out->type), static_cast<uint64_t>(c.n_embd)) : 0;
     const int rows = max_head_rows(variants);
     return {"draft layer, all experts resident, " + std::to_string(rows) + " head rows and " +
-                std::to_string(variants.size()) + " K/V caches",
+                std::to_string(variants.size()) + " K/V rings of " + std::to_string(ring_rows(context)) + " rows",
             DraftWeights::bytes(c, draft) + static_cast<uint64_t>(rows) * row +
                 device_bytes(c, context, variants.size()) + Host::bytes(c)};
 }
@@ -481,8 +493,8 @@ void Draft::run(int variant, int position, std::span<const int32_t> next, int de
 
 int Draft::first_kv_difference(int a, int b, int rows) const {
     if (a < 0 || b < 0 || a >= static_cast<int>(impl_->variants.size()) ||
-        b >= static_cast<int>(impl_->variants.size()) || rows < 0 || rows > impl_->context)
-        throw Error("Compare existing draft variants over rows within the context.");
+        b >= static_cast<int>(impl_->variants.size()) || rows < 0 || rows > ring_rows(impl_->context))
+        throw Error("Compare existing draft variants over rows within the draft's K/V ring.");
     return impl_->first_kv_difference(a, b, rows);
 }
 

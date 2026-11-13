@@ -13,7 +13,7 @@ any speed goal it missed, are written in its pull request. Speed goals are liste
 | **M3** Fast autoregressive decode | Per-layer graph segments; fused hyper-connection mixers; the six expert kernels near bandwidth | Every kernel microbenchmark within 15% of streaming bandwidth; >= 27 tok/s on code review (goal 30) |
 | **M4** Verify windows | Windows of 1-8 columns, each bitwise the one-column result; routed experts deduplicated across the window; DeltaNet state in two buffers, committed after accept and replayed by the same kernel; the draft-layer file, written and quantized by this project's tools, and the 4-bit MTP drafter; adaptive window; exact speculative sampling kernels; residency that follows use | Logits bitwise identical across window widths; greedy text identical with speculation on and off; sampled output passes a distribution test (goal 45 tok/s on code review) |
 | **M5** Copy mode and residency | Prompt-lookup copies; 9-16 columns on int8 tensor cores; asynchronous misses with measured prefetch; PLE read-ahead; KV, indexer and draft-KV that grow with the sequence | Output independent of residency; logits bitwise identical across both column paths; predictor hit rates reported separately from residency (goals: prose 40, repetition 100) |
-| **M6** Long context | Sparse indexer attention to 262,144 tokens with pooled keys; F16 KV cache; chunked prefill on int8 tensor cores, which verify windows also use where faster; sessions that extend the previous sequence; cancel | Needle retrieval at 32K, 128K and 256K; a second turn does not prefill the first (goal: 1,000 prompt tok/s at 4,096) |
+| **M6** Long context | Sparse indexer attention to 262,144 tokens with pooled keys; F16 KV cache; chunked prefill on int8 tensor cores, which verify windows also use where faster; sessions that extend the previous sequence; cancel | Needle retrieval at 32K, 128K and 256K; a second turn does not prefill the first (goal: 1,000 prompt tok/s at 4,096, reset to ~350) |
 | **M7** First release | `torch_server` (OpenAI-compatible: tokenizer, chat template, sampling and speculative sampling, streaming); `torch inspect --export-tokenizer`; install script; model-file verification; v0.1.0 | End-to-end install on a fresh Orin; every file in [model-files.md](model-files.md) verified by sha256 |
 
 M3 merged on 2026-11-04 below two of its gates, by the maintainer's decision: 25.4 tok/s on code review against 27,
@@ -68,5 +68,27 @@ What carries over:
 - The kernel gates carried from M3 are still missed: 32 launch classes of 1 MiB or more below 85% of the ceiling (27
   one-column, 5 multi-column), 36.9 ms of kernels per token, 1,107 launches, and launches under 1 MiB take 2.30 ms
   against 2. One token at a time measures 24.41 tok/s on code review against 27.
+
+M6 is done, below its prompt-speed goal. Its gates, as measured on the Orin on 2026-11-13
+([performance.md](performance.md#m6-long-context) has the numbers; some were measured from 2026-11-09):
+
+- **Sparse indexer attention to 262,144 tokens**, allocated up front: positions 0-2,050 bitwise the dense path,
+  windows bitwise one token at a time, output independent of residency, and against the reference runtime 95 of 96
+  greedy steps agree at 4K and 32K (the other a near-tie, mean KL at most 0.0026).
+- **Needle retrieval at 32K, 128K and 256K**: found at depths 10, 50 and 90% at 32K (prompts in ~780 s on the window
+  path), and at depth 50% at 128K and 256K with prefill (prompts in 854.7 and 1,763.6 s; depths 10 and 90% not run).
+- **A second turn does not prefill the first**: 29 new tokens after 4,128 take 0.6 s against 131.7 s from scratch, with
+  the same output; cancel between windows. With prefill, a second turn prefills only the tokens generated since the
+  last chunk and its new ones (508 tokens in 4.2 s against 12.5 s for all 1,532), bitwise a fresh prefill.
+- **Chunked prefill on int8 tensor cores**: chunks of up to 4,096 tokens, every column bitwise windows of 8. The
+  race's 4,096-token review prompt takes 17.7 s, 231 tok/s, against a goal of 1,000 that was reset in writing to
+  ~350 once the int8 kernels were measured: missed.
+- The draft layer at long context, speculative prompts in windows of 8, and `--lend-kv` as a labeled second number
+  (code review +12% at a 262,144-token context).
+- `tools/check_orin.sh` on af82794 (2026-11-13): unit and kernel parity tests, model parity (mean KL 0.00211 against
+  0.0041), graph against eager and residency 0, 256 and the budget's all pass. The kernel gates carried from M3 are
+  still missed: 34 launch classes of 1 MiB or more below 85% of the ceiling (32 on 2026-11-09; the two more are attention
+  projection groups at 84.7-84.8%), and launches under 1 MiB take 2.30 ms against 2.
+- On the race prompts with prefill, the ids with and without speculation equal the window path's in all nine (rule 7).
 
 Contributions that move a milestone forward are welcome; see [CONTRIBUTING.md](../CONTRIBUTING.md).

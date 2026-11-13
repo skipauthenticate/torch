@@ -138,7 +138,8 @@ __global__ void __launch_bounds__(kThreads)
 // reading state_in once and writing state_out once. Column strides: q, k and v advance by x_stride floats per column
 // (the layout of conv_silu_l2_window's output), alpha and beta by v_heads, out by v_heads * 128. The gates go to
 // gates[(t * v_heads + h) * 2 + {0, 1}] = {beta, g}; the inputs are left untouched. Each column's arithmetic is
-// gdn_step_kernel's, so it is bitwise the one-token result.
+// gdn_step_kernel's, so it is bitwise the one-token result. A long run of columns (a prefill chunk) loads column t +
+// 1's inputs into registers while column t is computed, and reads k and q from shared memory four values at a time.
 __global__ void __launch_bounds__(kHeadDim)
     gdn_window_kernel(const float* state_in, float* state_out, const float* q, const float* k, const float* v,
                       int64_t x_stride, const float* alpha, const float* beta, const float* dt_bias, const float* a,
@@ -150,34 +151,49 @@ __global__ void __launch_bounds__(kHeadDim)
         return;  // a fully accepted window: state_out already holds the state after all its columns
     const int h = blockIdx.x, j = threadIdx.x;
     const int kh = h % k_heads;
-    __shared__ float ks[kHeadDim], qs[kHeadDim];
+    __shared__ __align__(16) float ks[2][kHeadDim], qs[2][kHeadDim];
     const float* s_in = state_in + int64_t{h} * kHeadDim * kHeadDim;
     float s[kHeadDim];
 #pragma unroll
     for (int i = 0; i < kHeadDim; ++i)
         s[i] = s_in[i * kHeadDim + j];
+    // column t's inputs, loaded one column ahead
+    float k_next = 0.0f, q_next = 0.0f, v_next = 0.0f, alpha_next = 0.0f, beta_next = 0.0f;
+    const auto load = [&](int t) {
+        k_next = k[t * x_stride + kh * kHeadDim + j];
+        q_next = q[t * x_stride + kh * kHeadDim + j];
+        v_next = v[t * x_stride + h * kHeadDim + j];
+        alpha_next = alpha[t * int64_t{v_heads} + h];
+        beta_next = beta[t * int64_t{v_heads} + h];
+    };
+    if (columns > 0)
+        load(0);
     for (int t = 0; t < columns; ++t) {
-        __syncthreads();  // the previous column's reads of ks and qs are done
-        ks[j] = k[t * x_stride + kh * kHeadDim + j];
-        qs[j] = q[t * x_stride + kh * kHeadDim + j];
-        const float b = sigmoid(beta[t * int64_t{v_heads} + h]);
-        const float g = softplus(alpha[t * int64_t{v_heads} + h] + dt_bias[h]) * a[h];
-        __syncthreads();
+        const int buf = t & 1;
+        ks[buf][j] = k_next, qs[buf][j] = q_next;  // this buffer's last readers finished column t - 2
+        const float v_t = v_next, alpha_t = alpha_next, beta_t = beta_next;
+        __syncthreads();  // column t's k and q are in shared memory
+        if (t + 1 < columns)
+            load(t + 1);  // in flight while column t is computed
+        const float b = sigmoid(beta_t);
+        const float g = softplus(alpha_t + dt_bias[h]) * a[h];
         if (j == 0 && gates != nullptr) {
             gates[(t * int64_t{v_heads} + h) * 2] = b;
             gates[(t * int64_t{v_heads} + h) * 2 + 1] = g;
         }
         const float eg = expf(g);
+        const float* ksb = ks[buf];
+        const float* qsb = qs[buf];
         float kv = 0.0f;
 #pragma unroll
         for (int i = 0; i < kHeadDim; ++i)
-            kv += s[i] * ks[i];
-        const float d = (v[t * x_stride + h * kHeadDim + j] - eg * kv) * b;
+            kv += s[i] * ksb[i];
+        const float d = (v_t - eg * kv) * b;
         float acc = 0.0f;
 #pragma unroll
         for (int i = 0; i < kHeadDim; ++i) {
-            s[i] = eg * s[i] + ks[i] * d;
-            acc += s[i] * qs[i];
+            s[i] = eg * s[i] + ksb[i] * d;
+            acc += s[i] * qsb[i];
         }
         out[(t * int64_t{v_heads} + h) * kHeadDim + j] = acc * scale;
     }

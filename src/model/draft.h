@@ -11,6 +11,12 @@
 // hyper-connection mixers, the head's mixer and the shared output head. Depth j >= 2 runs the same pass from the
 // block's own state S' and the previous draft at position t + j - 1; those rows of the K/V cache are rewritten before
 // they are read. At prompt positions the KV-only pass writes row t from S's attention mixer and K/V projections only.
+//
+// The draft's attention is dense over the last kDraftWindow positions at most: each K/V cache is a ring of
+// min(context, kDraftWindow) rows (row = position % rows). Below kDraftWindow positions that is every earlier
+// position, exactly as a full cache. Past it, a ring row may still hold a draft written ahead of the last accepted
+// position (the oldest position of the window loses its row) until that position is computed again; drafts are
+// verified, so only acceptance can change.
 #pragma once
 
 #include <cstdint>
@@ -23,6 +29,8 @@
 #include "core/budget.h"
 
 namespace torch::model {
+
+inline constexpr int kDraftWindow = 16384;  // positions the draft layer attends to at most
 
 class Model;
 
@@ -66,8 +74,8 @@ public:
     void run(int variant, int position, std::span<const int32_t> next, int depth, std::vector<Drafted>& out,
              const std::function<bool(int, float)>& more = nullptr);
 
-    // The first of the first `rows` K/V cache rows in which variants a and b differ (keys or values, bitwise), or -1
-    // when they are equal: for tests. Waits for the GPU.
+    // The first of the first `rows` K/V ring rows (at most min(context, kDraftWindow)) in which variants a and b
+    // differ (keys or values, bitwise), or -1 when they are equal: for tests. Waits for the GPU.
     int first_kv_difference(int a, int b, int rows) const;
 
 private:

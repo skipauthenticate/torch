@@ -11,7 +11,9 @@
 // hedge re-issues the whole request.
 //
 // The buffers are the caller's memory, in pools of equal-sized buffers; a pool needs at least one spare buffer more
-// than the reads one read_all() puts into it.
+// than the reads one read_all() puts into it. A read counts as late from when a worker starts it, not from the batch's
+// start, and a hedge waits for a free spare buffer without holding up the batch, so a batch of any size with any
+// number of late reads completes.
 #pragma once
 
 #include <atomic>
@@ -65,8 +67,8 @@ private:
         uint32_t j;  // the chunk's index in its read
     };
     void work();
-    std::shared_ptr<Task> submit(const Request& r);
-    Buffer* take(int pool);
+    std::shared_ptr<Task> submit(const Request& r, bool wait = true);  // nullptr: no free buffer and !wait
+    Buffer* take(int pool, bool wait = true);
     static void abandon(Task& t);
 
     const DirectFile& file_;

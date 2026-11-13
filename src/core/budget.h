@@ -39,6 +39,10 @@ struct Budget {
     uint64_t available_after_load = 0;
     int added = 0;
     uint64_t added_bytes = 0;
+    // Experts in the KV cache's unused tail (--lend-kv): the reservations already hold their memory.
+    int lend_from = 0;  // the first position lent
+    int tenants = 0;
+    uint64_t lent_bytes = 0;  // the tail's bytes
 
     uint64_t reserved() const noexcept;                                        // sum of the reservations
     uint64_t room() const noexcept { return available - floor - reserved(); }  // for resident experts

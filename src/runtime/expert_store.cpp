@@ -179,6 +179,64 @@ void ExpertStore::load(const std::vector<std::vector<int32_t>>& resident) {
     std::copy(host_map_.begin(), host_map_.end(), map_);
 }
 
+void ExpertStore::add_tenants(const std::vector<Tenant>& tenants) {
+    uint64_t stride = 0;  // a bounce buffer holds the pages of any matrix
+    for (const model::Layer& L : layers_)
+        for (int kind = 0; kind < 3; ++kind)
+            stride = std::max(stride, slot_bytes(tensor(L, kind).slice_bytes));
+    for (const Tenant& t : tenants)
+        if (resident(t.layer, t.expert))
+            throw Error("Expert " + std::to_string(t.expert) + " of layer " + std::to_string(t.layer) +
+                        " is already resident; this is a bug in the engine.");
+    void* p = nullptr;
+    TORCH_CUDA_CHECK(cudaHostAlloc(&p, kReadThreads * stride, cudaHostAllocDefault));
+    uint8_t* bounce = static_cast<uint8_t*>(p);
+    const int n = 3 * static_cast<int>(tenants.size());
+    try {
+        for (int first = 0; first < n; first += kReadThreads)  // one bounce buffer per read thread
+            pool_.run(std::min(kReadThreads, n - first), [&](int j) {
+                const Tenant& t = tenants[static_cast<size_t>((first + j) / 3)];
+                const int kind = (first + j) % 3;
+                const model::Layer& L = layers_[static_cast<size_t>(t.layer)];
+                uint64_t slot = 0;  // the kind's slot in the tenant's memory, as load() lays out an expert
+                for (int k = 0; k < kind; ++k)
+                    slot += slot_bytes(tensor(L, k).slice_bytes);
+                const model::ExpertTensor& m = tensor(L, kind);
+                const uint64_t offset = m.file_offset + static_cast<uint64_t>(t.expert) * m.slice_bytes;
+                const uint8_t* src = file_.read(offset, m.slice_bytes, bounce + static_cast<uint64_t>(j) * stride);
+                uint8_t* dst = t.at + slot + offset % kPage;  // the file's offset within a page, as in a slot
+                TORCH_CUDA_CHECK(cudaMemcpy(dst, src, m.slice_bytes, cudaMemcpyHostToDevice));
+                const size_t entry =
+                    static_cast<size_t>(t.layer) * static_cast<size_t>(n_expert_) + static_cast<size_t>(t.expert);
+                host_map_[entry * 3 + static_cast<size_t>(kind)] = dst;
+            });
+    } catch (...) {
+        cudaFreeHost(bounce);
+        throw;
+    }
+    cudaFreeHost(bounce);
+    std::copy(host_map_.begin(), host_map_.end(), map_);
+}
+
+std::vector<std::pair<int, int>> ExpertStore::evict(const uint8_t* begin, const uint8_t* end) {
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(begin), hi = reinterpret_cast<uintptr_t>(end);
+    std::vector<std::pair<int, int>> out;
+    for (size_t i = 0; i < host_map_.size(); i += 3) {
+        bool inside = false;
+        for (size_t kind = 0; kind < 3; ++kind) {
+            const uintptr_t at = reinterpret_cast<uintptr_t>(host_map_[i + kind]);
+            inside = inside || (at >= lo && at < hi);
+        }
+        if (!inside)
+            continue;
+        for (size_t kind = 0; kind < 3; ++kind)
+            host_map_[i + kind] = map_[i + kind] = nullptr;
+        out.emplace_back(static_cast<int>(i / 3 / static_cast<size_t>(n_expert_)),
+                         static_cast<int>(i / 3 % static_cast<size_t>(n_expert_)));
+    }
+    return out;
+}
+
 ExpertStore::~ExpertStore() {
     stop_ = true;
     if (thread_.joinable())
@@ -288,6 +346,41 @@ std::vector<uint64_t> ExpertStore::read_route_counts() const {
 bool ExpertStore::resident(int layer, int expert) const noexcept {
     return host_map_[(static_cast<size_t>(layer) * static_cast<size_t>(n_expert_) + static_cast<size_t>(expert)) * 3] !=
            nullptr;
+}
+
+std::array<const uint8_t*, 3> ExpertStore::resident_matrices(int layer, int expert) const noexcept {
+    const size_t at = (static_cast<size_t>(layer) * static_cast<size_t>(n_expert_) + static_cast<size_t>(expert)) * 3;
+    return {host_map_[at], host_map_[at + 1], host_map_[at + 2]};
+}
+
+std::vector<const uint8_t*> ExpertStore::stage_for_prefill(int layer, std::span<const int32_t> experts) {
+    const int count = static_cast<int>(experts.size());
+    if (count > kGateSlots)
+        throw Error("A prefill pass stages at most " + std::to_string(kGateSlots) + " experts, not " +
+                    std::to_string(count) + "; this is a bug in the engine.");
+    const auto start = std::chrono::steady_clock::now();
+    std::lock_guard lock(io_mutex_);
+    io_->release();  // the GPU is done with every earlier read (the caller's contract)
+    held_ = 0;
+    staged_.clear();
+    const model::Layer& L = layers_[static_cast<size_t>(layer)];
+    std::vector<HedgedReads::Request> reads(static_cast<size_t>(3 * count));
+    for (int i = 0; i < count; ++i)
+        for (int kind = 0; kind < 3; ++kind) {
+            const model::ExpertTensor& t = tensor(L, kind);
+            reads[static_cast<size_t>(3 * i + kind)] = {
+                kind, t.file_offset + static_cast<uint64_t>(experts[static_cast<size_t>(i)]) * t.slice_bytes,
+                t.slice_bytes};
+        }
+    std::vector<const uint8_t*> data(reads.size());
+    io_->read_all(reads, data);
+    held_ = count;
+    read_ns_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    for (const uint8_t* d : data)
+        if (d == nullptr)
+            throw Error("Reading an expert of layer " + std::to_string(layer) + " from the SSD failed.");
+    return data;
 }
 
 std::vector<ExpertStore::Staged> ExpertStore::staged() const {

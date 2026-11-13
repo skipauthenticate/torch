@@ -18,7 +18,7 @@ From the GSQ-RCO IQ3_S file (per decoded token, before speculation):
 | Output head (Q6_K) | ~0.5 GB | every token; 0.49 GiB [file] |
 | **Fixed per pass** | **~4.2 GB** | read once per verify window, however many tokens it holds |
 | Routed experts, 10 of 512 per layer | ~1.0 GB per token | 2.0-2.3 MB each [file]; grows with the window, minus overlap |
-| Indexer scoring (pooled keys, F16) | 3.3 MB per 1,024 tokens of context, per window | 0.11 GB at 32K, 0.87 GB at 262K [est] |
+| Indexer scoring (pooled keys, F16) | 0.8 MB per 1,024 tokens of context, per window | 25 MB at 32K, 0.2 GB at 262K [est] |
 | Selected K/V (2,048 cells, 12 layers, F16) | ~50 MB per token | flat with context [est] |
 | PLE rows and token embedding | 1.4 KB + 1.4 KB per token | SSD latency, not bandwidth |
 
@@ -49,9 +49,9 @@ The owner's board has about 47 GiB available to the engine (other software runs 
 | --- | ---: | --- |
 | Non-expert weights, including `token_embd` | 4.2 GiB | always resident |
 | Draft layer (IQ4_XS experts, Q8_0 rest) | ~1.3 GiB | 2.5 GiB if all Q8_0 [est] |
-| KV cache, 12 attention layers, F16 | 6.0 GiB | 24 MiB per 1,024 tokens; allocated as the sequence grows |
-| Draft-layer KV, F16 | 0.5 GiB | grows with the sequence |
-| Indexer pooled keys, F16, 13 layers | 0.8 GiB | grows with the sequence |
+| KV cache, 12 attention layers, F16 | 6.0 GiB | 24 MiB per 1,024 tokens; allocated up front for `--context` (M6) |
+| Draft-layer KV, F16 | 32 MiB | a ring of the last 16,384 positions (M6) |
+| Indexer pooled keys, F16, 12 layers | 0.19 GiB | 64 B per token per layer |
 | DeltaNet state x2, conv history, operand log | 0.25 GiB | 113 MB per state copy |
 | CUDA graph segments, 16 window shapes | ~0.5 GiB | ~30 MiB per window shape [est] |
 | Miss staging (2 layers in flight x 160 experts x 2.3 MB) | 0.75 GiB | mapped pinned memory |
@@ -67,18 +67,33 @@ it at start and prints its own version of this table.
 
 ## Prefill
 
-Prefill is SSD-bound on this board. Every chunk touches all 512 experts of every layer, so the non-resident experts are
-read once per chunk; GPU time is ~0.3 s per 4,096-token chunk (47 GiB of weights streamed once, plus compute) [est].
-With an SSD at 5.8 GB/s at queue depth 4 [M2] (the table below keeps the conservative 3 GB/s until M6 measures prefill):
+Prefill is compute-bound on this board, not SSD-bound as first estimated: a 4,096-token chunk reads its ~4,950
+non-resident experts (~10 GB) in the background while ~16.3 s of GPU work runs (architecture decision 11). The race's
+review prompt 1 (4,096 tokens, `--context 262144`, `calib-g-spec.txt`, one chunk), GPU seconds per stage from CUDA
+events (`TORCH_PREFILL_STAGES=1`), on the Orin, before and after the tuning round of 2026-11-13. Its three kept commits
+measured, one run each: cfc67c8 20.3 s (GEMM tree nodes padded against bank conflicts), 51c7338 18.7 s (BF16 passes
+staged as one sequence, so the 10240 x 320 mixer up projection leaves the one-column kernel; BF16 5.02 s), af4641e
+17.8 s (two 256-thread int8 GEMM blocks an SM; experts 5.36 to 4.57 s). The experts stage varies by about 0.1 s
+between runs (the read-ahead).
 
-| Chunk | Non-resident experts read per chunk | Prompt tok/s at 67% resident (262K capacity) | at 82% resident (short context) |
-| ---: | ---: | ---: | ---: |
-| 4,096 | 15.5 GiB / 8.4 GiB | ~700 | ~1,500 |
-| 8,192 | same | ~1,300 | ~2,500 |
-| 16,384 | same | ~2,200 | ~3,700 |
+| Stage | 2026-11-12, ac29367 | 2026-11-13, af82794 (final) |
+| --- | ---: | ---: |
+| Dense int8 products | 4.38 | 3.54 |
+| BF16 x F32 products | 6.58 | 5.04 |
+| Routed experts | 6.91 | 4.48 |
+| Attention and the indexer | 1.24 | 1.24 |
+| DeltaNet | 0.91 | 0.91 |
+| Everything else | 1.11 | 1.11 |
+| **GPU total** | **21.13** | **16.32** |
+| **Prompt, wall clock** | **22.6 s (181 tok/s)**, twice | **17.7 s (231 tok/s)**, twice |
 
-Chunk size is bounded by the activation memory in the budget. A 262,144-token prompt takes minutes at any chunk size;
-sessions that extend the previous sequence do not prefill again (architecture decision 11).
+Before prefill the race prompts took 76-82 s in windows of 8 (147.7 s for review prompt 1 with the draft layer's
+pass). The goal was 1,000 prompt tok/s at 4,096; after the int8 kernels were measured it was reset in writing to ~350.
+The measured 231 misses it.
+
+Memory: the chunk's activations are 1.55 GiB at 4,096 columns, the read-ahead pools 0.34 GiB and the
+session snapshot 0.11 GiB, each its own budget line. Long prompts run at about the same rate: 131,001 tokens took
+854.7 s (153 tok/s) and 262,040 took 1,763.6 s (149 tok/s) on 2026-11-11, before the BF16 tuning (the needles below).
 
 ## Measured so far
 
@@ -324,6 +339,106 @@ request except review 3 (speculative 255 to 281). The prompt misses more, which 
 6.7 GiB is what a 262,144-token context's F16 KV, draft-layer KV and pooled indexer keys will take. Also measured
 there and not kept: `--swap 64` and `--swap 128` (medians 35.65 and 35.70 against 35.58 with 32).
 
+## M6: long context
+
+Attention above 2,048 tokens of context is sparse: the indexer keeps each column's 512 best 4-token blocks plus the open
+tail (decision 10). One layer's attention per window, from `bench/sparse_attention.cu` (CUDA events, graphs over 12
+layers' caches, random inputs), times 12 layers, ms per window, measured on 2026-11-10:
+
+| Columns | Dense at position 2,040 | Sparse at 3,848 | Difference | Sparse at 32,000 | Sparse at 262,000 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.55 | 1.22 | +0.67 | 1.51 | 4.10 |
+| 4 | 1.54 | 2.48 | +0.94 | 3.34 | 8.74 |
+| 8 | 2.93 | 4.12 | +1.19 | 5.26 | 11.02 |
+
+Per layer, us, the same runs:
+
+| Tokens, columns | BF16 projections | Score | Select | Attention over the cells |
+| --- | ---: | ---: | ---: | ---: |
+| 3,848, 1 / 4 / 8 | 20.9 / 34.9 / 51.0 | 4.8 / 13.9 / 18.9 | 10.6-10.8 | 53.9 / 133.1 / 242.8 |
+| 32,000, 1 / 4 / 8 | 20.9 / 35.0 / 50.0 | 16.4 / 50.1 / 56.4 | 18.4-18.6 | 58.8 / 164.4 / 296.3 |
+| 262,000, 1 / 4 / 8 | 20.9 / 34.7 / 50.3 | 112.9 / 350.7 / 365.6 | 124.1-124.9 | 67.6 / 201.8 / 351.0 |
+
+- Gate K4 (a sparse window at 4,096 within 1 ms of the dense window at 2,048) passes at 1 and 4 columns. At 8 it is
+  0.1-0.4 ms over (this bench, and same-token model runs plus the bench's dense 4K-2K difference), because of the
+  indexer's BF16 projections at 8 columns: the multi-column BF16 kernel, shared with the mixers.
+- Scoring reads the pooled keys: 16.8 MB per layer at 262,144 tokens, ~112 us at 150 GB/s, which the 1-column score
+  reaches. Windows of 3 or more columns use a kernel that reads each key once for all columns (444 -> 351 us at 4
+  columns); the F32 arithmetic of 8 columns is ~100 us per layer at the GPU's peak [est]. Select is 124 us per layer at
+  262,144 (186 before the change of 2026-11-10).
+- The same 4,096-token prompt, positions 3,600-4,096, sparse against dense attention: 115.22 against 116.25 ms per
+  window at 8 columns, 72.59 against 72.96 at 4 (one session, 22,900 experts resident).
+- `--context 262144` reserves 6.19 GiB for the KV cache and indexer keys and leaves 19,303 of 24,576 experts resident
+  (78.5%; 22,466 at `--context 4096`); MemAvailable 7.42 GiB at the end. A 4,096-token prompt's logits are bitwise
+  those of `--context 4096` at all 4,096 positions, and window 8 is bitwise window 1.
+- Parity with the reference runtime (F16 KV, teacher forcing, 32 greedy steps each): 4,046 tokens 32/32 top-1 and mean
+  KL 0.00255, 4,028 tokens 32/32 and 0.00115, 32,700 tokens 31/32 plus one near-tie (Torch's choice 0.10 nats
+  below the reference's own in the reference's ranking) and 0.00210 (gate 0.0041).
+- The draft layer attends to the last 16,384 positions from a K/V ring (`src/model/draft.h`): its budget line is
+  1.49 GiB at `--context 262144` (2.00 GiB with a full cache). On the three race review prompts (4,096 tokens, 256
+  greedy tokens, `--context 262144`, placement `calib-g-spec.txt`) the ids with speculation equal the one-token run's:
+  29.84 / 29.33 / 30.74 tok/s at 2.34 / 1.98 / 2.76 tokens per window, against 22.62 / 22.59 / 22.55 one token at a
+  time, 18,025-18,168 experts resident. Past the ring's wrap (a 16,500-token review prompt, 64 tokens, `calib.txt`)
+  the ids also agree, at 2.79 tokens per window and 21.71 tok/s (17,881 resident).
+- With the draft layer the prompt now goes in windows of 8 too: review prompt 1 in 147.7 s instead of 319.0 at
+  window 1, the draft's K/V rows bitwise those of a one-token pass (`--check-draft-kv`). The race's prose and
+  repetition prompts (4,096 tokens, 256 greedy tokens, `--context 262144`; speculation with `calib-g-spec.txt`, one
+  token at a time with `calib-g.txt`), ids identical in all six:
+
+| Prompt | Speculative tok/s | Tokens per window | Generation misses | One token at a time | Its misses |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose 1 / 2 / 3 | 32.85 / 32.30 / 30.45 | 2.11 / 2.18 / 2.09 | 495 / 543 / 621 | 23.81 / 23.86 / 23.85 | 450 / 418 / 427 |
+| Repetition 1 / 2 / 3 | 42.62 / 44.90 / 43.62 | 4.71 / 4.98 / 4.02 | 1,218 / 1,315 / 1,223 | 23.36 / 23.30 / 23.30 | 758 / 783 / 710 |
+
+  18,877-19,616 experts resident in the speculative runs, 19,520-19,531 one token at a time; prompts in 76-82 s.
+- `--lend-kv` (a second number, not the headline): the bytes of positions 16,384-262,143 in every attention layer's K
+  rows, V rows and pooled keys hold ~2,990 more experts (5.80 GiB) until a window writes there. Race review prompts,
+  `--context 262144`, speculation, `calib-g-spec.txt`, without and with it back to back (ids identical in all six):
+
+| Review | Without: tok/s | Resident | Generation misses | With: tok/s | Resident (lent) | Generation misses |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 28.94 | 17,994 | 3,051 | 32.51 | 20,929 (2,990) | 796 |
+| 2 | 29.16 | 17,875 | 3,011 | 31.98 | 20,805 (2,988) | 835 |
+| 3 | 29.03 | 17,366 | 4,360 | 34.12 | 20,338 (2,993) | 1,020 |
+
+  Median 29.03 to 32.51 tok/s (+12%). The top-up after loading varied from 514 to 1,167 experts between runs
+  (MemAvailable after loading 9.98-11.24 GiB). A prompt that crosses the lend mark (16,500 tokens, `--lend-from 2048`,
+  the mark moved 8 times) gives bitwise the logits of the run without lending at every position.
+- Needle in a haystack (`bench/needle.py`: the workloads' synthetic prose, one sentence with a 7-digit number at a
+  depth, a question): 32,700 prompt tokens at `--context 32768`, window 8, `calib-g.txt`, 32 greedy tokens. The answer
+  comes first at depths 10, 50 and 90%; prompts in 792.7, 781.0 and 775.9 s (about 41 tokens per second). With
+  prefill (chunks of 4,096, `calib-g.txt`, 32 greedy tokens, 2026-11-11, before the BF16 tuning), the answer comes
+  first at depth 50% at 131,001 tokens (`--context 131072`, prompt 854.7 s) and at 262,040 tokens (`--context
+  262144`, prompt 1,763.6 s). GPU seconds at 262,040: dense 280, BF16 618, experts 448, attention 198, DeltaNet 58,
+  other 70. MemAvailable stayed at 7.35 GiB or above (the floor is 6). Depths 10 and 90% were not run at 128K and
+  256K.
+- Prefill against windows of 8 (review prompt 1, `--context 4096`, 8 generated tokens, logits byte for byte at every
+  chunk end and every generated step): 300 tokens in chunks of 300, 64 and 37, and 64 with `--resident 256`; 2,200
+  tokens in chunks of 512, 333 and 4,096 (across the 2,051/2,052 edge). All equal, and so are: `--spec` with
+  `--check-draft-kv` (ids and draft K/V); `--lend-from 1024` at `--context 16384`, the mark crossed inside chunks
+  with 173 experts lent; `--resident 0`; `--then` against windows of 8 with `--then`.
+- The race prompts with prefill (2026-11-13 at 51c7338, chunks of 4,096, `--context 262144`, `calib-g-spec.txt`, 256 greedy
+  tokens, `--swap 32 --swap-prompt 0`): in all nine, the ids one token at a time and with speculation equal the ids
+  of the window-path runs of 2026-11-09. Prompts in 18.2-18.8 s one token at a time and 19.4-20.0 s with the draft
+  layer's pass. Decode, one token at a time: prose 23.67-23.73, repetition 22.97-23.02, review 22.44-22.68 tok/s.
+  Speculative: prose 32.13 / 31.56 / 30.11, repetition 40.05 / 42.89 / 43.25, review 28.75 / 29.72 / 31.29 tok/s.
+- Race round 2 (2026-11-13, af82794, the race's rules: the nine 4,096-token prompts, 256 greedy tokens, `--context
+  262144`, one process per request with the load excluded, prefill in one chunk of 4,096): median decode 30.25 tok/s on
+  code review, 31.37 on prose and 42.38 on repetition; time to first token 18.8-19.0 s (216-218 prompt tok/s; 92-242 s
+  on the window path in round 1); the speculative ids equal the one-token ids in all nine. With `--lend-kv`, a labeled
+  second number: 32.20 / 32.67 / 46.99 tok/s, time to first token 18.3-18.6 s.
+- Sessions (`torch run --then`): on review prompt 1, a second turn of 29 new tokens after 4,128 takes 0.6 s of prompt
+  against 131.7 s for a fresh run of the same 4,157 tokens, and generates the same 32 ids; so do the cancelled
+  (`--cancel-after 3`) and speculative variants. With prefill, a second turn rewinds to the end of the last chunk and
+  prefills the generated tokens again with its new ones. Turn 1 is 1,024 tokens and 8 generated; turn 2 adds 500
+  and prefills 508 in 4.2 s, against 12.5 s for a fresh prefill of the 1,532 tokens. Turn 2's rows equal the fresh
+  run's byte for byte, at chunks of 512 and 37, with `--spec` (ids), with lending (the mark crossed in turn 2), and
+  after a request cancelled between chunks (`--cancel-prompt-after`).
+- Memory at `--context 262144`: MemAvailable falls by the device buffers' 5.9 GiB at cudaMalloc already, and they are
+  zeroed once at allocation, so the top-up after loading counts no untouched KV. During a 32,700-token prompt
+  MemAvailable stayed at 6.73 GiB or above.
+- Measured from 2026-11-09 to 2026-11-13; the final numbers are at commit af82794.
+
 ## Targets
 
 Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in
@@ -335,12 +450,15 @@ request; it may not close with a failed gate.
 | M3, autoregressive | 30 (gate: >= 27) | | | |
 | M4, verify windows + MTP | 45 | | | |
 | M5, copy mode + residency | 50 | 40 | 100 | |
-| M6, long context | | | | 1,000 (about 4 s to the first token) |
+| M6, long context | | | | 1,000 (about 4 s to the first token); reset to ~350 |
 
 M4 measured 37.2 on code review against its goal of 45; the goal carries to M5.
 
 M5 measured 38.2 on code review against 50, 41.3 on prose against 40 and 56.0 on repetition against 100. The
 review and repetition goals carry forward with the int8 tensor-core kernels, which move to M6.
+
+M6's prompt goal of 1,000 tok/s at 4,096 was reset in writing to ~350 once the int8 kernels were measured. M6
+measured 231 (17.7 s for the race's 4,096-token review prompt, 2026-11-13): missed.
 
 M3's 30 tok/s is 86% of the physical ceiling across roughly a thousand launches, which is why its gate is 27:
 that is ambitious [est]. M3 measured 25.4 on code review (25.7 prose, 24.3 repetition) and merged below its gate by
