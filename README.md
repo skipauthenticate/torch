@@ -5,7 +5,7 @@ An inference engine for one model on one device: **Qwen3.8-Flash-Next** on the *
 Supporting a single device lets every kernel, memory decision and default be tuned for the Orin's unified memory,
 small L2 cache and 16 streaming multiprocessors, with no compromises for other hardware.
 
-> **Status: early development (milestones M0-M7 done; v0.1.0 not yet tagged).** The engine decodes speculatively: the model's own draft layer
+> **Status: early development (v0.1.0, milestones M0-M7 done).** The engine decodes speculatively: the model's own draft layer
 > proposes up to 5 tokens, one verify window of up to 8 columns checks them, and the generated tokens are the same as
 > one at a time. On the Orin it runs at 38.2 tok/s on code review, 41.3 on prose and 56.0 on repetitive text (medians of three
 > requests, 2026-11-09), with
@@ -17,6 +17,8 @@ small L2 cache and 16 streaming multiprocessors, with no compromises for other h
 > repetitive text, and sampled at the model file's defaults at 29.5 / 28.9 / 42.1 tok/s through `torch run`, with the same
 > tokens as without speculation (medians; the board's free memory varied during the session, see the
 > [performance model](docs/performance.md#m7-the-c-api-the-server-and-sampling)).
+> In one server process for all nine race requests, as the race's rules say, it decodes at 31.9 / 32.5 / 46.2 tok/s
+> (medians, 2026-11-13).
 > The [roadmap](docs/roadmap.md) lists what each milestone delivers;
 > the [performance model](docs/performance.md) lists what has been measured and what we expect.
 

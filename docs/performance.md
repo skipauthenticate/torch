@@ -488,6 +488,24 @@ seed 1, 256 tokens, all of them reasoning: speculative 24.81 / 28.11 / 28.02 tok
 24.51 / 24.60 on review 1, prose 1 and repetition 1 (17,410 resident), ids equal; 2.52 / 1.95 / 1.84 tokens per
 window. The gain (6-15%) is smaller than with thinking off.
 
+The race as its rule 5 says: one `torch_server` process (251350b plus a server change that only reports expert hits
+and misses), a 3-token warmup, then the nine race requests in order (review, prose, repetition, three each), greedy,
+256 tokens, plain configuration (no lending), `--context 262144`. Experts made resident by swaps stay resident from
+one request to the next. Measured on 2026-11-13 22:26-22:38 PST, 17,040 resident, then in the same session the frozen
+M6 binary started once per request as race rounds 1 and 2 ran it (17,150 falling to 16,526 resident), tok/s:
+
+| Request | One server process | M6 binary, a process each |
+| --- | ---: | ---: |
+| Review 1 / 2 / 3 | 27.82 / 31.92 / 35.07 | 27.54 / 27.20 / 28.96 |
+| Prose 1 / 2 / 3 | 29.58 / 33.53 / 32.52 | 30.79 / 29.92 / 28.40 |
+| Repetition 1 / 2 / 3 | 39.46 / 46.22 / 49.61 | 37.84 / 39.83 / 38.62 |
+| **Medians** | **31.92 / 32.52 / 46.22** | **27.54 / 29.92 / 38.62** |
+
+All nine answers have the same ids as race round 2's. The first request of each workload starts from the previous
+workload's experts and pays for it (prose 1: 29.58 against 30.79 fresh); the next ones gain. Prefill chunks of 1,024
+instead of 4,096 under the same harness gave 583 more resident experts but medians within one pass's noise
+(+0.8% / +1.0% / -1.2%) and prompts of 23.9-24.8 s instead of 19.5, so 4,096 stays the default.
+
 `tools/check_orin.sh` at f1e1b8b: unit and kernel parity tests, model parity (mean KL 0.00211), graph = eager and the
 residency identity pass; the kernel gates carried from M3 are missed (35 launch classes of 1 MiB or more below 85% of
 the ceiling, launches under 1 MiB 2.30 ms against 2). `ctest`: every unit and parity test passes.
