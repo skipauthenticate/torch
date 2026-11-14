@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/skipauthenticate/torch/releases/latest"><img src="https://img.shields.io/github/v/release/skipauthenticate/torch?label=release&color=e8590c" alt="Latest release"></a>
   <a href="https://github.com/skipauthenticate/torch/actions/workflows/ci.yml"><img src="https://github.com/skipauthenticate/torch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/skipauthenticate/torch" alt="MIT license"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
 **Free, open source, and built for one board.** Torch runs Qwen3.8-Flash-Next with its full 262,144-token context
