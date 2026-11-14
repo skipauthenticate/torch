@@ -1,69 +1,120 @@
-# Torch
+<h1 align="center">Torch</h1>
 
-An inference engine for one model on one device: **Qwen3.8-Flash-Next** on the **NVIDIA Jetson AGX Orin 64 GB**.
+<h3 align="center">A fast, exact inference engine for one model on one device.</h3>
+<p align="center">Qwen3.8-Flash-Next on the NVIDIA Jetson AGX Orin 64 GB.</p>
 
-Supporting a single device lets every kernel, memory decision and default be tuned for the Orin's unified memory,
-small L2 cache and 16 streaming multiprocessors, with no compromises for other hardware.
+<p align="center">
+  <a href="#speed">Speed</a> · <a href="#install"><b>Install</b></a> · <a href="#use-it">Use it</a> ·
+  <a href="#hardware">Hardware</a> · <a href="#how-it-works">How it works</a> · <a href="#help">Help</a>
+</p>
 
-> **Status: early development (v0.1.0, milestones M0-M7 done).** The engine decodes speculatively: the model's own draft layer
-> proposes up to 5 tokens, one verify window of up to 8 columns checks them, and the generated tokens are the same as
-> one at a time. On the Orin it runs at 38.2 tok/s on code review, 41.3 on prose and 56.0 on repetitive text (medians of three
-> requests, 2026-11-09), with
-> output that does not depend on which experts are resident and matches the reference within the parity gate.
-> Contexts reach 262,144 tokens with the model's sparse attention above 2,048, and prompts prefill in chunks of up to
-> 4,096 tokens: 231 tok/s on the 4,096-token code-review prompt (M6, 2026-11-13).
-> M7 adds a C API and `torch_server`, an OpenAI-compatible server. At the race's settings (4,096-token prompts, a
-> 262,144-token context, 2026-11-13) it decodes greedily at 29.9 / 30.8 / 42.1 tok/s on code review, prose and
-> repetitive text, and sampled at the model file's defaults at 29.5 / 28.9 / 42.1 tok/s through `torch run`, with the same
-> tokens as without speculation (medians; the board's free memory varied during the session, see the
-> [performance model](docs/performance.md#m7-the-c-api-the-server-and-sampling)).
-> In one server process for all nine race requests, as the race's rules say, it decodes at 31.9 / 32.5 / 46.2 tok/s
-> (medians, 2026-11-13).
-> The [roadmap](docs/roadmap.md) lists what each milestone delivers;
-> the [performance model](docs/performance.md) lists what has been measured and what we expect.
+<p align="center">
+  <a href="https://github.com/skipauthenticate/torch/releases/latest"><img src="https://img.shields.io/github/v/release/skipauthenticate/torch?label=release&color=e8590c" alt="Latest release"></a>
+  <a href="https://github.com/skipauthenticate/torch/actions/workflows/ci.yml"><img src="https://github.com/skipauthenticate/torch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
 
-## Goals
+**Free, open source, and built for one board.** Torch runs Qwen3.8-Flash-Next with its full 262,144-token context
+on a Jetson AGX Orin 64 GB and serves it over the OpenAI chat API. Every kernel and default is tuned for this one
+device, and the output is exactly what the model file computes: speculative decoding changes the speed, never the
+tokens.
 
-- **Fast**: the highest single-request decode speed on the Orin, measured on code review, prose and repetitive text.
-- **No quality loss**: the engine computes the model exactly as the quantized file describes it, at the file's own
-  precision (F16 KV cache, 8-bit activations in the dot products). Speculative decoding is verified
-  exactly, so it changes speed, never the output.
-- **Full context**: 262,144 tokens.
-- **Readable**: small, documented modules with tests, so the engine is easy to learn from and contribute to.
+## Speed
 
-## Requirements
+Answer speed on the Orin, in tokens per second. Each workload is three requests with 4,096-token prompts, a
+262,144-token context and 256 generated tokens, all nine sent to one server process. Medians, greedy, measured on
+2026-11-13.
 
-- Jetson AGX Orin 64 GB developer kit or module
-- JetPack 7 (L4T R39, CUDA 13)
-- ~85 GB of free NVMe space for the model files: 51.0 GiB of weights, 26.8 GiB of n-gram table, 1.38 GiB of draft
-  layer ([model files](docs/model-files.md) has exact sizes and sha256s)
-- The model: `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000{1,2}-of-00002.gguf` from
-  [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-  at revision `ed59f920` (see [the model](docs/architecture.md#the-model)), plus the draft-layer file, which
-  `tools/make_draft.py` builds from the original checkpoint (not yet published)
+| Workload | Answer speed | Reading the prompt |
+| --- | ---: | ---: |
+| Code review | 31.9 tokens/s | about 215 tokens/s |
+| Writing | 32.5 tokens/s | about 215 tokens/s |
+| Repetitive text | 46.2 tokens/s | about 215 tokens/s |
+
+<details>
+<summary><b>More numbers</b></summary>
+
+| Setting | Code review | Writing | Repetitive text |
+| --- | ---: | ---: | ---: |
+| Sampled at the model's defaults (temperature 1.0, top-k 20, top-p 0.95), one process per request, 2026-11-13 | 29.5 | 28.9 | 42.1 |
+| Greedy, short prompts (about 1,500 tokens) and a 2,048-token context, 2026-11-09 | 38.2 | 41.3 | 56.0 |
+
+A long context takes memory that would otherwise hold more of the model's experts, so speed depends on the context you
+ask for. A sampled request with a fixed seed gives the same tokens with speculation on or off.
+[How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
+
+</details>
 
 ## Install
 
-On the Orin, as your own user (no sudo): clone the repository, read [docs/install.md](docs/install.md) and
-`scripts/install.sh`, then run `scripts/install.sh`. It checks the system, builds into `~/.local`, downloads and
-verifies the model files, builds the draft layer locally, runs a smoke test and installs `torch-server`
-([docs/server.md](docs/server.md)).
+On the Orin, as your own user (no sudo needed):
 
-## Documentation
+```sh
+git clone https://github.com/skipauthenticate/torch.git && cd torch
+scripts/install.sh
+```
 
-| Document | What it covers |
+The installer checks your system, builds Torch into `~/.local`, downloads and verifies the model files (83.6 GB) and
+builds the model's draft layer on your machine. It shows the model licenses and asks you to accept them before
+anything is downloaded. A run from scratch takes about 20 minutes plus the download, and you can run it again at any
+time: it resumes where it stopped. Read the script first; don't pipe it from the network into a shell.
+
+[Install guide](docs/install.md) · [Model files and checksums](docs/model-files.md) · [Uninstall](docs/install.md#uninstalling)
+
+## Use it
+
+Start the server:
+
+```sh
+~/.local/bin/torch-server --context 16384
+```
+
+Then talk to it like any OpenAI-compatible server at `http://127.0.0.1:8080/v1`:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
+  "messages": [{"role": "user", "content": "Write a haiku about the Orin."}],
+  "stream": true
+}'
+```
+
+Streaming, thinking (returned as `reasoning_content`), stop strings, seeds and multi-turn conversations that don't
+read the earlier turns again are all supported. The server answers one request at a time and listens only on your
+machine unless you give it an API key. [Server guide](docs/server.md)
+
+For scripts and C programs there is also `torch run` and a small C API (`include/torch_engine.h`).
+[Development guide](docs/development.md)
+
+## Hardware
+
+| Supported hardware | Needs |
 | --- | --- |
-| [Architecture](docs/architecture.md) | How the engine works and why each design decision was made |
-| [Performance model](docs/performance.md) | Bytes per token, the bandwidth ceiling, reference measurements, targets |
-| [Roadmap](docs/roadmap.md) | Milestones, their gates and what each one delivers |
-| [Benchmarking](docs/benchmarking.md) | The three workloads and what every speed claim reports |
-| [Install](docs/install.md) | `scripts/install.sh`: checks, build, model files, draft layer, smoke test, uninstall |
-| [Server](docs/server.md) | `torch_server`: the OpenAI chat API over the engine, its options, limits and security |
-| [Model files](docs/model-files.md) | Exact file names, sizes, revision and sha256s; the draft-layer file |
-| [Development](docs/development.md) | Building, testing, fuzzing, fixtures and `torch inspect` |
-| [Contributing](CONTRIBUTING.md) | How to build, test, measure and send a change |
+| **NVIDIA Jetson AGX Orin 64 GB** (developer kit or module) | JetPack 7 (CUDA 13), about 85 GB of free NVMe space |
+
+That is the only device. Supporting one board is what lets every kernel, memory decision and default fit the Orin's
+unified memory, small L2 cache and 16 streaming multiprocessors.
+
+## How it works
+
+- **The whole model, mostly in memory.** The model's experts that are used most stay resident; the rest are read from
+  the NVMe in 128 KiB pieces when they are needed, and the set adapts while it runs.
+- **Speculative decoding with the model's own draft layer.** It proposes up to 5 tokens and one pass checks them, so
+  each pass usually yields more than one token. Checking is exact.
+- **Long context.** The model's sparse attention reaches 262,144 tokens, and prompts are read in chunks of 4,096
+  tokens on the Orin's tensor cores.
+- **Exact by design.** Weights as stored, 8-bit activations in the dot products, F16 KV cache, F32 accumulators.
+  Output does not depend on which experts are resident, and it matches the reference implementation within the
+  parity gate.
+
+[Architecture](docs/architecture.md) · [Performance model](docs/performance.md)
+
+## Help
+
+[All guides](docs) · [Report a bug](https://github.com/skipauthenticate/torch/issues/new/choose) ·
+[Security](SECURITY.md) · [Contribute](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
 ## License
 
-The code is [MIT](LICENSE). The model files are not part of this project; they keep their own licenses, which
-the installer prints and asks you to accept ([NOTICE](NOTICE), [model files](docs/model-files.md)).
+The code is [MIT](LICENSE). The model files are not part of this project and keep their own licenses, which the
+installer shows and asks you to accept ([NOTICE](NOTICE)).

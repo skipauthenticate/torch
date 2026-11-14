@@ -4,8 +4,7 @@ Torch runs one model, Qwen3.8-Flash-Next, on one device, the NVIDIA Jetson AGX O
 below follows from that narrow target: we never trade speed on the Orin for portability.
 
 This document explains what the engine does and why. [performance.md](performance.md) has the numbers it is built
-around, [roadmap.md](roadmap.md) the order in which it is built, and [model-files.md](model-files.md) the files it
-reads.
+around and [model-files.md](model-files.md) the files it reads.
 
 Numbers marked **[file]** were read from the GGUF headers at revision `ed59f920` on 2026-11-03. **[M2]**, **[M3]** and
 **[M4]** were measured on the owner's Orin (JetPack 7, MAXN, GPU at 1.3 GHz) by this project's benchmarks
