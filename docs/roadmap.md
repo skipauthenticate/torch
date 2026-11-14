@@ -91,4 +91,18 @@ M6 is done, below its prompt-speed goal. Its gates, as measured on the Orin on 2
   projection groups at 84.7-84.8%), and launches under 1 MiB take 2.30 ms against 2.
 - On the race prompts with prefill, the ids with and without speculation equal the window path's in all nine (rule 7).
 
+M7 is done except the v0.1.0 tag, which waits for the maintainer. Its gates, as measured on the Orin on 2026-11-13
+([performance.md](performance.md#m7-the-c-api-the-server-and-sampling) has the numbers):
+
+- **End-to-end install**: `scripts/install.sh` in a clean environment (empty home and prefix, a clean copy of the
+  commit) built, verified the model files, built the draft layer from the base checkpoint (both its hashes match) and
+  passed its smoke test in 1,133 s; a second run took 3 s. Not verified on a newly flashed board.
+- **Every model file verified by sha256**: both shards downloaded at the pinned revision (83.6 GB in 1,620 s, with an
+  interrupted download resumed), and the locally built draft layer, all against `scripts/models.sha256`.
+- **Sampled output with the same tokens with and without speculation**: 54 of 54 seeded pairs on `torch run`, and
+  through the server.
+- **The server**: greedy ids equal `torch run`'s on the nine race prompts; the official OpenAI client works streamed
+  and not; a closed stream stops the engine within one window; a second turn reuses the first turn's prompt.
+- `tools/check_orin.sh`: every correctness check passes; the kernel gates carried from M3 are still missed.
+
 Contributions that move a milestone forward are welcome; see [CONTRIBUTING.md](../CONTRIBUTING.md).

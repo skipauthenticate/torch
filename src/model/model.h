@@ -19,6 +19,10 @@
 #include "core/placement.h"
 #include "model/config.h"
 
+namespace torch::kernels {
+struct SamplingParams;  // kernels/sampling/sample.h
+}
+
 struct CUstream_st;  // cudaStream_t is CUstream_st*
 
 namespace torch::model {
@@ -121,6 +125,16 @@ public:
     std::span<const float> logits(int column = 0) const noexcept;
     // Column t's most likely next token after the last window, computed on the GPU; ties go to the lowest id.
     int32_t argmax(int column = 0) const noexcept;
+    // Sampling (kernels/sampling/sample.h): draws the next tokens of columns first .. first + n - 1 of the last window
+    // (a prefill chunk: column 0, its last token's), the later columns conditional on the window's inputs after column
+    // `first` as drafts, and returns the accepted tokens: the drafts that equal the drawn tokens, then the first drawn
+    // token that differs, or the last column's. Column first draws at the position after its input token, so a request
+    // draws the same tokens however its windows are cut. Penalties read history_counts(). Call before accept(); throws
+    // Error when the GPU fails.
+    std::vector<int32_t> sample(const kernels::SamplingParams& params, int first, int n);
+    // The history counts the sampler's penalties read, n_vocab of them, in memory the GPU reads directly: the caller
+    // keeps them, between windows.
+    std::span<int32_t> history_counts() noexcept;
     const std::string& error() const noexcept;
 
     // Changes Options::swaps_per_window from the next window on (for example fewer during a prompt's one-token

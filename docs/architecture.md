@@ -404,12 +404,15 @@ quantizers.
 
 ### 13. Tokenizer, chat template and sampling
 
-The tokenizer is `gpt2` BPE with the `qwen35` pre-tokenizer, 248,320 tokens, merges in the GGUF [file]. The C API
-takes token ids. The server (`torch_server`) tokenizes with `tokenizers` and renders `tokenizer.chat_template`
+The tokenizer is `gpt2` BPE with the `qwen35` pre-tokenizer, 248,320 tokens, merges in the GGUF [file]: 248,044
+BPE tokens, 33 added tokens and 243 unused padding ids, which sampling masks ([model-files.md](model-files.md)). The C
+API takes token ids. The server (`torch_server`) tokenizes with `tokenizers` and renders `tokenizer.chat_template`
 (9,993 characters of Jinja, with `enable_thinking`) with `jinja2`, both built from the vocabulary, merges and template
 that `torch inspect --export-tokenizer` writes from the GGUF, so no second copy of the tokenizer is downloaded.
-Sampling takes temperature, top-k, top-p, min-p, seed, and repetition and presence penalties as the OpenAI API names
-them; the file recommends top_k 20, top_p 0.95, temperature 1.0 [file]. Benchmarks run greedy.
+Sampling takes temperature, top-k, top-p, min-p, seed, and repetition, presence and frequency penalties as the OpenAI
+API names them; the file recommends top_k 20, top_p 0.95, temperature 1.0 [file]. The penalties count only the tokens
+the request has generated, from zero on every request, as the API penalises the text generated so far: counting a
+4,096-token prompt would make common tokens impossible at frequency_penalty 0.5. Benchmarks run greedy.
 
 ### 14. Measured, not guessed
 
@@ -431,7 +434,8 @@ asks for.
   not depend on which block finished first.
 - Ties in argmax, router top-10 and indexer top-512 go to the lowest index.
 - The same model, tokens and settings give the same greedy output on every run, with any residency and any window
-  policy. Sampled output is reproducible for a fixed seed and window policy, and has the same distribution for any.
+  policy. Sampled output is the same for a fixed seed with any window policy, with or without speculation: each token
+  is drawn at its position with the request's seed (measured on the 9 bench prompts x 3 seeds, M7).
 
 ## Correctness
 
@@ -461,7 +465,7 @@ src/
   kernels/     CUDA kernels, one folder per operation (gemv, experts, attention, deltanet, hc, norm, sampling)
   model/       model configuration, weight loading, the layer graph
   runtime/     decode loop, speculation, graph segments, expert residency and I/O, PLE reader, sessions
-  api/         C API used by the server and the tools
+  api/         C API used by the server and the tools (include/torch_engine.h, libtorch_engine.so)
 server/torch_server/   OpenAI-compatible HTTP server (Python, over the C API; tokenizer and chat template live
                        here; the package is never named `torch`, a name a widely used Python package already takes)
 tools/         inspect, bench, compare, make_draft

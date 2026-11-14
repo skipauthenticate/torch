@@ -59,6 +59,7 @@ add_library(torch_core STATIC
   src/core/swaps.cpp
   src/formats/types.cpp
   src/gguf/gguf.cpp
+  src/gguf/tokenizer_export.cpp
   src/model/config.cpp
   src/model/window_policy.cpp
   src/runtime/direct_io.cpp
@@ -98,8 +99,19 @@ if(TORCH_CUDA)
     src/model/weights.cpp
     src/runtime/expert_gate.cu
     src/runtime/expert_store.cpp
-    src/runtime/prefill_reads.cpp)
+    src/runtime/prefill_reads.cpp
+    src/runtime/generator.cpp)
   target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
+  # One build of the engine for the static command line and the shared library (the C API): position-independent
+  # objects, and nothing visible outside the library but the torch_engine_* functions.
+  set_target_properties(torch_core torch_engine PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden
+                        CUDA_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+  add_library(torch_engine_shared SHARED src/api/torch_engine.cpp)
+  set_target_properties(torch_engine_shared PROPERTIES OUTPUT_NAME torch_engine CXX_VISIBILITY_PRESET hidden
+                        VISIBILITY_INLINES_HIDDEN ON)
+  target_include_directories(torch_engine_shared PUBLIC include)
+  target_link_libraries(torch_engine_shared PRIVATE torch_engine torch_warnings)
+  target_link_options(torch_engine_shared PRIVATE -Wl,--exclude-libs,ALL)
   # nvcc warns (445) about C++20 template lambdas whose template parameter appears only in the body, which is the
   # with_type() dispatch pattern of src/formats/types.h.
   target_compile_options(torch_engine PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=445>)

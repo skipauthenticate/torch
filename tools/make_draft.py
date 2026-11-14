@@ -16,7 +16,7 @@ the indexer BF16, norms F32. With --experts iq4 it writes OUT/draft-iq4.gguf ins
 experts: gate and up IQ4_XS, down IQ4_NL (their rows are 640 long, which IQ4_XS's 256-value blocks do not divide),
 from this file's quantizers (search_scale).
 
-usage: python3 tools/make_draft.py OUT [--experts q8_0|iq4]   (needs numpy, tests/fixtures/requirements.txt)
+usage: python3 tools/make_draft.py OUT [--experts q8_0|iq4] [--bf16-only]   (needs numpy, tests/fixtures/requirements.txt)
 """
 
 import argparse
@@ -349,10 +349,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("out", type=Path, help="output directory")
     parser.add_argument("--experts", choices=["q8_0", "iq4"], default="q8_0", help="the routed experts' formats")
+    parser.add_argument("--bf16-only", action="store_true",
+                        help="stop after step 1 (the installer checks the BF16 file's sha256 before quantizing)")
     args = parser.parse_args()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     tensors = fetch_bf16(out)
+    if args.bf16_only:
+        return
     draft = out / f"draft-{args.experts}.gguf"
     write_draft(out / "draft-bf16.gguf", metadata(), tensors, draft, metadata(), iq4=args.experts == "iq4")
     print(f"wrote {draft} ({draft.stat().st_size:,} bytes)")

@@ -56,6 +56,7 @@ The unit tests:
 | --- | --- |
 | `dequant` | The CPU reference dequantization of all 13 formats against the numpy reference's values in `tests/fixtures/quant_blocks.bin` |
 | `gguf` | The reader on `tests/fixtures/tiny.gguf`, and on truncated and corrupt headers the test builds |
+| `tokenizer_export` | `torch inspect --export-tokenizer` on small headers the test builds: JSON escapes, the added tokens' flags, unused ids left out, and the files it refuses |
 | `inspect_json`, `inspect_header_only` | `torch inspect` on the fixture, and on a copy of it cut inside the tensor data |
 
 With the sanitizers:
@@ -233,6 +234,10 @@ curl -L -r 0-11534335 -o shard1-head.gguf \
 build/torch inspect --header-only shard1-head.gguf
 ```
 
+`--export-tokenizer DIR` writes the tokenizer and chat template from the same file ([model-files.md](model-files.md),
+"The tokenizer"); `tests/tools/tokenizer_export_test.py DIR` checks them (`pip install --no-deps --require-hashes -r
+server/requirements.txt`).
+
 The format table it prints matches [model-files.md](model-files.md) (checked on 2026-11-03):
 
 ```
@@ -267,7 +272,8 @@ See [architecture.md](architecture.md#source-layout) for the source layout. What
 | `src/gguf/` | The GGUF reader |
 | `src/kernels/` | CUDA kernels, one folder per operation: `gemv`, `norm`, `hc`, `deltanet`, `attention`, `moe`, `ple` |
 | `src/model/` | The model's configuration (`config`), its weights in engine memory (`weights`), the forward pass (`model`) |
-| `src/runtime/` | Direct reads and the read pool, the expert store (residency and the miss path), the PLE row reader |
+| `src/runtime/` | Direct reads and the read pool, the expert store (residency and the miss path), the PLE row reader, the generation loop (`generator.h`) |
+| `src/api/`, `include/torch_engine.h` | The C API: `libtorch_engine.so` exports only the `torch_engine_*` functions; `tests/api/torch_engine_test.c` runs it on the model (sessions, seeds, cancel from another thread) |
 | `tools/` | The `torch` command: `torch inspect`, `torch run`, `torch --version`; `tools/check_wording.py`; `tools/make_draft.py` (the draft-layer file) |
 | `bench/` | Microbenchmarks: GPU memory bandwidth by memory type, SSD reads by queue depth; `draft_acceptance.py` (the draft layer's acceptance per depth on the workloads, M4) |
 | `tests/` | Unit tests, kernel parity tests, model parity, the fuzz target, the fixtures and the script that writes them |

@@ -27,6 +27,7 @@
 #include "kernels/norm/norm.h"
 #include "kernels/ple/ple.h"
 #include "kernels/sampling/argmax.h"
+#include "kernels/sampling/sample.h"
 #include "model/weights.h"
 #include "runtime/direct_io.h"
 #include "runtime/expert_store.h"
@@ -123,6 +124,7 @@ struct Buffers {
     float *key, *key_n, *value, *query, *ple_gate, *gated, *ple_x;
     float* logits;
     kernels::ArgmaxResult *argmax, *argmax_scratch;
+    float* sample_scratch = nullptr;  // the sampler's distributions, kMaxColumns of n_vocab (windows' buffers only)
     // Q8 copies of the vectors quantized products read, one buffer per vector so that no column's copy is overwritten
     // by another vector's before it is read: the block input, the attention or DeltaNet output (6,144 wide), the shared
     // expert's hidden vector, the routed experts' hidden vectors, and any other input (up to hc x n_embd wide).
@@ -297,6 +299,7 @@ struct Buffers {
         q8 = d.cols<BlockQ8>(E / 32),
         q8_x = d.cols<BlockQ8>(std::max(V, static_cast<size_t>(c.n_head * c.head_dim)) / 32);
         q8_sh = d.cols<BlockQ8>(SH / 32), q8_h = d.cols<BlockQ8>(K * FF / 32), q8_wide = d.cols<BlockQ8>(HCD / 32);
+        sample_scratch = d.take<float>(static_cast<size_t>(kernels::sampling_scratch_floats(c.n_vocab, kMaxColumns)));
     }
 };
 
@@ -309,7 +312,13 @@ struct HostBuffers {
 
     static uint64_t bytes(const Config& c) {
         return kMaxColumns * ((2 * static_cast<uint64_t>(c.n_embd) + static_cast<uint64_t>(c.n_vocab)) * sizeof(float) +
-                              sizeof(kernels::ArgmaxResult) + sizeof(int32_t));
+                              sizeof(kernels::ArgmaxResult) + sizeof(int32_t)) +
+               sampling_bytes(c);
+    }
+    // The sampler's mapped memory (allocated on its own): the history counts, then its small inputs and outputs.
+    static constexpr int kSamplingInts = 4 * kMaxColumns;
+    static uint64_t sampling_bytes(const Config& c) {
+        return (static_cast<uint64_t>(c.n_vocab) + kSamplingInts) * sizeof(int32_t);
     }
     void lay_out(uint8_t* host, const Config& c) {
         logits = reinterpret_cast<float*>(host);
@@ -442,6 +451,11 @@ struct Model::Impl {
     int parity = 0;            // which DeltaNet state buffer holds the state before the next window
     bool window_open = false;  // the last window is not committed yet
     bool want_logits = true;
+    // Sampling (sample()): mapped memory the host writes and the kernels read, its device address, and the last
+    // window's logits on the device with the position of the token its column 0 draws.
+    int32_t *sampling_host = nullptr, *sampling_device = nullptr;
+    const float* last_logits = nullptr;
+    size_t first_draw = 0;
     int layer_ = -1;              // the layer being computed, for dump lines
     uint64_t reserved_later = 0;  // Options::reserve, allocated by the caller after the model
     // Swaps (Options::swaps_per_window): which experts are resident; their recency is the store's stamps.
@@ -511,9 +525,15 @@ struct Model::Impl {
         b = cols[0];
         ops = &cols[0];
         void* h = nullptr;
-        TORCH_CUDA_CHECK(cudaHostAlloc(&h, HostBuffers::bytes(cfg), cudaHostAllocDefault));
+        TORCH_CUDA_CHECK(
+            cudaHostAlloc(&h, HostBuffers::bytes(cfg) - HostBuffers::sampling_bytes(cfg), cudaHostAllocDefault));
         host = static_cast<uint8_t*>(h);
         hb.lay_out(host, cfg);
+        TORCH_CUDA_CHECK(cudaHostAlloc(&h, HostBuffers::sampling_bytes(cfg), cudaHostAllocMapped));
+        sampling_host = static_cast<int32_t*>(h);
+        std::fill_n(sampling_host, cfg.n_vocab + HostBuffers::kSamplingInts, 0);
+        TORCH_CUDA_CHECK(cudaHostGetDevicePointer(&h, sampling_host, 0));
+        sampling_device = static_cast<int32_t*>(h);
         if (chunk_cap > 0) {
             DeviceLayout chunk_dry(nullptr, 0, chunk_cap);
             chunk.lay_out(chunk_dry, cfg, context, chunk_cap);
@@ -735,6 +755,8 @@ struct Model::Impl {
             cudaFree(device);
         if (host)
             cudaFreeHost(host);
+        if (sampling_host)
+            cudaFreeHost(sampling_host);
         prefill_reads.reset();  // its reads finish first
         for (cudaEvent_t e : table_copied)
             if (e)
@@ -1326,6 +1348,35 @@ struct Model::Impl {
                                              cudaMemcpyDeviceToHost, stream));
     }
 
+    // Draws columns first .. first + n - 1 of the last window (sample_columns), the later columns conditional on the
+    // window's inputs after column `first` as drafts, then keeps the longest prefix of those drafts equal to the drawn
+    // tokens and the first drawn token that differs (accept_drafts). The inputs, position and tokens go through the
+    // mapped memory after the history counts; the scratch is the windows' (the draws run after the window).
+    std::vector<int32_t> sample(kernels::SamplingParams params, int first, int n) {
+        if (last_logits == nullptr || first < 0 || n < 1 || first + n > window)
+            throw Error("Sample columns of the last window, before accept().");
+        int32_t* in = sampling_host + cfg.n_vocab;  // drafts [kMaxColumns], position, sampled, accepted + tokens
+        int32_t *drafts = in, *position = in + kMaxColumns, *sampled = position + 1, *accepted = sampled + kMaxColumns;
+        const size_t off = static_cast<size_t>(cfg.n_vocab);
+        for (int j = 0; j + 1 < n; ++j)
+            drafts[j] = history[window_start + static_cast<size_t>(first + 1 + j)];
+        *position = static_cast<int32_t>(first_draw) + first;
+        const bool penalties =
+            params.repetition_penalty != 1.0f || params.presence_penalty != 0.0f || params.frequency_penalty != 0.0f;
+        int32_t* dev = sampling_device + off;  // the same ints at their device address
+        kernels::sample_columns(last_logits + static_cast<int64_t>(first) * cfg.n_vocab, cfg.n_vocab, n,
+                                penalties ? sampling_device : nullptr, n > 1 ? dev : nullptr, params, dev + kMaxColumns,
+                                cols[0].sample_scratch, dev + kMaxColumns + 1, stream);
+        if (n > 1)
+            kernels::accept_drafts(dev + kMaxColumns + 1, dev, n, dev + 2 * kMaxColumns + 1, dev + 2 * kMaxColumns + 2,
+                                   stream);
+        TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
+        TORCH_CUDA_CHECK(cudaGetLastError());
+        if (n == 1)
+            return {sampled[0]};
+        return std::vector<int32_t>(accepted + 1, accepted + 1 + *accepted);
+    }
+
     // Settles the last window, keeping its first n tokens: the convolution histories and the PLE ring take the kept
     // columns, and when n is short of the window the DeltaNet state is recomputed from the state before the window
     // over the kept columns (the same kernel and order as the window, so bitwise the same state). The KV rows of the
@@ -1402,6 +1453,7 @@ struct Model::Impl {
         const int E = cfg.n_embd;
         window_start = history.size();
         window = columns;
+        last_logits = cols[0].logits, first_draw = window_start + 1;
 
         // The token embedding and the PLE rows are single rows: the CPU dequantizes them to F32 into pinned memory,
         // which the window's first copies read.
@@ -1549,6 +1601,7 @@ struct Model::Impl {
                     static_cast<uint64_t>(layer_counts[il * cfg.n_expert + e]);
         parity ^= 1;  // every DeltaNet layer wrote its state after the chunk to state_out
         window = 1;   // logits(0) and argmax(0): the chunk's last token's
+        last_logits = chunk_last.logits, first_draw = history.size();
         window_open = false;
         take_snapshot();
         times.total += ms(Clock::now() - start);
@@ -1839,6 +1892,14 @@ std::span<const float> Model::logits(int column) const noexcept {
 
 int32_t Model::argmax(int column) const noexcept {
     return column >= 0 && column < impl_->window ? impl_->hb.argmax[column].index : -1;
+}
+
+std::vector<int32_t> Model::sample(const kernels::SamplingParams& params, int first, int n) {
+    return impl_->sample(params, first, n);
+}
+
+std::span<int32_t> Model::history_counts() noexcept {
+    return {impl_->sampling_host, static_cast<size_t>(impl_->cfg.n_vocab)};
 }
 
 const std::string& Model::error() const noexcept {

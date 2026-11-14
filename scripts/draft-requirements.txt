@@ -1,0 +1,4 @@
+# tools/make_draft.py in the installer (scripts/install.sh): Python 3.12 on the Orin (Linux arm64). numpy is pinned so
+# the draft file comes out with the sha256 in models.sha256.
+numpy==2.3.5 \
+    --hash=sha256:8b973c57ff8e184109db042c842423ff4f60446239bd585a5131cc47f06f789d

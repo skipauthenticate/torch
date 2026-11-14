@@ -64,6 +64,87 @@ jobs:
       - run: python tests/tools/make_draft_test.py
       - run: python tests/tools/run_workloads_test.py
 
+  # The tokenizer export on the real header: the first 11 MiB of shard 1 at the pinned revision (docs/model-files.md),
+  # fetched by range request and cached by revision. Nothing of the model is in the repository; the goldens are ids
+  # of texts that are.
+  tokenizer-export:
+    runs-on: ubuntu-24.04
+    env:
+      HEADER_URL: https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+      HEADER_SHA256: d9565390beaba837e3146374b72356372a0a08e00f0a306a1054d87453e02dab
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/gguf-header
+          key: gguf-header-ed59f92082b1e93c0e96d60a8b11aab089b52f09
+      - run: |
+          mkdir -p ~/gguf-header
+          f=~/gguf-header/shard1-11MiB.gguf
+          [ -f "$f" ] || curl --fail --silent --show-error --location --retry 5 -r 0-11534335 -o "$f" "$HEADER_URL"
+          echo "$HEADER_SHA256  $f" | sha256sum -c -
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTORCH_CUDA=OFF -DTORCH_WERROR=ON
+      - run: cmake --build build --target torch
+      - run: ./build/torch inspect --header-only --export-tokenizer "$RUNNER_TEMP/tokenizer" ~/gguf-header/shard1-11MiB.gguf
+      - run: pip install --no-deps --require-hashes -r server/requirements.txt
+      - run: python tests/tools/tokenizer_export_test.py "$RUNNER_TEMP/tokenizer"
+
+  # torch_server against the stub engine (tests/server/stub_engine.c, the C API without a model) and the exported
+  # tokenizer, on both architectures the server ships for.
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      HEADER_URL: https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+      HEADER_SHA256: d9565390beaba837e3146374b72356372a0a08e00f0a306a1054d87453e02dab
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/gguf-header
+          key: gguf-header-ed59f92082b1e93c0e96d60a8b11aab089b52f09
+      - run: |
+          mkdir -p ~/gguf-header
+          f=~/gguf-header/shard1-11MiB.gguf
+          [ -f "$f" ] || curl --fail --silent --show-error --location --retry 5 -r 0-11534335 -o "$f" "$HEADER_URL"
+          echo "$HEADER_SHA256  $f" | sha256sum -c -
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTORCH_CUDA=OFF -DTORCH_WERROR=ON
+      - run: cmake --build build --target torch torch_engine_stub
+      - run: ./build/torch inspect --header-only --export-tokenizer "$RUNNER_TEMP/tokenizer" ~/gguf-header/shard1-11MiB.gguf
+      - run: pip install --no-deps --require-hashes -r server/requirements.txt
+      - run: python -m unittest discover -s tests/server -v
+        env:
+          TORCH_ENGINE_LIBRARY: build/tests/libtorch_engine_stub.so
+          TORCH_TOKENIZER_DIR: ${{ runner.temp }}/tokenizer
+
+  # The installer: shellcheck, its system checks without the Jetson ones, and the hashes it uses against the docs.
+  install-script:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build shellcheck
+      - run: shellcheck scripts/install.sh
+      - run: scripts/install.sh --check --no-gpu-check
+      - run: |
+          while read -r sha name; do
+            grep -qF "$sha" docs/model-files.md && grep -qF "$name" docs/model-files.md ||
+              { echo "docs/model-files.md does not show $name and $sha"; exit 1; }
+          done < scripts/models.sha256
+
   fuzz:
     runs-on: ubuntu-24.04
     env:

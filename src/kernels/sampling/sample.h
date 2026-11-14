@@ -3,10 +3,13 @@
 // leaves it.
 //
 // The distribution of a column, in this order:
+//  0. Tokens at or above params.vocab_used (the vocabulary's unused padding ids) get x = -infinity: never drawn.
 //  1. Penalties on the raw logit x of every token with a history count n > 0: x = x / repetition_penalty if x > 0,
 //     else x * repetition_penalty; then x = x - frequency_penalty * n - presence_penalty. The history count of column i
-//     is counts[v] (prompt and generated tokens before the window) plus the number of j < i with drafts[j] == v: the
-//     inputs of the window's columns 1..i, which column i's distribution is conditional on.
+//     is counts[v] (the caller's history before the window: the generator counts the tokens this request has
+//     generated, from zero on every request, as the API being imitated penalises the text generated so far) plus the
+//     number of j < i with drafts[j] == v: the inputs of the window's columns 1..i, which column i's distribution is
+//     conditional on.
 //  2. Temperature: x / temperature. temperature == 0 means greedy: the token is the lowest index of the largest x, no
 //     random numbers are drawn, and the steps below do not apply.
 //  3. Softmax over the whole vocabulary: p = exp(x - max) / sum, F32, fixed reduction order.
@@ -52,6 +55,7 @@ struct SamplingParams {
     float presence_penalty = 0.0f;
     float frequency_penalty = 0.0f;
     uint64_t seed = 0;
+    int vocab_used = 0;  // tokens at or above it are never drawn; 0: every token
 };
 
 // vocab must be a multiple of 4 (the model's 248,320 is) and at most 262,144. Floats of scratch sample_columns needs.
