@@ -125,7 +125,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
     reference and GGUF writer, with numpy pinned.
   - CI: formatting (clang-format 19.1.7), host tests (GCC 13; Clang 18 with AddressSanitizer and
     UndefinedBehaviorSanitizer; Apple Clang), fixture reproducibility and 60 seconds of fuzzing.
-- Project documentation: architecture, performance model, roadmap, benchmarking and development guides.
+- Project documentation: architecture, performance model, benchmarking and development guides.
 - Contribution guide, code of conduct, security policy, issue and pull request templates.
 - `docs/model-files.md`: exact names, sizes, revision and verified sha256s of the two model shards; the definition
   of the draft-layer file.
@@ -158,4 +158,4 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - Corrected the model description from the file's header: the indexer selects 2,048 cells (512 pooled blocks), the
   format list includes Q8_0 and F16, the n-gram table is IQ4_NL, RoPE is stored as M-RoPE sections, the file has no
   MTP tensors. Vision is a non-goal.
-- Roadmap gates separated from speed goals; benchmark reports include the slowest window and a committed result file.
+- Milestone gates separated from speed goals; benchmark reports include the slowest window and a committed result file.

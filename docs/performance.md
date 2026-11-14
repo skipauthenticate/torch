@@ -512,8 +512,8 @@ the ceiling, launches under 1 MiB 2.30 ms against 2). `ctest`: every unit and pa
 
 ## Targets
 
-Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in
-[roadmap.md](roadmap.md). A milestone may close below a speed goal with the measured number written in its pull
+Speed numbers are **goals**. The **gates** a milestone must pass are the correctness and kernel bandwidth checks that
+`tools/check_orin.sh` runs ([development.md](development.md)). A milestone may close below a speed goal with the measured number written in its pull
 request; it may not close with a failed gate.
 
 | Milestone | Code review | Prose | Repetition | Prompt tok/s at 4,096 |

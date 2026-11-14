@@ -1,7 +1,7 @@
 // How fast the GPU streams each kind of memory the engine can allocate: device memory (cudaMalloc), mapped pinned
 // host memory (cudaHostAlloc with cudaHostAllocMapped) and ordinary memory registered as mapped (cudaHostRegister).
 // The CPU can write the last two from a file read. The best read figure of the memory type the weights live in is the
-// "streaming bandwidth" every kernel's gate is measured against (docs/roadmap.md, M3).
+// "streaming bandwidth" every kernel's gate is measured against (the kernel gate in tools/check_orin.sh).
 //
 // Each launch shape is swept: 2 to 16 blocks per SM of 256 or 512 threads, each thread keeping 1 or 4 independent
 // 16-byte loads in flight. Reads fold the words with XOR so nothing is optimized away; read+write copies one buffer

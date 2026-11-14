@@ -1,5 +1,6 @@
 // Kernel microbenchmark: how fast each GPU kernel of one decoded token runs, in GB/s against the streaming ceiling
-// measured by bench/memory_bandwidth.cu. It is the baseline every kernel change is compared with (docs/roadmap.md, M3).
+// measured by bench/memory_bandwidth.cu. It is the baseline every kernel change is compared with (the kernel gate in
+// tools/check_orin.sh).
 //
 // What it times. The tensor table of shard 1 gives the exact matrix-vector products a token runs (model.cpp): every
 // non-expert matrix (gemv_q8 for quantized formats with its quantize_q8, gemv_bf16 for BF16, a mixer's inject rows in

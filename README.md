@@ -107,7 +107,7 @@ unified memory, small L2 cache and 16 streaming multiprocessors.
   Output does not depend on which experts are resident, and it matches the reference implementation within the
   parity gate.
 
-[Architecture](docs/architecture.md) · [Performance model](docs/performance.md) · [Roadmap](docs/roadmap.md)
+[Architecture](docs/architecture.md) · [Performance model](docs/performance.md)
 
 ## Help
 
