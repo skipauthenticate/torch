@@ -7,6 +7,33 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `scripts/install.sh` (M7, docs/install.md): checks the Orin, builds into a prefix, makes the server's environment,
+  downloads (resumable) or verifies the model shards against `scripts/models.sha256`, builds the draft layer locally
+  with its BF16 input checked, and runs a smoke test; needs the model licenses accepted, never uses sudo.
+- `calibration/ed59f920/`: the placement (route counts) and draft-head vocabulary for the pinned model files, made from
+  the held-out calibration prompts; `torch_server` uses them by default, and the installer installs them.
+- `torch_server` (M7, `server/torch_server`, docs/server.md): `POST /v1/chat/completions` streamed or not,
+  `GET /v1/models`, `GET /health` over the C API; the model's own template in a sandbox; thinking as
+  `reasoning_content`; stop strings across windows; sessions with `cached_tokens`; cancel when the client goes, also
+  during the prompt; one engine thread and a queue. CI tests it against a stub of the C API on x86-64 and arm64.
+- Milestone M7, first release (in progress):
+  - The generation loop is a library class, `runtime::Generator` (`src/runtime/generator.h`): the prompt in prefill
+    chunks or windows, one-token and speculative greedy decoding, sessions, cancel, and stops on max tokens, stop ids
+    or a caller callback. `torch run` is a command line over it, with the same output; `--stop-ids` stops after any
+    of the given ids.
+  - Sampled decoding (`torch run --temperature ... --seed S`): the sampling kernels draw each token at its position
+    with the request's seed, one token at a time or speculatively with the exact accept step (`accept_drafts`), so
+    the same seed gives the same tokens either way. The 243 unused padding ids are never drawn; penalties count only
+    the request's generated tokens. A request's last speculative window always gets the draft layer's K/V pass, and a
+    request cancelled mid-prompt records only what was fed.
+  - The C API (`include/torch_engine.h`, `libtorch_engine.so`): open, generate (token ids, a `stable` length, greedy
+    or sampled parameters, token and progress callbacks), cancel from any thread, reset, error, stats, close. Status
+    codes, no exceptions across the boundary, a struct size in every struct and `torch_engine_abi_version()`. Sessions
+    rewind to the end of the previous prompt's stable part or start again (`cached_tokens`); a cancel stops before the
+    next window or prefill chunk. The engine is built once, position-independent, for the command line and the
+    library, and the library exports only `torch_engine_*`.
+  - `torch inspect --export-tokenizer DIR` (M7): `tokenizer.json` and `chat_template.jinja` from shard 1's header,
+    equal as parsed JSON to the base model's tokenizer; CI checks it on the real header (job `tokenizer-export`).
 - Milestone M6, long context:
   - The model's sparse indexer above 2,048 tokens of context, to 262,144 (`src/kernels/indexer/`): pooled keys, scores
     in a fixed order checked bit for bit against a CPU reference, the top 512 blocks with ties to the lower index, and

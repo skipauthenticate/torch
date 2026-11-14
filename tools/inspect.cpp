@@ -12,6 +12,7 @@
 #include "core/error.h"
 #include "formats/types.h"
 #include "gguf/gguf.h"
+#include "gguf/tokenizer_export.h"
 
 namespace torch {
 namespace {
@@ -20,10 +21,12 @@ using gguf::ValueType;
 
 constexpr const char* kUsage =
     "usage: torch inspect [--tensors] [--header-only] [--json] FILE...\n"
+    "       torch inspect [--header-only] --export-tokenizer DIR FILE\n"
     "\n"
-    "  --tensors      also list every tensor: name, format, shape, size and file offset\n"
-    "  --header-only  accept a file that stops after its tensor table, such as the first 11 MiB of shard 1\n"
-    "  --json         print one JSON object per file\n";
+    "  --tensors           also list every tensor: name, format, shape, size and file offset\n"
+    "  --header-only       accept a file that stops after its tensor table, such as the first 11 MiB of shard 1\n"
+    "  --json              print one JSON object per file\n"
+    "  --export-tokenizer  write DIR/tokenizer.json and DIR/chat_template.jinja from shard 1's header\n";
 
 constexpr uint64_t kMaxArrayShown = 64;  // longer arrays (the tokenizer's) are shown by element type and length
 constexpr uint64_t kTextArrayItems = 8;  // text output shows the first few elements of an array
@@ -313,6 +316,7 @@ void print_json(const char* path, const gguf::File& f, bool list_tensors) {
 
 int inspect(int argc, char** argv) {
     bool list_tensors = false, header_only = false, json = false;
+    const char* export_dir = nullptr;
     std::vector<const char*> paths;
     for (int i = 0; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -322,6 +326,8 @@ int inspect(int argc, char** argv) {
             header_only = true;
         } else if (arg == "--json") {
             json = true;
+        } else if (arg == "--export-tokenizer" && i + 1 < argc) {
+            export_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::fputs(kUsage, stdout);
             return 0;
@@ -332,9 +338,23 @@ int inspect(int argc, char** argv) {
             paths.push_back(argv[i]);
         }
     }
-    if (paths.empty()) {
+    if (paths.empty() || (export_dir != nullptr && (paths.size() != 1 || list_tensors || json))) {
         std::fputs(kUsage, stderr);
         return 2;
+    }
+    if (export_dir != nullptr) {
+        try {
+            const gguf::TokenizerCounts n = gguf::export_tokenizer(gguf::File::open(paths[0], header_only), export_dir);
+            std::printf(
+                "wrote %s/tokenizer.json (%s BPE tokens, %s added tokens, %s merges; %s unused ids left out) "
+                "and %s/chat_template.jinja (%s bytes)\n",
+                export_dir, with_commas(n.vocab).c_str(), with_commas(n.added).c_str(), with_commas(n.merges).c_str(),
+                with_commas(n.unused).c_str(), export_dir, with_commas(n.template_bytes).c_str());
+            return 0;
+        } catch (const Error& e) {
+            std::fprintf(stderr, "torch inspect: %s\n", e.what());
+            return 1;
+        }
     }
 
     for (size_t i = 0; i < paths.size(); ++i) {

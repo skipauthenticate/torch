@@ -297,7 +297,7 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const int v = v4 * 4 + e;
-            float x = elements[e];
+            float x = params.vocab_used > 0 && v >= params.vocab_used ? -INFINITY : elements[e];
             int n = base_counts[e];
             for (int j = 0; j < column; ++j)
                 n += drafts[j] == v;

@@ -1,5 +1,6 @@
 #include "model/config.h"
 
+#include <algorithm>
 #include <numeric>
 #include <string>
 
@@ -84,6 +85,10 @@ Config Config::read(const gguf::File& f) {
     const gguf::TensorInfo* embd = f.tensor("token_embd.weight");
     expect(embd != nullptr && embd->n_dims == 2 && embd->shape[0] == c.n_embd, "token_embd.weight");
     c.n_vocab = static_cast<int>(embd->shape[1]);
+    c.n_vocab_used = c.n_vocab;
+    if (const auto types = f.get<std::vector<int32_t>>("tokenizer.ggml.token_type"))
+        for (size_t v = std::min(types->size(), static_cast<size_t>(c.n_vocab)); v > 0 && (*types)[v - 1] == 5; --v)
+            c.n_vocab_used = static_cast<int>(v - 1);
 
     // The shapes the kernels are written for (src/kernels/*/ headers).
     expect(c.head_dim == 256 && c.n_head % c.n_head_kv == 0 && c.n_rot % 2 == 0 && c.n_rot <= c.head_dim,

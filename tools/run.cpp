@@ -24,7 +24,7 @@
 #include "core/placement.h"
 #include "model/draft.h"
 #include "model/model.h"
-#include "model/window_policy.h"
+#include "runtime/generator.h"
 
 namespace torch {
 namespace {
@@ -37,6 +37,13 @@ constexpr const char* kUsage =
     "\n"
     "  --tokens LIST   comma-separated prompt token ids, or @FILE to read them from FILE\n"
     "  -n N            tokens to generate after the prompt (default 16)\n"
+    "  --stop-ids LIST stop generating after any of these token ids (comma-separated; it is kept)\n"
+    "  --temperature T, --top-k K, --top-p P, --min-p P, --repetition-penalty R, --presence-penalty P,\n"
+    "  --frequency-penalty F, --seed S\n"
+    "                  sample instead of the greedy argmax (kernels/sampling/sample.h; temperature 1.0, top-k and "
+    "top-p off\n"
+    "                  unless given, a random seed when none is); the same seed gives the same tokens with and\n"
+    "                  without --spec; penalties count this request's generated tokens only\n"
     "  --then LIST     another request after the first (repeatable): when its prompt extends the sequence so far,\n"
     "                  only its new tokens are fed (with --prefill, from the end of the last prefill: the tokens\n"
     "                  generated since are prefilled again with them); otherwise the sequence starts again\n"
@@ -240,6 +247,7 @@ int run(int argc, char** argv) {
     std::optional<std::filesystem::path> shard1;
     std::vector<int32_t> prompt;
     std::vector<std::vector<int32_t>> turns;  // the requests after the first (--then)
+    std::vector<int32_t> stop_ids;            // generation stops after any of these (--stop-ids)
     int cancel_after = 0;                     // generated windows before Model::cancel() (tests); 0: never
     int cancel_prompt_after = 0;              // the first request's prompt windows or chunks before it (tests)
     int generate = 16, top = 5, window = 1, keep = model::kMaxColumns, accept_from = 0;
@@ -249,6 +257,9 @@ int run(int argc, char** argv) {
     std::FILE* logits_file = nullptr;
     std::FILE* json_file = nullptr;
     int draft_depth = 3, spec = 0, swap_prompt = -1;
+    bool sample = false;  // any sampling option given: sampled instead of greedy
+    kernels::SamplingParams sampling;
+    std::optional<uint64_t> seed;
     std::string spec_policy = "adaptive-stop";
     bool check_kv = false;
     std::filesystem::path draft_path, report_path;
@@ -277,6 +288,8 @@ int run(int argc, char** argv) {
                 prompt = tokens_of(value());
             } else if (arg == "--then") {
                 turns.push_back(tokens_of(value()));
+            } else if (arg == "--stop-ids") {
+                stop_ids = parse_tokens(value());
             } else if (arg == "--cancel-after") {
                 cancel_after = parse_count(value(), "--cancel-after", 1);
             } else if (arg == "--cancel-prompt-after") {
@@ -335,6 +348,30 @@ int run(int argc, char** argv) {
                 options.swaps_per_window = parse_count(value(), "--swap", 0);
             } else if (arg == "--swap-prompt") {
                 swap_prompt = parse_count(value(), "--swap-prompt", 0);
+            } else if (arg == "--temperature" || arg == "--top-p" || arg == "--min-p" ||
+                       arg == "--repetition-penalty" || arg == "--presence-penalty" || arg == "--frequency-penalty") {
+                char* end = nullptr;
+                const char* text = value();
+                const float v = std::strtof(text, &end);
+                if (*end != '\0' || !std::isfinite(v) || v < 0.0f)
+                    throw Error(std::string(arg) + " takes a number of at least 0.");
+                (arg == "--temperature"          ? sampling.temperature
+                 : arg == "--top-p"              ? sampling.top_p
+                 : arg == "--min-p"              ? sampling.min_p
+                 : arg == "--repetition-penalty" ? sampling.repetition_penalty
+                 : arg == "--presence-penalty"   ? sampling.presence_penalty
+                                                 : sampling.frequency_penalty) = v;
+                sample = true;
+            } else if (arg == "--top-k") {
+                sampling.top_k = parse_count(value(), "--top-k", 0);
+                sample = true;
+            } else if (arg == "--seed") {
+                char* end = nullptr;
+                const char* text = value();
+                seed = std::strtoull(text, &end, 10);
+                if (*end != '\0' || *text == '-')
+                    throw Error("--seed takes a whole number.");
+                sample = true;
             } else if (arg == "--spec-policy") {
                 spec_policy = value();
                 if (spec_policy != "fixed" && spec_policy != "adaptive" && spec_policy != "adaptive-stop")
@@ -404,88 +441,49 @@ int run(int argc, char** argv) {
         std::printf("loaded in %.1f s; MemAvailable now %.2f GiB\n\n", load_s,
                     static_cast<double>(mem_available()) / static_cast<double>(kGiB));
 
+        runtime::Generator gen(m, draft.get(), static_cast<int>(variants.size()), options.prefill_columns);
         std::vector<int32_t> sequence;
         RouteCounts routes_at_prompt_end{};
         for (size_t turn = 0; turn < turns.size(); ++turn) {
-            // A request whose prompt extends the sequence so far (the tokens fed to the model) feeds only its new
-            // tokens; any other prompt starts a new sequence.
             prompt = turns[turn];
-            size_t resume_at = 0;  // the first position this request feeds
-            if (turn > 0) {
-                // Sessions, option B: with --prefill, back to the end of the last prefill, so the tokens fed since
-                // (generated ones, and a speculative window's columns past the sequence) are prefilled again with the
-                // new ones, as a fresh prefill of the whole prompt would feed them.
-                const size_t fed = static_cast<size_t>(m.position());
-                const bool back = options.prefill_columns > 0 && m.prefill_end() >= 0;
-                const size_t from = back ? static_cast<size_t>(m.prefill_end()) : fed;
-                if (from <= sequence.size() && from < prompt.size() &&
-                    std::equal(sequence.begin(), sequence.begin() + static_cast<std::ptrdiff_t>(from), prompt.begin()))
-                    resume_at = from;
-                else
-                    m.reset();
-                if (resume_at > 0 && back) {
-                    m.rewind();
-                    std::printf(
-                        "\nback to the end of the last prefill at position %zu: the %zu tokens fed since are "
-                        "dropped\n",
-                        resume_at, fed - resume_at);
-                }
-                if (resume_at == 0 && options.lend_from > 0)
-                    std::printf("\nafter the reset, %d experts in the KV cache's lent tail\n",
-                                m.expert_stats().tenants);
-                std::printf("\nturn %zu: %zu new prompt tokens after %zu already in the sequence\n", turn + 1,
-                            prompt.size() - resume_at, resume_at);
-            }
-            sequence = prompt;
-            const model::ExpertStats at_turn_start = m.expert_stats();
-            model::ExpertStats at_prompt_end{};  // expert hits and misses when the prompt was in
+            runtime::Request request;
+            request.prompt = prompt;
+            request.max_tokens = generate;
+            request.stop_ids = stop_ids;
+            request.spec = spec;
+            request.policy = spec_policy;
+            request.draft_depth = draft_depth;
+            request.swaps_after_prompt = swap_generate;  // --swap-prompt sets the prompt's windows apart
+            request.window = window, request.keep = keep, request.accept_from = accept_from;
+            request.cancel_after = cancel_after;
+            request.sample = sample, request.sampling = sampling, request.seed = seed;
+            request.cancel_prompt_after = turn == 0 ? cancel_prompt_after : 0;
+            model::ExpertStats at_turn_start{}, at_prompt_end{};  // expert hits and misses when the prompt was in
             model::DecodeTimes times_at_prompt_end{};
-            // The prompt's routing predicts the generation's poorly (code in, English out), so --route-counts records
-            // only the generated tokens: the counts when the prompt was in are subtracted at the end.
-            double decode_ms = 0;
-            int decoded = 0, prompt_steps = 0;
-            const size_t n_variants = drafting ? variants.size() : 0;
-            std::vector<Acceptance> acceptance(n_variants, Acceptance(draft_depth));
-            std::vector<std::vector<std::vector<model::Drafted>>> drafts(n_variants);  // [variant][generated step]
-            std::vector<model::Drafted> scratch;
-            const auto prompt_start = Clock::now();
-            double prompt_s = 0;     // the prompt's windows, the draft layer's passes over them included
-            bool cancelled = false;  // Model::cancel() stopped the request between windows
-            for (size_t i = resume_at; i < sequence.size();) {
-                // Prompt tokens are known, so they go `window` at a time, keeping `keep` of each window (or in prefill
-                // chunks of up to --prefill tokens, kept whole); generated tokens go one at a time.
-                const bool chunked = options.prefill_columns > 0 && i < prompt.size();
-                const size_t width =
-                    chunked ? std::min<size_t>(static_cast<size_t>(options.prefill_columns), prompt.size() - i)
-                    : i < prompt.size() ? std::min<size_t>(static_cast<size_t>(window), prompt.size() - i)
-                                        : 1;
-                const size_t kept = chunked || i < static_cast<size_t>(accept_from)
-                                        ? width
-                                        : std::min<size_t>(width, static_cast<size_t>(keep));
-                const auto start = Clock::now();
-                const std::span<const int32_t> tokens = std::span<const int32_t>(sequence).subspan(i, width);
-                if (!(chunked ? m.prefill(tokens) : m.verify(tokens))) {
-                    if (!m.cancelled())
-                        throw Error(m.error());
-                    cancelled = true;
-                    break;
+            runtime::Observer observer;
+            observer.on_start = [&](const runtime::Resume& resume) {
+                if (turn > 0) {
+                    if (resume.rewound)
+                        std::printf(
+                            "\nback to the end of the last prefill at position %zu: the %zu tokens fed since are "
+                            "dropped\n",
+                            resume.at, resume.fed - resume.at);
+                    if (resume.at == 0 && options.lend_from > 0)
+                        std::printf("\nafter the reset, %d experts in the KV cache's lent tail\n",
+                                    m.expert_stats().tenants);
+                    std::printf("\nturn %zu: %zu new prompt tokens after %zu already in the sequence\n", turn + 1,
+                                prompt.size() - resume.at, resume.at);
                 }
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-                if (i >= prompt.size()) {  // generated tokens only: the speed of decoding, not of feeding the prompt
-                    decode_ms += ms;
-                    if (++decoded == cancel_after)
-                        m.cancel();
-                } else if (turn == 0 && ++prompt_steps == cancel_prompt_after) {
-                    m.cancel();
-                }
-                int32_t next = -1;
-                for (size_t t = chunked ? kept - 1 : 0; t < kept; ++t) {  // a chunk has its last position's results
-                    const size_t at = i + t;
-                    const int column = chunked ? 0 : static_cast<int>(t);
-                    if (!quiet) {
-                        const std::span<const float> logits = m.logits(column);
+                at_turn_start = m.expert_stats();
+            };
+            if (!quiet)
+                observer.on_window = [&](size_t i, size_t kept, size_t width, bool chunked, double ms) {
+                    const std::vector<int32_t>& seq = gen.sequence();
+                    for (size_t t = chunked ? kept - 1 : 0; t < kept; ++t) {  // a chunk has its last position's
+                        const size_t at = i + t;
+                        const std::span<const float> logits = m.logits(chunked ? 0 : static_cast<int>(t));
                         const std::vector<Top> best = top_k(logits, top);
-                        std::printf("pos %4zu  in %6d  ->", at, sequence[at]);
+                        std::printf("pos %4zu  in %6d  ->", at, seq[at]);
                         for (const Top& top_entry : best)
                             std::printf("  %6d %8.4f", top_entry.token, top_entry.logprob);
                         std::printf("   (%.1f ms%s)\n", ms,
@@ -495,156 +493,53 @@ int run(int argc, char** argv) {
                         if (logits_file)
                             std::fwrite(logits.data(), sizeof(float), logits.size(), logits_file);
                         if (json_file) {
-                            std::fprintf(json_file, "{\"pos\": %zu, \"token\": %d, \"top\": [", at, sequence[at]);
+                            std::fprintf(json_file, "{\"pos\": %zu, \"token\": %d, \"top\": [", at, seq[at]);
                             for (size_t j = 0; j < best.size(); ++j)
                                 std::fprintf(json_file, "%s[%d, %.7g]", j ? ", " : "", best[j].token, best[j].logprob);
                             std::fprintf(json_file, "]}\n");
                         }
                     }
-                    if (at + 1 == sequence.size())
-                        next = m.argmax(column);  // greedy: the GPU's argmax, ties to the lowest id
-                }
-                // The draft layer over the window's kept positions i .. i + kept - 1: the KV-only pass at prompt
-                // positions whose next token is known, then drafts from the argmax at the last position while tokens
-                // are still to be generated (the KV-only pass at the window's other positions in the same call). A
-                // chunk's positions go kMaxColumns at a time, each group's residuals staged into the window columns.
-                for (size_t v = 0; v < n_variants; ++v)
-                    for (size_t g = 0; g < kept; g += static_cast<size_t>(model::kMaxColumns)) {
-                        const size_t at = i + g, count = std::min<size_t>(kept - g, model::kMaxColumns);
-                        const bool kv_only = at + count < prompt.size();
-                        if (!kv_only && sequence.size() >= prompt.size() + static_cast<size_t>(generate))
-                            break;
-                        if (chunked)
-                            m.stage_residuals(static_cast<int>(g), static_cast<int>(count));
-                        const auto draft_start = Clock::now();
-                        const int position = static_cast<int>(at);
-                        if (kv_only) {
-                            draft->run(static_cast<int>(v), position, std::span(&prompt[at + 1], count), 0, scratch);
-                        } else {
-                            std::vector<int32_t> after(sequence.begin() + static_cast<std::ptrdiff_t>(at + 1),
-                                                       sequence.begin() + static_cast<std::ptrdiff_t>(at + count));
-                            after.push_back(next);
-                            draft->run(static_cast<int>(v), position, after, draft_depth, drafts[v].emplace_back());
-                        }
-                        const double draft_ms =
-                            std::chrono::duration<double, std::milli>(Clock::now() - draft_start).count();
-                        Acceptance& a = acceptance[v];
-                        (kv_only ? a.kv_ms : a.draft_ms) += draft_ms;
-                        if (kv_only)
-                            a.kv_positions += static_cast<int>(count);
-                        else
-                            ++a.draft_steps;
-                    }
-                if (kept < width && !m.accept(static_cast<int>(kept)))
-                    throw Error(m.error());
-                i += kept;
-                if (i == prompt.size()) {  // the prompt is in (once): count the generation's misses and swaps from here
-                    prompt_s = std::chrono::duration<double>(Clock::now() - prompt_start).count();
-                    at_prompt_end = m.expert_stats();
-                    times_at_prompt_end = m.decode_times();
-                    if (!route_counts_path.empty())
-                        routes_at_prompt_end = m.route_counts();
-                    m.set_swaps_per_window(swap_generate);
-                }
-                if (next >= 0 && i == sequence.size() && sequence.size() >= prompt.size() &&
-                    sequence.size() < prompt.size() + static_cast<size_t>(generate))
-                    sequence.push_back(next);
-                if (spec > 0 && i >= prompt.size())
-                    break;  // the speculative loop below generates the rest
-            }
-
-            // Speculative greedy decoding: a window of the last token and the drafts, keeping its first n tokens, where
-            // n - 1 drafts equal the model's own argmax before them (stopping at an end of sequence); the window's n
-            // argmaxes are the new tokens. The draft layer then extends over the kept positions (KV-only but the last)
-            // and drafts again from the last one.
-            double verify_ms = 0, extend_ms = 0, spec_ms = 0;
-            int windows = 0, window_tokens = 0, verified_drafts = 0,
-                extended = -1;  // the last position the draft layer extended over
-            if (spec > 0 && sequence.size() > prompt.size() && !cancelled) {
-                const auto spec_start = Clock::now();
-                const size_t total = prompt.size() + static_cast<size_t>(generate);
-                const bool adaptive = spec_policy != "fixed", stop_early = spec_policy == "adaptive-stop";
-                // Seed costs of a window of d drafts (milliseconds, drafting included): about 16 ms per verified column
-                // after ~50 ms (measured with D = 3 on the review prompts, 96 ms a window); the policy follows the
-                // observed times from there.
-                std::vector<double> seed_costs;
-                for (int k = 0; k <= spec; ++k)
-                    seed_costs.push_back(50.0 + 16.0 * k);
-                model::WindowPolicy policy(spec, seed_costs);
-                const std::function<bool(int, float)> more = [&](int drafted, float prob) {
-                    return policy.more(drafted, prob);
                 };
-                std::vector<model::Drafted> d = drafts[0].back();
-                std::vector<int32_t> win, a(static_cast<size_t>(spec) + 1);
-                while (sequence.size() < total) {
-                    const int p = m.position();            // the window's first position, that of sequence.back()
-                    int use = static_cast<int>(d.size());  // drafts to verify
-                    if (adaptive) {
-                        for (size_t j = 0; j < d.size(); ++j)
-                            policy.more(static_cast<int>(j) + 1, d[j].prob);  // records the probabilities
-                        use = policy.width();
-                    }
-                    win.assign(1, sequence.back());
-                    for (int j = 0; j < use; ++j)
-                        win.push_back(d[static_cast<size_t>(j)].token);
-                    const auto verify_start = Clock::now();
-                    if (!m.verify(win)) {
-                        if (!m.cancelled())
-                            throw Error(m.error());
-                        cancelled = true;
-                        break;
-                    }
-                    for (int t = 0; t <= use; ++t)
-                        a[static_cast<size_t>(t)] = m.argmax(t);
-                    int n = 1;
-                    while (n <= use && d[static_cast<size_t>(n - 1)].token == a[static_cast<size_t>(n - 1)] &&
-                           a[static_cast<size_t>(n - 1)] != static_cast<int32_t>(m.config().eos_token))
-                        ++n;
-                    if (n <= use && !m.accept(n))
+            // The prompt's routing predicts the generation's poorly (code in, English out), so --route-counts records
+            // only the generated tokens: the counts when the prompt was in are subtracted at the end.
+            observer.on_prompt_end = [&] {
+                at_prompt_end = m.expert_stats();
+                times_at_prompt_end = m.decode_times();
+                if (!route_counts_path.empty())
+                    routes_at_prompt_end = m.route_counts();
+            };
+            const runtime::Result res = gen.generate(request, observer);
+            sequence = res.sequence;
+            const bool cancelled = res.cancelled;
+            const double prompt_s = res.prompt_s, decode_ms = res.decode_ms;
+            const int decoded = res.decoded, windows = res.windows, extended = res.extended;
+            const size_t n_variants = res.variants.size();
+            std::vector<Acceptance> acceptance(n_variants, Acceptance(draft_depth));
+            for (size_t v = 0; v < n_variants; ++v) {
+                const runtime::DraftStats& st = res.variants[v];
+                acceptance[v].kv_ms = st.kv_ms, acceptance[v].draft_ms = st.draft_ms;
+                acceptance[v].kv_positions = st.kv_positions, acceptance[v].draft_steps = st.draft_steps;
+            }
+            std::vector<model::Drafted> scratch;
+            const int ring = std::min(options.context, model::kDraftWindow);
+            if (check_kv && extended >= 0 && extended + 1 + spec > ring) {
+                std::printf("draft K/V check skipped: %d positions pass the draft's ring of %d rows\n",
+                            extended + 1 + spec, ring);
+            } else if (check_kv && extended >= 0) {  // the K/V invariant: decode the history again, one at a time
+                m.reset();
+                for (int q = 0; q <= extended; ++q) {
+                    if (!m.decode(sequence[static_cast<size_t>(q)]))
                         throw Error(m.error());
-                    const double this_verify_ms =
-                        std::chrono::duration<double, std::milli>(Clock::now() - verify_start).count();
-                    verify_ms += this_verify_ms;
-                    if (++windows == cancel_after)
-                        m.cancel();
-                    window_tokens += n, verified_drafts += use;
-                    sequence.insert(sequence.end(), a.begin(), a.begin() + n);
-                    const auto extend_start = Clock::now();
-                    if (sequence.size() < total) {
-                        draft->run(0, p, std::span(a.data(), static_cast<size_t>(n)), spec, d,
-                                   stop_early ? more : std::function<bool(int, float)>());
-                        extended = p + n - 1;
-                    } else if (turn + 1 < turns.size()) {  // the next turn's drafts see these positions too
-                        draft->run(0, p, std::span(a.data(), static_cast<size_t>(n)), 0, scratch);
-                    }
-                    const double this_extend_ms =
-                        std::chrono::duration<double, std::milli>(Clock::now() - extend_start).count();
-                    extend_ms += this_extend_ms;
-                    if (adaptive)
-                        policy.observe(use, n - 1, this_verify_ms + this_extend_ms);
+                    draft->run(1, q, std::span(&sequence[static_cast<size_t>(q) + 1], 1), 0, scratch);
                 }
-                sequence.resize(std::min(sequence.size(), total));
-                spec_ms = std::chrono::duration<double, std::milli>(Clock::now() - spec_start).count();
-                const int ring = std::min(options.context, model::kDraftWindow);
-                if (check_kv && extended >= 0 && extended + 1 + spec > ring) {
-                    std::printf("draft K/V check skipped: %d positions pass the draft's ring of %d rows\n",
-                                extended + 1 + spec, ring);
-                } else if (check_kv && extended >= 0) {  // the K/V invariant: decode the history again, one at a time
-                    m.reset();
-                    for (int q = 0; q <= extended; ++q) {
-                        if (!m.decode(sequence[static_cast<size_t>(q)]))
-                            throw Error(m.error());
-                        draft->run(1, q, std::span(&sequence[static_cast<size_t>(q) + 1], 1), 0, scratch);
-                    }
-                    const int same = draft->first_kv_difference(0, 1, extended + 1);
-                    const int beyond = draft->first_kv_difference(0, 1, std::min(extended + 1 + spec, options.context));
-                    std::printf(
-                        "draft K/V after %d windows: rows 0-%d %s a fresh KV-only pass over the accepted history "
-                        "(first difference including the %d rows after them: row %d)\n",
-                        windows, extended, same < 0 ? "equal, bit for bit," : "DIFFER from", spec, beyond);
-                    if (same >= 0)
-                        throw Error("The draft K/V differs from a fresh pass at row " + std::to_string(same) + ".");
-                }
+                const int same = draft->first_kv_difference(0, 1, extended + 1);
+                const int beyond = draft->first_kv_difference(0, 1, std::min(extended + 1 + spec, options.context));
+                std::printf(
+                    "draft K/V after %d windows: rows 0-%d %s a fresh KV-only pass over the accepted history "
+                    "(first difference including the %d rows after them: row %d)\n",
+                    windows, extended, same < 0 ? "equal, bit for bit," : "DIFFER from", spec, beyond);
+                if (same >= 0)
+                    throw Error("The draft K/V differs from a fresh pass at row " + std::to_string(same) + ".");
             }
 
             if (quiet) {  // the generated ids, so a run's output can be compared and hashed
@@ -672,8 +567,12 @@ int run(int argc, char** argv) {
                         static_cast<unsigned long long>(at_prompt_end.misses - at_turn_start.misses),
                         static_cast<unsigned long long>(at_prompt_end.prefill_reads - at_turn_start.prefill_reads));
             }
-            std::printf("\nprompt %zu tokens, generated %d%s", prompt.size(),
-                        static_cast<int>(sequence.size() - prompt.size()), cancelled ? " (cancelled)" : "");
+            const int generated =
+                sequence.size() > prompt.size() ? static_cast<int>(sequence.size() - prompt.size()) : 0;
+            std::printf("\nprompt %zu tokens, generated %d%s%s", prompt.size(), generated,
+                        cancelled ? " (cancelled)" : "", res.stopped ? " (stopped at a stop id)" : "");
+            if (res.stopped)
+                std::printf("; the stop id was token %d of its window's %d", res.stop_column + 1, res.stop_window);
             if (decoded > 0)
                 std::printf(": %.2f tok/s (%.1f ms per token)", 1000.0 * decoded / decode_ms, decode_ms / decoded);
             std::printf(
@@ -693,20 +592,27 @@ int run(int argc, char** argv) {
                 throw Error("Cannot write " + report_path.string() + ".");
             if (spec > 0 && windows > 0) {
                 const double first = acceptance[0].draft_ms;  // the drafts after the prompt's last token
-                const double gen_ms = spec_ms + first;
+                const double gen_ms = res.spec_ms + first;
                 std::printf(
                     "speculative (%s): %zu tokens in %d windows of the last token and up to %d drafts, %.2f verified "
                     "on "
                     "average: %.2f tokens per window, "
                     "%.2f tok/s (%.1f ms per window: verify and accept %.1f, draft %.1f, host %.1f)\n",
-                    spec_policy.c_str(), static_cast<size_t>(generate), windows, spec,
-                    static_cast<double>(verified_drafts) / windows, static_cast<double>(window_tokens) / windows,
-                    1000.0 * generate / gen_ms, spec_ms / windows, verify_ms / windows, (extend_ms + first) / windows,
-                    (spec_ms - verify_ms - extend_ms) / windows);
+                    spec_policy.c_str(), static_cast<size_t>(generated), windows, spec,
+                    static_cast<double>(res.verified_drafts) / windows,
+                    static_cast<double>(res.window_tokens) / windows, 1000.0 * generated / gen_ms,
+                    res.spec_ms / windows, res.verify_ms / windows, (res.extend_ms + first) / windows,
+                    (res.spec_ms - res.verify_ms - res.extend_ms) / windows);
+                std::printf("speculative acceptance by depth (accepted / verified with the earlier drafts accepted):");
+                for (size_t j = 0; j < res.depth_tried.size(); ++j)
+                    std::printf(" %d/%d", res.depth_accepted[j], res.depth_tried[j]);
+                std::printf("\n");
             }
+            if (sample)
+                std::printf("sampled: seed %llu\n", static_cast<unsigned long long>(res.seed));
             for (size_t v = 0; v < n_variants && spec == 0; ++v) {
                 Acceptance& a = acceptance[v];
-                a.count(drafts[v], sequence, prompt.size() - 1);
+                a.count(res.variants[v].drafts, sequence, prompt.size() - 1);
                 const std::string name = variant_name(variants[v]);
                 std::printf("draft %s: %d steps of %d drafts; accepted at each depth, given the earlier ones:",
                             name.c_str(), a.steps, draft_depth);

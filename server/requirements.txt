@@ -1,0 +1,11 @@
+# torch_server's dependencies (architecture decision 13), Python 3.12 on Linux x86-64 and arm64; also what the tokenizer
+# and server tests use. Installed with `pip install --no-deps --require-hashes -r`: the tokenizer reads a local file,
+# so tokenizers' declared hub client (and its 15 dependencies) is not installed.
+tokenizers==0.23.3 \
+    --hash=sha256:376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87 \
+    --hash=sha256:ec82e80e65a862275b97c3d90b7a523df8d9519ee48aeb4e9625b2cc909274e0
+jinja2==3.1.6 \
+    --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+markupsafe==3.0.4 \
+    --hash=sha256:8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581 \
+    --hash=sha256:6a45c3d514f2436064db00d7fc8778d888f0236ebfed649b53d13a59e69ad51b

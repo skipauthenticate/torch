@@ -439,6 +439,59 @@ Per layer, us, the same runs:
   MemAvailable stayed at 6.73 GiB or above.
 - Measured from 2026-11-09 to 2026-11-13; the final numbers are at commit af82794.
 
+## M7: the C API, the server and sampling
+
+Measured on 2026-11-13 at f1e1b8b, in one session on the Orin, with the race's settings (the nine 4,096-token race
+prompts, `--context 262144`, `--prefill 4096`, `calib-g-spec.txt`, `--swap 32 --swap-prompt 0`, 256 tokens). Each
+request is its own process: per prompt, the frozen M6 binary (af82794), this build's `torch run` and a `torch_server`
+started for that one request, in turn. **The board's memory moved during the session**: another user's session was on
+the board, and the experts added after loading went from 0 (the M6 binary and `torch run` on review 1 and 2) to
+2,500-3,400 (every later run). Decode follows the resident count, about 1 tok/s per 1,000 experts, so compare within a
+row. Resident experts are at the end of the request (the server's from its `torch` field).
+
+Greedy and speculative, tok/s (resident experts):
+
+| Prompt | M6 binary | `torch run` | `torch_server` |
+| --- | ---: | ---: | ---: |
+| Review 1 | 26.09 (15,593) | 25.88 (15,616) | 25.64 (15,478) |
+| Review 2 | 25.77 (15,617) | 25.45 (15,610) | 29.93 (18,735) |
+| Review 3 | 31.33 (18,930) | 29.82 (18,020) | 30.23 (18,382) |
+| Prose 1 | 31.97 (18,901) | 31.07 (18,439) | 30.84 (17,726) |
+| Prose 2 | 31.23 (18,771) | 30.64 (18,505) | 30.80 (17,994) |
+| Prose 3 | 29.93 (18,922) | 30.07 (18,719) | 30.54 (18,598) |
+| Repetition 1 | 41.80 (18,504) | 41.06 (18,550) | 42.05 (18,810) |
+| Repetition 2 | 39.32 (18,931) | 43.61 (18,557) | 38.09 (17,998) |
+| Repetition 3 | 42.92 (18,629) | 43.16 (18,044) | 43.72 (18,067) |
+| **Median** review / prose / repetition | 26.09 / 31.23 / 41.80 | 25.88 / 30.64 / 43.16 | 29.93 / 30.80 / 42.05 |
+
+The ids of all 27 requests are equal, prompt by prompt, and equal the window path's of 2026-11-09. Where the resident
+counts are close the three are within 2% (prose 3, repetition 1 and 3); the medians differ by the residency swings
+(review). Prompts took 18.6-19.8 s.
+
+Sampled at the model file's defaults (temperature 1.0, top_k 20, top_p 0.95), `torch run`, seeds 1 and 2, speculative
+and one token at a time in turn; median of the 3 prompts x 2 seeds per workload, tok/s:
+
+| Workload | Speculative | One token at a time |
+| --- | ---: | ---: |
+| Review | 29.48 | 18.00 |
+| Prose | 28.93 | 21.85 |
+| Repetition | 42.11 | 19.43 |
+
+In every pair the speculative ids equal the one-token ids (18 pairs); 2,102-3,226 experts were added after loading
+(one run 1,155). The repetition pairs ran an hour later in the session, after a run of them was stopped at the 6 GiB
+MemAvailable floor. Sampled speculation is 1.3-2.2x one token at a time. Against greedy speculation in the same session
+at similar residency it is 1-7% lower on review (29.48 against 29.82-31.33) and prose (28.93 against 30.07-31.07) and
+about equal on repetition (42.11 against 41.06-43.61).
+
+Thinking on (the template's default, `reasoning_effort` left out of the race request bodies), through the server,
+seed 1, 256 tokens, all of them reasoning: speculative 24.81 / 28.11 / 28.02 tok/s against one token at a time 23.30 /
+24.51 / 24.60 on review 1, prose 1 and repetition 1 (17,410 resident), ids equal; 2.52 / 1.95 / 1.84 tokens per
+window. The gain (6-15%) is smaller than with thinking off.
+
+`tools/check_orin.sh` at f1e1b8b: unit and kernel parity tests, model parity (mean KL 0.00211), graph = eager and the
+residency identity pass; the kernel gates carried from M3 are missed (35 launch classes of 1 MiB or more below 85% of
+the ceiling, launches under 1 MiB 2.30 ms against 2). `ctest`: every unit and parity test passes.
+
 ## Targets
 
 Speed numbers are **goals**. The **gates** a milestone must pass are its correctness checks and bandwidth checks in

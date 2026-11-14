@@ -41,6 +41,9 @@ struct Config {
     std::vector<uint64_t> ple_multipliers, ple_head_offsets, ple_head_vocab;
 
     uint32_t eos_token = 0;
+    // Tokens a sampler may draw: the vocabulary without its trailing unused ids (tokenizer.ggml.token_type 5), the
+    // padding of the embedding and output rows (248,077 of 248,320 here). n_vocab when the file has no token types.
+    int n_vocab_used = 0;
 
     bool recurrent(int layer) const noexcept { return (layer + 1) % full_attention_interval != 0; }
     int ple_heads() const noexcept { return (ple_ngram - 1) * ple_heads_per_ngram; }

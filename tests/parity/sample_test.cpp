@@ -208,6 +208,34 @@ void check_certain_and_impossible() {
     std::printf("%-52s %s\n", "top_k 5, a draft with p = 0: always rejected", never ? "ok" : "FAIL");
 }
 
+// Tokens at or above vocab_used are never drawn, even when they hold the largest logits: greedy picks the best token
+// below it, and over 200 seeds with temperature 2 no draw reaches the masked ids.
+void check_vocab_used() {
+    Window w = make_window(3000, 2, 13);
+    for (int c = 0; c < 2; ++c)
+        for (int v = 2992; v < 3000; ++v)
+            w.logits[static_cast<size_t>(c) * 3000 + v] = 40.0f;  // the padding rows' logits, the largest
+    w.drafts = {7};
+    DeviceBuffer<float> dl(w.logits.size());
+    DeviceBuffer<int32_t> dc(w.counts.size()), dd(w.drafts.size());
+    upload_all(w, dl, dc, dd);
+    SamplingParams p;
+    p.vocab_used = 2992;
+    p.temperature = 0.0f;
+    std::vector<float> col0 = column_logits(w, 0);
+    col0.resize(2992);
+    const bool greedy = run(w, p, 5, dl, dc, dd).sampled[0] == argmax_lowest(col0);
+    p.temperature = 2.0f;
+    bool below = true;
+    for (uint64_t seed = 1; seed <= 200; ++seed) {
+        p.seed = seed;
+        const Outcome out = run(w, p, 5, dl, dc, dd);
+        below = below && out.sampled[0] < 2992 && out.sampled[1] < 2992;
+    }
+    CHECK(greedy && below);
+    std::printf("%-52s %s\n", "vocab_used: padding ids never drawn", greedy && below ? "ok" : "FAIL");
+}
+
 // ---- Statistics --------------------------------------------------------------------------------------------------
 
 // Chi-square of observed counts against expected probabilities; bins with fewer than 5 expected are pooled. Returns
@@ -331,6 +359,7 @@ int main() {
     try {
         check_greedy();
         check_certain_and_impossible();
+        check_vocab_used();
         SamplingParams plain;
         plain.temperature = 1.3f;
         check_statistics("temperature 1.3", plain, 400, 30000);
