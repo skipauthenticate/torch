@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-14
+
 ### Added
 
 - `scripts/install.sh` (M7, docs/install.md): checks the Orin, builds into a prefix, makes the server's environment,
@@ -16,7 +18,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `GET /v1/models`, `GET /health` over the C API; the model's own template in a sandbox; thinking as
   `reasoning_content`; stop strings across windows; sessions with `cached_tokens`; cancel when the client goes, also
   during the prompt; one engine thread and a queue. CI tests it against a stub of the C API on x86-64 and arm64.
-- Milestone M7, first release (in progress):
+- Milestone M7, first release:
   - The generation loop is a library class, `runtime::Generator` (`src/runtime/generator.h`): the prompt in prefill
     chunks or windows, one-token and speculative greedy decoding, sessions, cancel, and stops on max tokens, stop ids
     or a caller callback. `torch run` is a command line over it, with the same output; `--stop-ids` stops after any
