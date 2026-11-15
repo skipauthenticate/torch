@@ -47,6 +47,9 @@ struct Budget {
     uint64_t reserved() const noexcept;                                        // sum of the reservations
     uint64_t room() const noexcept { return available - floor - reserved(); }  // for resident experts
     uint64_t left() const noexcept { return room() - resident_bytes; }
+    // What the placement at start fills: it keeps kTopUpMargin free as well, so a start whose reservations were exact
+    // ends at the floor plus the margin rather than on the floor; the top-up after loading fills the rest.
+    uint64_t placement_room() const noexcept { return room() > kTopUpMargin ? room() - kTopUpMargin : 0; }
     std::string table() const;  // one line per item, as the engine prints it
 };
 

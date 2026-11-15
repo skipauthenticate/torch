@@ -124,7 +124,8 @@ with `O_DIRECT`, so the page cache does not compete for the same memory. The res
 40 GiB also frees page cache and idle memory that MemAvailable did not count at start (on the development Orin
 MemAvailable fell 37.5 GiB for a planned 45 GiB [M3]), so after loading the engine reads MemAvailable again and makes
 the next-ranked experts resident until it is down to the floor plus 1.5 GiB (except with `--resident`, which tests use
-to fix residency exactly).
+to fix residency exactly). The placement at start keeps that 1.5 GiB free as well, so a start whose estimates were
+exact also ends at the floor plus 1.5 GiB rather than on the floor.
 
 ### 2. Columns: 1 to 8, each bitwise the one-column result
 
