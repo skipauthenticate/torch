@@ -24,29 +24,44 @@ tokens.
 Measured on the Orin on 2026-11-15. Each workload is three requests with 4,096-token prompts, a 262,144-token context
 and 256 generated tokens, all nine sent to one server process. Medians, greedy.
 
-| Workload | Answer speed | Prompt processing | 4,096-token prompt |
+| Workload | Answer speed | Prompt processing (default) | Prompt processing (`--fast-prefill`) |
 | --- | ---: | ---: | ---: |
-| Code review | 35.7 tokens/s | about 285 tokens/s | 14.3 s |
-| Writing | 33.6 tokens/s | about 270 tokens/s | 15.1 s |
-| Repetitive text | 52.3 tokens/s | about 275 tokens/s | 15.0 s |
+| Code review | 37.7 tokens/s | 288 tokens/s (14.2 s) | 387 tokens/s (10.6 s) |
+| Writing | 33.8 tokens/s | 274 tokens/s (15.0 s) | 359 tokens/s (11.4 s) |
+| Repetitive text | 52.7 tokens/s | 273 tokens/s (15.0 s) | 359 tokens/s (11.4 s) |
 
-With the opt-in `--fast-prefill`, the 4,096-token prompt takes about 10.6 s for code review and 11.5 s for the other
-two; answers can then differ slightly from the default exact path.
+The times in brackets are for the whole 4,096-token prompt, which is the wait before the first answer token.
+
+### Why `--fast-prefill` is off by default
+
+`--fast-prefill` reads the prompt about a quarter faster by running its BF16 matrix products on the GPU's tensor
+cores. To do that it rounds the prompt's activations to BF16 first, and that rounding has costs:
+
+- **Answers can change.** The numbers inside the model come out slightly different. In the measurement above, 7 of
+  the 9 answers differed from the default's at some token, often one where two choices were nearly tied.
+- **No exact match with the default path.** By default, reading a prompt in chunks gives bit for bit the same result
+  as feeding it one token at a time, at the model file's own precision. With `--fast-prefill` it does not. Its
+  results are still the same from run to run and at any chunk size.
+- **Less tested.** Prompts of 32K tokens or more, and sampled (non-greedy) answers, have not been checked with it.
+
+Quality stays inside the project's parity limit against the reference implementation either way (mean KL 0.00158 with
+the flag and 0.00211 without, against a limit of 0.0041). Answer speed is the same with or without the flag.
 
 <details>
 <summary><b>More numbers</b></summary>
 
 | Same settings | Code review | Writing | Repetitive text |
 | --- | ---: | ---: | ---: |
-| This release, answer speed | 35.7 | 33.6 | 52.3 |
+| This release, answer speed | 37.7 | 33.8 | 52.7 |
 | v0.1.0, answer speed (2026-11-13) | 31.9 | 32.5 | 46.2 |
-| This release, 4,096-token prompt | 14.3 s | 15.1 s | 15.0 s |
+| This release, 4,096-token prompt | 14.2 s | 15.0 s | 15.0 s |
+| This release, 4,096-token prompt with `--fast-prefill` | 10.6 s | 11.4 s | 11.4 s |
 | v0.1.0, 4,096-token prompt | about 19 s | about 19 s | about 19 s |
 
 A long context takes memory that would otherwise hold more of the model's experts, so speed depends on the context you
 ask for and on how much memory is free on the board (one request's speed moves by about 1 token/s between
-loads). v0.1.0's prompts took 18.6-19.8 s on 2026-11-13. A sampled
-request with a fixed seed gives the same tokens with speculation on or off.
+loads; the answer-speed row above came from a load that kept 19,136 experts resident). v0.1.0's prompts took
+18.6-19.8 s on 2026-11-13. A sampled request with a fixed seed gives the same tokens with speculation on or off.
 [How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
 </details>
@@ -90,7 +105,7 @@ read the earlier turns again, and tool calls for agent clients (the server runs 
 supported. The server answers one request at a time and listens only on your
 machine unless you give it an API key. [Server guide](docs/server.md)
 
-`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.5 -> 10.6 s on code
+`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.2 -> 10.6 s on code
 review) by rounding the prompt's activations to BF16 on the tensor cores; answers can then differ from the default
 exact path. Off by default. [Server guide](docs/server.md)
 
