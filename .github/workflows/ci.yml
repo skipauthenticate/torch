@@ -123,6 +123,7 @@ jobs:
       - run: cmake --build build --target torch torch_engine_stub
       - run: ./build/torch inspect --header-only --export-tokenizer "$RUNNER_TEMP/tokenizer" ~/gguf-header/shard1-11MiB.gguf
       - run: pip install --no-deps --require-hashes -r server/requirements.txt
+      - run: pip install -r server/requirements-test.txt
       - run: python -m unittest discover -s tests/server -v
         env:
           TORCH_ENGINE_LIBRARY: build/tests/libtorch_engine_stub.so

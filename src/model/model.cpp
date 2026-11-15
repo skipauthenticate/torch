@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -374,7 +375,8 @@ struct Model::Impl {
     int chunk_tenants = 0;
     bool lent_early = false;                            // lend_chunk(true) has lent the part after the residuals
     float *chunk_embd = nullptr, *chunk_ple = nullptr;  // [chunk_cap][n_embd]
-    int32_t* chunk_pos = nullptr;                       // [chunk_cap]
+    std::future<double> chunk_ple_read;  // the chunk's PLE rows into chunk_ple (ms), joined by ple_rows_in
+    int32_t* chunk_pos = nullptr;        // [chunk_cap]
     // The routed experts of a chunk's layer: their route counts, and each pass's experts and matrix table on the host,
     // a ring of kTableRing (a pass's copies to the GPU read them after the host has moved on).
     static constexpr int kTableRing = 4;
@@ -1816,11 +1818,13 @@ struct Model::Impl {
                         chunk_embd + static_cast<size_t>(t) * static_cast<size_t>(E));
             chunk_pos[t] = static_cast<int32_t>(window_start) + t;
         }
-        const auto ple_start = Clock::now();
-        ple->read_tokens(history, window_start, n, chunk_ple);  // each distinct row once
-        const double ple_ms = ms(Clock::now() - ple_start);
-        times.ple += ple_ms;
-        times.ple_max = std::max(times.ple_max, ple_ms);
+        // The PLE rows (each distinct row once) are read while the GPU runs the layers before the PLE layer;
+        // ple_rows_in() waits for them there.
+        chunk_ple_read = std::async(std::launch::async, [this, first = window_start, n] {
+            const auto ple_start = Clock::now();
+            ple->read_tokens(history, first, n, chunk_ple);
+            return ms(Clock::now() - ple_start);
+        });
         store->before_window();
         reclaim_chunk();  // the chunk's buffers are written below
         while (!lend_regions.empty() && lend_mark < context &&
@@ -1832,6 +1836,8 @@ struct Model::Impl {
             enqueue_chunk(n);
         } catch (...) {
             prefilling = false, ops = &cols[0], b = cols[0];
+            if (chunk_ple_read.valid())
+                chunk_ple_read.wait();  // its thread writes chunk_ple
             throw;
         }
         prefilling = false, ops = &cols[0], b = cols[0];
@@ -1939,13 +1945,23 @@ struct Model::Impl {
         stage(kTotal, [&] { enqueue_chunk_work(n); });
     }
 
+    // The chunk's PLE rows, once their reads are done, into the chunk's device rows (before the PLE layer reads them).
+    void ple_rows_in(int n) {
+        if (!chunk_ple_read.valid())
+            return;
+        const double ple_ms = chunk_ple_read.get();  // rethrows a failed read
+        times.ple += ple_ms;
+        times.ple_max = std::max(times.ple_max, ple_ms);
+        TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk.ple_embd, chunk_ple,
+                                         sizeof(float) * static_cast<size_t>(n) * static_cast<size_t>(cfg.n_embd),
+                                         cudaMemcpyHostToDevice, stream));
+    }
+
     void enqueue_chunk_work(int n) {
         const int E = cfg.n_embd;
         const size_t N = static_cast<size_t>(n);
         TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk.pos, chunk_pos, sizeof(int32_t) * N, cudaMemcpyHostToDevice, stream));
         TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk.embd, chunk_embd, sizeof(float) * N * static_cast<size_t>(E),
-                                         cudaMemcpyHostToDevice, stream));
-        TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk.ple_embd, chunk_ple, sizeof(float) * N * static_cast<size_t>(E),
                                          cudaMemcpyHostToDevice, stream));
         layer_ = -1;
         kernels::hc_broadcast(chunk.embd, chunk.res, E, cfg.hc, stream, n);
@@ -1957,6 +1973,7 @@ struct Model::Impl {
                 if (pending)
                     kernels::hc_combine(chunk.res, chunk.out, chunk.inject, E, cfg.hc, stream, n);
                 pending = false;
+                ple_rows_in(n);  // the layers before ran while its rows were read
                 ple_block(L, n);
             }
             hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, pending, n);
@@ -1968,6 +1985,7 @@ struct Model::Impl {
             experts(L, il, n);
             pending = true;
         }
+        ple_rows_in(n);  // (joined above when a layer is the PLE layer)
         layer_ = -1;
         // The head's mixer for every column, as windows run it (the draft layer reads each column's residual after it);
         // the output head for the last column only.

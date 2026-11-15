@@ -62,10 +62,10 @@ def last_params():
 
 
 class Running:
-    def __init__(self, delay_ms=0, window=4, queue=4, api_key=None, context=4096, prefill=64):
+    def __init__(self, delay_ms=0, window=4, queue=4, api_key=None, context=4096, prefill=64, max_tokens=1000):
         os.environ["TORCH_STUB_DELAY_MS"], os.environ["TORCH_STUB_WINDOW"] = str(delay_ms), str(window)
         self.engine = E.Engine(LIBRARY, ANSWER, draft="draft", context=context, prefill_columns=prefill)
-        self.server = Server(("127.0.0.1", 0), CHAT, self.engine, "test-model", api_key, queue, 1000)
+        self.server = Server(("127.0.0.1", 0), CHAT, self.engine, "test-model", api_key, queue, max_tokens)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -172,6 +172,24 @@ class Basic(unittest.TestCase):
         self.assertEqual(r["usage"]["completion_tokens_details"]["reasoning_tokens"], len(reasoning) + 1)
         self.assertTrue(CHAT.decode(last_ids()).endswith("assistant\n<think>\n"))  # the model writes the rest
 
+    def test_reasoning_object(self):
+        # reasoning {enabled, effort}: another spelling of reasoning_effort, which wins when both are given
+        for body, like in [({"reasoning": {"enabled": False}}, {"reasoning_effort": "none"}),
+                           ({"reasoning": {"enabled": True, "effort": "none"}}, {"reasoning_effort": "none"}),
+                           ({"reasoning": {"effort": "low", "max_tokens": 100}}, {"reasoning_effort": "low"}),
+                           ({"reasoning": {"enabled": True}}, {}),
+                           ({"reasoning": {"enabled": False}, "reasoning_effort": "medium"},
+                            {"reasoning_effort": "medium"})]:
+            answer("ok")
+            self.assertEqual(self.s.chat(like)[0], 200)
+            want = last_ids()
+            self.assertEqual(self.s.chat(body)[0], 200)
+            self.assertEqual(last_ids(), want, body)
+        for body, param in [({"reasoning": {"enabled": "no"}}, "reasoning"), ({"reasoning": "low"}, "reasoning"),
+                            ({"reasoning": {"effort": "huge"}}, "reasoning.effort")]:
+            status, r = self.s.chat(body)
+            self.assertEqual((status, r["error"]["param"]), (400, param), body)
+
     def test_stop_string_across_windows(self):
         ids = answer("one two three STOP_HERE four five six")
         status, r = self.s.chat({"reasoning_effort": "none", "stop": ["STOP_HERE", "never"]})
@@ -230,7 +248,7 @@ class Basic(unittest.TestCase):
         self.assertEqual(r["model"], "test-model")
 
     def test_refused(self):
-        for body, param in [({"tools": [{"type": "function"}]}, "tools"), ({"n": 2}, "n"),
+        for body, param in [({"tools": [{"type": "function"}]}, "tools[0]"), ({"n": 2}, "n"),
                             ({"response_format": {"type": "json_object"}}, "response_format"),
                             ({"logprobs": True}, "logprobs"), ({"temperature": 3}, "temperature"),
                             ({"top_p": 0}, "top_p"), ({"seed": -1}, "seed"), ({"stop": [""]}, "stop"),
@@ -269,6 +287,17 @@ class Limits(unittest.TestCase):
             self.assertEqual(s.chat({"reasoning_effort": "none"}, headers={"Authorization": "Bearer k1"})[0], 200)
         finally:
             s.close()
+
+    def test_max_tokens_default(self):
+        # without max_tokens: what the context has left, or --max-tokens-default when it is smaller
+        for default, want in ((None, lambda n: 4096 - n), (100, lambda n: 100)):
+            s = Running(max_tokens=default)
+            try:
+                answer("x")
+                _, r = s.chat({"reasoning_effort": "none"})
+                self.assertEqual(last_params().max_tokens, want(r["usage"]["prompt_tokens"]))
+            finally:
+                s.close()
 
     def test_queue_full(self):
         s = Running(delay_ms=40, queue=1)

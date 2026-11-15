@@ -1,3 +1,3 @@
-# Test only (tests/server/board_gates.py openai): the official client, to check compatibility. The server never
-# installs or imports it.
+# Test only (tests/server/test_tools.py in CI, tests/server/board_gates.py openai): the official client, to check
+# compatibility. The server never installs or imports it.
 openai==3.50.0
