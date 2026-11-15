@@ -884,13 +884,13 @@ struct Model::Impl {
             const RouteCounts counts = RouteCounts::read(o.placement);
             if (counts.n_layer != cfg.n_layer || counts.n_expert != cfg.n_expert)
                 throw Error("The route counts in " + o.placement.string() + " were recorded with another model.");
-            p = place_ranked(counts, bytes, budget.room(),
+            p = place_ranked(counts, bytes, budget.placement_room(),
                              o.resident_total ? static_cast<size_t>(*o.resident_total) : SIZE_MAX);
             budget.placement = "the most-routed experts in " + o.placement.string() +
                                (o.resident_total ? ", " + std::to_string(*o.resident_total) + " in total" : "");
             ranking = counts;
         } else {
-            const int k = uniform_capacity(budget.room(), cfg.n_expert, bytes);
+            const int k = uniform_capacity(budget.placement_room(), cfg.n_expert, bytes);
             p = place_uniform(k, cfg.n_expert, bytes);
             budget.placement = "experts 0 to " + std::to_string(k - 1) + " of every layer (no route counts given)";
             ranking = uniform_ranking(cfg.n_layer, cfg.n_expert);

@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
+### Fixed
+
+- When its memory estimates at start were exact (little page cache to free while loading), the engine placed
+  experts down to its 6 GiB free-memory floor and could end just below it, skipping the 1.5 GiB margin the top-up
+  keeps. The placement at start now keeps the margin too.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
