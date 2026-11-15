@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_map>
 
 #include "core/error.h"
 #include "formats/dequant.h"
@@ -85,6 +86,45 @@ void PleRows::read_window(std::span<const int32_t> history, size_t first, int co
         dequant_row(Type::IQ4_NL, data[r], config_.ple_dim, out + r * static_cast<size_t>(config_.ple_dim));
     }
     reads_->release();
+}
+
+void PleRows::read_tokens(std::span<const int32_t> history, size_t first, int count, float* out) {
+    const size_t heads = static_cast<size_t>(config_.ple_heads()), D = static_cast<size_t>(config_.ple_dim);
+    const size_t n = heads * static_cast<size_t>(count);
+    std::vector<uint64_t> unique;    // distinct row offsets, in order of first use
+    std::vector<uint32_t> which(n);  // each (token, head)'s index in unique
+    std::unordered_map<uint64_t, uint32_t> index;
+    index.reserve(n);
+    for (int t = 0; t < count; ++t) {
+        const std::vector<uint64_t> rows = row_ids(config_, history, first + static_cast<size_t>(t));
+        for (size_t h = 0; h < heads; ++h) {
+            const uint64_t offset = table_offset_ + rows[h] * row_bytes_;
+            const auto [it, fresh] = index.emplace(offset, static_cast<uint32_t>(unique.size()));
+            if (fresh)
+                unique.push_back(offset);
+            which[static_cast<size_t>(t) * heads + h] = it->second;
+        }
+    }
+    std::vector<float> values(unique.size() * D);
+    const size_t batch = static_cast<size_t>(columns_) * heads;  // the reads one read_all may hold
+    for (size_t b = 0; b < unique.size(); b += batch) {
+        const size_t m = std::min(batch, unique.size() - b);
+        std::vector<HedgedReads::Request> requests(m);
+        for (size_t i = 0; i < m; ++i)
+            requests[i] = {0, unique[b + i], row_bytes_};
+        std::vector<const uint8_t*> data(m);
+        reads_->read_all(requests, data);
+        for (size_t i = 0; i < m; ++i) {
+            if (data[i] == nullptr) {
+                reads_->release();
+                throw Error("A read of the PLE rows from shard 2 failed; check the SSD and the file.");
+            }
+            dequant_row(Type::IQ4_NL, data[i], config_.ple_dim, values.data() + (b + i) * D);
+        }
+        reads_->release();
+    }
+    for (size_t r = 0; r < n; ++r)
+        std::copy_n(values.data() + static_cast<size_t>(which[r]) * D, D, out + r * D);
 }
 
 }  // namespace torch::runtime

@@ -50,9 +50,12 @@ uint32_t torch_engine_abi_version(void) {
     return TORCH_ENGINE_ABI_VERSION;
 }
 
+static int last_fast_prefill = -1;
+
 torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engine** engine, char* error,
                                       size_t error_size) {
-    if (!o || !engine || o->struct_size != sizeof(torch_engine_options) || !o->model || o->context < 1 ||
+    const int abi1 = o && o->struct_size == offsetof(torch_engine_options, fast_prefill); /* ends before it */
+    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1) || !o->model || o->context < 1 ||
         o->prefill_columns < 1) {
         if (error && error_size)
             snprintf(error, error_size, "stub: bad options");
@@ -62,6 +65,7 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
     snprintf(e->answer_path, sizeof e->answer_path, "%s", o->model);
     e->has_draft = o->draft != NULL;
     e->context = o->context, e->prefill = o->prefill_columns;
+    last_fast_prefill = abi1 ? 0 : o->fast_prefill != 0;
     e->window = env_int("TORCH_STUB_WINDOW", 4), e->delay_ms = env_int("TORCH_STUB_DELAY_MS", 0);
     e->sequence = malloc(sizeof(int32_t) * MAX_IDS);
     *engine = e;
@@ -229,6 +233,9 @@ TORCH_ENGINE_API int torch_stub_last_stopped(void) {
 }
 TORCH_ENGINE_API int torch_stub_running(void) {
     return atomic_load(&running);
+}
+TORCH_ENGINE_API int torch_stub_last_fast_prefill(void) { /* of the last torch_engine_open */
+    return last_fast_prefill;
 }
 TORCH_ENGINE_API int torch_stub_requests(void) {
     return last_request.requests;

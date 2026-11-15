@@ -78,8 +78,9 @@ SPECULATIVE = re.compile(
     r"speculative \(([^)]*)\): \d+ tokens in (\d+) windows of the last token and up to (\d+) drafts, ([0-9.]+) "
     r"verified on average: ([0-9.]+) tokens per window, ([0-9.]+) tok/s \(([0-9.]+) ms per window: verify and "
     r"accept ([0-9.]+), draft ([0-9.]+), host ([0-9.]+)\)")
-GENERATION = re.compile(r"generation: (\d+) routed hits, (\d+) misses; (\d+) swaps, ([0-9.]+) ms \(([0-9.]+) ms per "
-                        r"window\); the prompt's: (\d+) swaps, ([0-9.]+) ms")
+GENERATION = re.compile(r"generation: (\d+) routed hits, (\d+) misses(?:, read in ([0-9.]+) ms)?; (\d+) swaps"
+                        r"(?: \((\d+) when the staging filled\))?, ([0-9.]+) ms \(([0-9.]+) ms per window\); the "
+                        r"prompt's: (\d+) swaps, ([0-9.]+) ms")  # read time and swaps when full: torch run since M8
 
 
 def speculative(out):
@@ -98,9 +99,10 @@ def generation(out):
     m = GENERATION.search(out)
     if not m:
         return None
-    return {"hits": int(m.group(1)), "misses": int(m.group(2)), "swaps": int(m.group(3)), "swap_ms": float(m.group(4)),
-            "swap_ms_per_window": float(m.group(5)), "prompt_swaps": int(m.group(6)),
-            "prompt_swap_ms": float(m.group(7))}
+    g = m.groups()
+    return {"hits": int(g[0]), "misses": int(g[1]), "read_ms": float(g[2]) if g[2] else None, "swaps": int(g[3]),
+            "swaps_when_full": int(g[4]) if g[4] else None, "swap_ms": float(g[5]), "swap_ms_per_window": float(g[6]),
+            "prompt_swaps": int(g[7]), "prompt_swap_ms": float(g[8])}
 
 
 def decode_tok_s(out):

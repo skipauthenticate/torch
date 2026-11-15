@@ -27,7 +27,7 @@ extern "C" {
 #define TORCH_ENGINE_API
 #endif
 
-#define TORCH_ENGINE_ABI_VERSION 1
+#define TORCH_ENGINE_ABI_VERSION 2
 
 typedef enum torch_engine_status {
     TORCH_ENGINE_OK = 0,
@@ -55,7 +55,13 @@ typedef struct torch_engine_options {
     int32_t context;          /* tokens the KV cache holds, 1 to 262,144 */
     int32_t prefill_columns;  /* the widest prefill chunk, 1 to 4,096 */
     int32_t lend_kv;          /* nonzero: the KV cache's unused tail holds experts until the sequence reaches it */
-    int32_t swaps_per_window; /* experts made resident after each generated window (0: none) */
+    int32_t swaps_per_window; /* experts made resident after each generated window (0: none; torch_server uses 128).
+                               * Without lend_kv, the misses a window holds when its staging fills are swapped in then,
+                               * within this budget. */
+    int32_t fast_prefill;     /* nonzero: prefill's BF16 products on the tensor cores with the activations rounded to
+                               * BF16 (ABI 2): a shorter time to the first token, but prefill is then not bitwise the
+                               * one-token path, so a greedy answer can differ. A caller built for ABI 1 passes
+                               * struct_size = offsetof(torch_engine_options, fast_prefill) and gets the exact path. */
 } torch_engine_options;
 
 typedef struct torch_engine_params {

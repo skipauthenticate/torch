@@ -77,12 +77,13 @@ int uniform_capacity(uint64_t room, int n_expert, const std::vector<uint64_t>& e
     return static_cast<int>(std::min<uint64_t>(room / per_k, static_cast<uint64_t>(n_expert)));
 }
 
-Placement place_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, uint64_t room) {
-    return extend_ranked(counts, expert_bytes, Placement{}, room);
+Placement place_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, uint64_t room,
+                       size_t limit) {
+    return extend_ranked(counts, expert_bytes, Placement{}, room, limit);
 }
 
 Placement extend_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, const Placement& have,
-                        uint64_t room) {
+                        uint64_t room, size_t limit) {
     if (static_cast<int>(expert_bytes.size()) != counts.n_layer)
         throw Error("The route counts were recorded with another model; record them again with torch run.");
     struct Item {
@@ -102,10 +103,14 @@ Placement extend_ranked(const RouteCounts& counts, const std::vector<uint64_t>& 
     std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.count > b.count; });
     Placement p;
     p.resident.resize(static_cast<size_t>(counts.n_layer));
+    size_t taken = 0;
     for (const Item& it : items) {
         const uint64_t bytes = expert_bytes[static_cast<size_t>(it.layer)];
+        if (taken == limit)
+            break;
         if (p.bytes + bytes > room)
             continue;
+        ++taken;
         p.bytes += bytes;
         p.resident[static_cast<size_t>(it.layer)].push_back(it.expert);
     }

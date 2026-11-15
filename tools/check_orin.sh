@@ -2,7 +2,8 @@
 # The checks a milestone passes on the Orin before it merges (CONTRIBUTING.md). Builds the tree, then on the GPU runs
 #   - the unit and kernel parity tests, and the model parity test against tests/model/reference.json;
 #   - the decode identity checks: byte-identical logits from the CUDA graph and kernel by kernel, and with 0, 256 and
-#     the budget's experts resident (output must not depend on residency);
+#     the budget's experts resident (output must not depend on residency); --fast-prefill deterministic and the same
+#     at three chunk sizes;
 #   - the kernel harness against the decode gates (bench/kernel_gates.py).
 # It prints each result and exits non-zero if any check fails.
 #
@@ -66,6 +67,23 @@ if run --logits "$out/graph.bin" && TORCH_EAGER=1 run --logits "$out/eager.bin" 
         echo "ok   residency 0, 256 and the budget's give identical logits"
     else echo "FAIL logits depend on residency"; failed=1; fi
 else echo "FAIL a decode run"; failed=1; fi
+
+# --fast-prefill (prefill's BF16 products on the tensor cores) is not bitwise the windows, but must be deterministic and
+# independent of the chunk size: 1,100 prompt tokens at chunks of 1,100 (twice), 550 and 275 give the same last prompt
+# row and the same generated rows (the files' last 4 rows of 248,320 logits).
+fast() { P=$(cut -d, -f1-1100 bench/workloads/review-calib-101.tokens)
+    ./build/torch run "$TORCH_MODEL" --tokens "$P" -n 4 --fast-prefill --prefill "$1" --logits "$2" > /dev/null; }
+if fast 1100 "$out/f1100.bin" && fast 1100 "$out/f1100b.bin" && fast 550 "$out/f550.bin" && fast 275 "$out/f275.bin"
+then
+    if cmp -s "$out/f1100.bin" "$out/f1100b.bin" && python3 - "$out" <<'PY'
+import sys
+row = 248320 * 4
+tails = [open(f"{sys.argv[1]}/f{c}.bin", "rb").read()[-4 * row:] for c in (1100, 550, 275)]
+sys.exit(0 if tails[0] == tails[1] == tails[2] else 1)
+PY
+    then echo "ok   --fast-prefill deterministic and the same at chunks of 1,100, 550 and 275"
+    else echo "FAIL --fast-prefill changes between runs or chunk sizes"; failed=1; fi
+else echo "FAIL a --fast-prefill run"; failed=1; fi
 
 if ./build/torch_bench_kernels "$TORCH_MODEL" --json "$out/kernels.json" > "$out/kernels.txt" 2>&1; then
     python3 bench/kernel_gates.py "$out/kernels.json" || failed=1

@@ -28,14 +28,17 @@ def main(argv=None):
                                                   "it from --model at start with --torch-bin)")
     p.add_argument("--torch-bin", default="torch", help="the torch command, for the export at start")
     p.add_argument("--draft", help="the draft-layer file: speculative decoding (per request: torch.speculative)")
-    p.add_argument("--draft-vocab", help="the draft head's token list (default: the shipped one, with 40,960 rows)")
+    p.add_argument("--draft-vocab", help="the draft head's token list (default: the shipped one, with 81,920 rows)")
     p.add_argument("--draft-head-rows", type=int, default=0)
     p.add_argument("--placement", help="a route-count file for the resident experts (default: the shipped one for "
                                        "the pinned model; 'none' for none)")
     p.add_argument("--context", type=int, default=16384, help="tokens the KV cache holds (1 to 262,144)")
     p.add_argument("--prefill", type=int, default=4096, help="the widest prefill chunk (1 to 4,096)")
     p.add_argument("--lend-kv", action="store_true", help="the KV cache's unused tail holds experts until needed")
-    p.add_argument("--swaps", type=int, default=32, help="experts made resident after each generated window")
+    p.add_argument("--fast-prefill", action="store_true",
+                   help="prompts' BF16 products on the tensor cores, the activations rounded to BF16: a shorter time to "
+                        "the first token, but a greedy answer can differ from the default's")
+    p.add_argument("--swaps", type=int, default=128, help="experts made resident after each generated window")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--api-key", default=os.environ.get("TORCH_SERVER_API_KEY"),
@@ -51,7 +54,7 @@ def main(argv=None):
         if a.placement is None:
             a.placement = str(CALIBRATION / ("calib-g-spec.txt" if a.draft else "calib-g.txt"))
         if a.draft and a.draft_vocab is None:
-            a.draft_vocab, a.draft_head_rows = str(CALIBRATION / "draft-vocab.txt"), a.draft_head_rows or 40960
+            a.draft_vocab, a.draft_head_rows = str(CALIBRATION / "draft-vocab.txt"), a.draft_head_rows or 81920
     if a.placement == "none":
         a.placement = None
     loopback = a.host == "localhost" or ipaddress.ip_address(a.host).is_loopback
@@ -69,7 +72,7 @@ def main(argv=None):
         name = a.model_name or re.sub(r"-0+1-of-0+\d+\.gguf$|\.gguf$", "", Path(a.model).name)
         try:
             engine = Engine(a.library, a.model, a.draft, a.draft_vocab, a.draft_head_rows, a.placement, a.context,
-                            a.prefill, a.lend_kv, a.swaps)
+                            a.prefill, a.lend_kv, a.swaps, a.fast_prefill)
         except (EngineError, OSError) as e:
             sys.exit(f"torch_server: {e}")
         server = Server((a.host, a.port), chat, engine, name, a.api_key, a.queue, a.max_tokens_default)

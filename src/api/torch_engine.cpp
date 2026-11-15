@@ -64,7 +64,9 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
                                       size_t error_size) {
     if (engine)
         *engine = nullptr;
-    if (!o || !engine || o->struct_size != sizeof(torch_engine_options) || !o->model) {
+    // ABI 1 callers end the struct before fast_prefill
+    const bool abi1 = o && o->struct_size == offsetof(torch_engine_options, fast_prefill);
+    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1) || !o->model) {
         copy_error("Pass torch_engine_options with struct_size = sizeof(torch_engine_options) and a model path.", error,
                    error_size);
         return TORCH_ENGINE_INVALID;
@@ -81,6 +83,7 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
         if (o->placement)
             opt.placement = o->placement;
         opt.lend_from = o->lend_kv ? 16384 : 0;
+        opt.fast_prefill = !abi1 && o->fast_prefill != 0;
         opt.swaps_per_window = 0;  // a prompt's windows swap nothing; generated ones up to swaps_per_window
         opt.logits = false;        // only the drawn tokens leave the GPU
         e->swaps = o->swaps_per_window;

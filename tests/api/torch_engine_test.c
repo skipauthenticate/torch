@@ -6,7 +6,7 @@
  *     handle, greedy and seeded; cancel from another thread mid-prefill and mid-decode, then the same request equals an
  *     uncancelled run. PROMPT is a chat prompt ending in the 7-token generation prompt (bench/workloads/).
  *   torch_engine_test MODEL DRAFT VOCAB PROMPT.tokens --bench SPEC PLACEMENT
- *     one request of 256 greedy tokens at the race's settings (context 262,144, prefill 4,096, swaps 32): decode tok/s
+ *     one request of 256 greedy tokens at the benchmark's settings (context 262,144, prefill 4,096, swaps 128): decode tok/s
  *     and resident experts, for A/B runs against torch run. */
 #include "torch_engine.h"
 
@@ -138,7 +138,7 @@ static torch_engine* open_engine(const char** argv, int32_t context, int32_t pre
     torch_engine_options o;
     memset(&o, 0, sizeof o);
     o.struct_size = sizeof o;
-    o.model = argv[1], o.draft = argv[2], o.draft_vocab = argv[3], o.draft_head_rows = 40960;
+    o.model = argv[1], o.draft = argv[2], o.draft_vocab = argv[3], o.draft_head_rows = 81920;
     o.placement = placement, o.context = context, o.prefill_columns = prefill, o.swaps_per_window = swaps;
     char error[512];
     torch_engine* e = NULL;
@@ -181,7 +181,7 @@ int main(int argc, const char** argv) {
     torch_engine_stats s;
 
     if (argc >= 8 && strcmp(argv[5], "--bench") == 0) {
-        torch_engine* e = open_engine(argv, 262144, 4096, argv[7], 32);
+        torch_engine* e = open_engine(argv, 262144, 4096, argv[7], 128);
         torch_engine_params p = params(0, 0, atoi(argv[6]));
         p.max_tokens = 256, p.n_stop_ids = 0;
         if (run(e, p1, n1, n1 - 7, &p, &a, &s, 0, 0) != TORCH_ENGINE_OK)

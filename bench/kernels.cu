@@ -4,7 +4,8 @@
 //
 // What it times. The tensor table of shard 1 gives the exact matrix-vector products a token runs (model.cpp): every
 // non-expert matrix (gemv_q8 for quantized formats with its quantize_q8, gemv_bf16 for BF16, a mixer's inject rows in
-// its down projection's launch, and the matrices that read one input in the launches model.cpp groups them into:
+// its down projection's launch, its up projection with hc_collapse in one gemv_bf16_collapse launch, and the
+// matrices that read one input in the launches model.cpp groups them into:
 // gemv_q8_group with one quantize_q8, BF16 pairs) and the routed experts (gemv_q8_experts with the model's slot count,
 // gate and up fused, and down), each deduplicated by (kernel, formats, shapes) with the number of launches per token.
 // With --columns T > 1 the matrices run on T columns at once and the routed gate+up and down on a window's unique
@@ -307,6 +308,7 @@ struct Matvec {
     std::vector<std::pair<Type, int>> parts;  // gemv_q8_group: each matrix's format and rows
     bool quantizes = true;                    // quantized products: the launch's input is quantized for it (not reused)
     float silu_scale = 0.0f;                  // BF16: the first matrix's rows store silu(silu_scale * sum)
+    int collapse_hc = 0;                      // BF16: a mixer's up projection run with hc_collapse over hc streams
 
     std::string format() const;
     std::string shape() const;
@@ -472,9 +474,17 @@ std::vector<Matvec> matvec_cases(const gguf::File& shard1, const model::Config& 
                 if (down != nullptr && inject_of(*down) == &t)
                     continue;  // timed with its down projection
             }
-            // A mixer's BF16 down projection stores its low-rank SiLU (hc_mix).
+            // A mixer's BF16 down projection stores its low-rank SiLU, and its up projection runs with hc_collapse
+            // (hc_mix).
             const bool mixer_down = name.find("hc_") != std::string::npos && name.find("_down") != std::string::npos;
-            if (type == Type::BF16) {
+            const bool mixer_up = name.find("hc_") != std::string::npos && name.size() > 3 &&
+                                  name.compare(name.size() - 3, 3, "_up") == 0;
+            if (type == Type::BF16 && mixer_up && cfg.hc == 4 && cols % 8 == 0 && cols <= 320 &&
+                rows % (32 * cfg.hc) == 0) {
+                Matvec m{"gemv_bf16_collapse", name, type, rows, cols, false};
+                m.collapse_hc = cfg.hc;
+                add_case(m);
+            } else if (type == Type::BF16) {
                 Matvec m{"gemv_bf16", name, type, rows, cols, false};
                 if (const gguf::TensorInfo* inject = inject_of(t)) {
                     m.name += "+inject";
@@ -523,7 +533,18 @@ Row time_matrix(const Matvec& c, cudaStream_t stream, Rng& rng) {
     Row row{c.kernel, c.name, c.format(), c.shape()};
     row.weight_bytes = static_cast<double>(matrix_bytes);
     row.count = c.count;
-    if (c.type == Type::BF16) {
+    if (c.collapse_hc > 0) {
+        const int n = c.rows / c.collapse_hc;
+        Device<float> x = random_floats(static_cast<size_t>(c.cols) * T, -1.0f, 1.0f, rng),
+                      xn = random_floats(static_cast<size_t>(c.rows) * T, -1.0f, 1.0f, rng),
+                      mixed(static_cast<size_t>(n) * T);
+        Device<BlockQ8> q8(static_cast<size_t>(n / 32) * T);
+        row.bytes = row.weight_bytes + T * (4.0 * (c.cols + c.rows + n) + n / 32.0 * sizeof(BlockQ8));
+        row.us = time_graph(stream, launches, [&](int i) {
+            kernels::gemv_bf16_collapse(weights.device() + stride * (static_cast<uint64_t>(i) % copies), n,
+                                        c.collapse_hc, c.cols, x.get(), xn.get(), mixed.get(), q8.get(), stream, T);
+        });
+    } else if (c.type == Type::BF16) {
         Device<float> x = random_floats(static_cast<size_t>(c.cols) * T, -1.0f, 1.0f, rng);
         row.bytes = row.weight_bytes + 4.0 * T * (c.cols + c.rows + c.rows2);
         row.us = time_graph(stream, launches, [&](int i) {
@@ -722,9 +743,11 @@ Row time_experts_window(const Matvec& c, int k, int experts, cudaStream_t stream
 
 // Times the kernels between the matrices, once per token shape. `quantize_counts` maps a vector length to the
 // number of quantize_q8 launches a token makes on it; `swiglu_launches` counts the shared experts whose gate and up
-// do not share a launch, `silu_launches` the mixers whose down projection does not apply the SiLU itself.
+// do not share a launch, `silu_launches` the mixers whose down projection does not apply the SiLU itself and
+// `collapse_launches` those whose up projection does not run hc_collapse.
 void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quantize_counts, int swiglu_launches,
-                        int silu_launches, cudaStream_t stream, Rng& rng, std::vector<Row>& rows) {
+                        int silu_launches, int collapse_launches, cudaStream_t stream, Rng& rng,
+                        std::vector<Row>& rows) {
     const int E = cfg.n_embd, HC = cfg.hc, LR = cfg.hc_rank, D = cfg.head_dim, H = cfg.n_head, HKV = cfg.n_head_kv;
     const int DS = cfg.ssm_head_dim, HV = cfg.ssm_v_heads, KH = cfg.ssm_k_heads, CC = cfg.conv_channels();
     const int K = cfg.n_expert_used, NE = cfg.n_expert, FFS = cfg.n_ff_shared;
@@ -786,7 +809,7 @@ void time_small_kernels(const model::Config& cfg, const std::map<int, int>& quan
                       mixed(static_cast<size_t>(E));
         Device<kernels::BlockQ8> mixed_q8(static_cast<size_t>(E) / 32);
         add("hc_collapse", shape_name(HC, E) + " with Q8 output", shape_name(HC, E),
-            (2.0 * HCD + E) * F + E / 32.0 * sizeof(kernels::BlockQ8), 2 * layers + 1, kLaunches,
+            (2.0 * HCD + E) * F + E / 32.0 * sizeof(kernels::BlockQ8), collapse_launches, kLaunches,
             [&](int) { kernels::hc_collapse(xn.get(), gate.get(), mixed.get(), mixed_q8.get(), E, HC, stream); });
         Device<float> res = floats(static_cast<size_t>(HCD)), out = floats(static_cast<size_t>(E)),
                       inject = floats(static_cast<size_t>(HC));
@@ -1085,11 +1108,14 @@ int run(const std::string& model, const char* json_path, double ceiling) {
                 quantize_counts[cfg.n_expert_used * torch::bench::g_columns * c.cols] += c.count;
         } else {
             rows.push_back(c.kernel == "gemv_q8_group" ? time_group(c, stream, rng) : time_matrix(c, stream, rng));
-            if (c.kernel != "gemv_bf16" && c.quantizes)
+            if (c.type != Type::BF16 && c.quantizes)
                 quantize_counts[c.cols] += c.count;
         }
     }
-    time_small_kernels(cfg, quantize_counts, swiglu_launches, silu_launches, stream, rng, rows);
+    int collapse_launches = 2 * cfg.n_layer + 1;  // the mixers whose up projection does not run hc_collapse itself
+    for (const Matvec& c : cases)
+        collapse_launches -= c.collapse_hc > 0 ? c.count : 0;
+    time_small_kernels(cfg, quantize_counts, swiglu_launches, silu_launches, collapse_launches, stream, rng, rows);
     TORCH_CUDA_CHECK(cudaStreamDestroy(stream));
 
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms_per_token() > b.ms_per_token(); });

@@ -16,9 +16,20 @@ PYTHONPATH=server ~/.local/torch-server/bin/python -m torch_server \
 template from the model file at start (`torch inspect --export-tokenizer`, or `--tokenizer DIR` for files exported
 before), loads the model and listens on `http://127.0.0.1:8080/v1`. For the pinned model files it uses the shipped
 calibration in `calibration/ed59f920/` unless told otherwise: the placement for speculative decoding (or for one token
-at a time without a draft file) and the draft head's 40,960-row vocabulary; `--placement none` turns the placement
-off. `--swaps` (experts made resident after each window) defaults to 32 and `--prefill` to 4,096.
+at a time without a draft file) and the draft head's 81,920-row vocabulary; `--placement none` turns the placement
+off. `--swaps` (experts made resident after each window) defaults to 128 and `--prefill` to 4,096. A window whose
+misses fill the expert staging swaps the ones it holds in at that point; `TORCH_SWAP_WHEN_FULL=0` in the environment
+turns that off (and `--lend-kv` does).
 `python -m torch_server --help` lists every option.
+
+`--fast-prefill` (off by default) runs the prompt's BF16 products on the Orin's tensor cores with the activations
+rounded to BF16, instead of the default exact kernels. On the nine 4,096-token benchmark prompts (2026-11-14) the time
+to the first token falls from 16.9 to 13.0 s on code review and from 18.4 to 14.4 s on prose and repetition. What it
+trades: the prompt is then not computed bitwise as the one-token path computes it, so a greedy answer can differ from
+the default's (7 of the 9 benchmark answers did, from a near-tie onwards). It stays deterministic and gives the same
+result at any `--prefill` chunk size, and it stays within the model parity gate against the reference implementation
+(mean KL 0.00158 against the default's 0.00211; gate 0.0041). Decoding is unchanged. `TORCH_FAST_PREFILL=1` in the
+environment turns it on where no option reaches (C API callers set `fast_prefill`, ABI 2).
 
 ## Endpoints
 
@@ -69,7 +80,8 @@ image or audio parts, `tool` messages, and a prompt plus `max_tokens` longer tha
   `prompt_tokens_details.cached_tokens` (prompt tokens the session kept), `completion_tokens_details.reasoning_tokens`.
 - `torch`: `cached_tokens`, `stable_tokens` (what the next turn can keep), `speculative`, `seed`, `prompt_seconds`
   (the time to the first token), `decode_seconds`, `prompt_tokens_per_second`, `decode_tokens_per_second`,
-  `tokens_per_window`, `resident_experts`, `total_experts`.
+  `tokens_per_window`, `resident_experts`, `total_experts`, and `expert_hits` and `expert_misses` (routed experts found
+  resident or read from the SSD since the server started; a request's are the difference from the one before).
 - Streams: a first chunk with `delta: {"role": "assistant", "content": ""}`, deltas of `content` and
   `reasoning_content`, a chunk with `finish_reason` and the `torch` field, one with `choices: []` and `usage` when
   `include_usage` is set, then `data: [DONE]`. During the prompt the server sends a comment per prefill chunk

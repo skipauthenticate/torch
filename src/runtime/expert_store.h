@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -111,12 +112,18 @@ public:
     // The misses served since the last before_window(), in order. Call between windows (the GPU idle), as the rest.
     std::vector<Staged> staged() const;
     // Queues the copy of staged expert `in` into the slots of resident expert `out` of the same layer and changes the
-    // map: `in` becomes resident and `out` not. Throws Error when `in` is resident or `out` is not.
-    void swap_in(const Staged& in, int out);
+    // map: `in` becomes resident and `out` not. With on_cpu the CPU copies now instead: inside a window, where GPU work
+    // queued on another stream can wait behind the window that waits for the I/O thread. Throws Error when `in` is
+    // resident or `out` is not.
+    void swap_in(const Staged& in, int out, bool on_cpu = false);
     // Marks the end of the swaps queued since the last before_window(), which waits for their copies.
     void end_swaps();
     // Before a window: waits for the swaps' copies and map entries, then frees the staging buffers.
     void before_window();
+    // When a miss does not fit next to the window's held misses, the I/O thread hands those to `f` (which may swap
+    // them in with swap_in on the CPU; their layers are done for this window) before it frees their buffers.
+    // Without it they are dropped. Set before the first window.
+    void on_full(std::function<void(std::span<const Staged>)> f) { on_full_ = std::move(f); }
 
 private:
     void load(const std::vector<std::vector<int32_t>>& resident);  // reads them and updates the device map
@@ -152,6 +159,8 @@ private:
     uint32_t* last_use_ = nullptr;   // mapped pinned: [layer][expert] window stamps
     std::atomic<bool> stop_{false};
     std::atomic<bool> failed_{false};
+    std::atomic<bool> swap_failed_{false};
+    std::function<void(std::span<const Staged>)> on_full_;
     std::atomic<uint64_t> read_ns_{0};
     std::thread thread_;
 };

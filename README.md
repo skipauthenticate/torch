@@ -21,26 +21,31 @@ tokens.
 
 ## Speed
 
-Answer speed on the Orin, in tokens per second. Each workload is three requests with 4,096-token prompts, a
-262,144-token context and 256 generated tokens, all nine sent to one server process. Medians, greedy, measured on
-2026-11-13.
+Measured on the Orin on 2026-11-14. Each workload is three requests with 4,096-token prompts, a 262,144-token context
+and 256 generated tokens, all nine sent to one server process. Medians, greedy.
 
-| Workload | Answer speed | Reading the prompt |
-| --- | ---: | ---: |
-| Code review | 31.9 tokens/s | about 215 tokens/s |
-| Writing | 32.5 tokens/s | about 215 tokens/s |
-| Repetitive text | 46.2 tokens/s | about 215 tokens/s |
+| Workload | Answer speed | Prompt processing | 4,096-token prompt |
+| --- | ---: | ---: | ---: |
+| Code review | 36.2 tokens/s | about 280 tokens/s | 14.5 s |
+| Writing | 32.5 tokens/s | about 265 tokens/s | 15.5 s |
+| Repetitive text | 50.1 tokens/s | about 265 tokens/s | 15.5 s |
+
+With the opt-in `--fast-prefill`, the 4,096-token prompt takes about 10.6 s for code review and 11.5 s for the other
+two; answers can then differ slightly from the default exact path.
 
 <details>
 <summary><b>More numbers</b></summary>
 
-| Setting | Code review | Writing | Repetitive text |
+| Same settings | Code review | Writing | Repetitive text |
 | --- | ---: | ---: | ---: |
-| Sampled at the model's defaults (temperature 1.0, top-k 20, top-p 0.95), one process per request, 2026-11-13 | 29.5 | 28.9 | 42.1 |
-| Greedy, short prompts (about 1,500 tokens) and a 2,048-token context, 2026-11-09 | 38.2 | 41.3 | 56.0 |
+| This release, answer speed | 36.2 | 32.5 | 50.1 |
+| v0.1.0, answer speed (2026-11-13) | 31.9 | 32.5 | 46.2 |
+| This release, 4,096-token prompt | 14.5 s | 15.5 s | 15.5 s |
+| v0.1.0, 4,096-token prompt | about 19 s | about 19 s | about 19 s |
 
 A long context takes memory that would otherwise hold more of the model's experts, so speed depends on the context you
-ask for. A sampled request with a fixed seed gives the same tokens with speculation on or off.
+ask for and on how much memory is free on the board. v0.1.0's prompts took 18.6-19.8 s on 2026-11-13. A sampled
+request with a fixed seed gives the same tokens with speculation on or off.
 [How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
 </details>
@@ -83,6 +88,10 @@ Streaming, thinking (returned as `reasoning_content`), stop strings, seeds and m
 read the earlier turns again are all supported. The server answers one request at a time and listens only on your
 machine unless you give it an API key. [Server guide](docs/server.md)
 
+`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.5 -> 10.6 s on code
+review) by rounding the prompt's activations to BF16 on the tensor cores; answers can then differ from the default
+exact path. Off by default. [Server guide](docs/server.md)
+
 For scripts and C programs there is also `torch run` and a small C API (`include/torch_engine.h`).
 [Development guide](docs/development.md)
 
@@ -103,9 +112,9 @@ unified memory, small L2 cache and 16 streaming multiprocessors.
   each pass usually yields more than one token. Checking is exact.
 - **Long context.** The model's sparse attention reaches 262,144 tokens, and prompts are read in chunks of 4,096
   tokens on the Orin's tensor cores.
-- **Exact by design.** Weights as stored, 8-bit activations in the dot products, F16 KV cache, F32 accumulators.
-  Output does not depend on which experts are resident, and it matches the reference implementation within the
-  parity gate.
+- **Exact by design.** Weights as stored, 8-bit activations in the dot products, F16 KV cache, F32 accumulators. Output
+  does not depend on which experts are resident, and it matches the reference implementation within the parity gate. The
+  opt-in `--fast-prefill` gives up the bitwise match with the default path for a shorter wait for the first token.
 
 [Architecture](docs/architecture.md) · [Performance model](docs/performance.md)
 

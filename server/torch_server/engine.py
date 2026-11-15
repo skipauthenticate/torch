@@ -8,7 +8,7 @@ import ctypes
 from ctypes import CFUNCTYPE, POINTER, Structure, c_char_p, c_double, c_float, c_int, c_int32, c_uint32, c_uint64
 from ctypes import c_void_p
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 OK, ERROR, INVALID, CANCELLED, BUSY = range(5)
 FINISH_LENGTH, FINISH_STOP, FINISH_CANCELLED = range(3)
 
@@ -16,7 +16,8 @@ FINISH_LENGTH, FINISH_STOP, FINISH_CANCELLED = range(3)
 class Options(Structure):
     _fields_ = [("struct_size", c_uint32), ("model", c_char_p), ("draft", c_char_p), ("draft_vocab", c_char_p),
                 ("draft_head_rows", c_int32), ("placement", c_char_p), ("context", c_int32),
-                ("prefill_columns", c_int32), ("lend_kv", c_int32), ("swaps_per_window", c_int32)]
+                ("prefill_columns", c_int32), ("lend_kv", c_int32), ("swaps_per_window", c_int32),
+                ("fast_prefill", c_int32)]
 
 
 class Params(Structure):
@@ -49,7 +50,7 @@ class Engine:
     """One loaded model. open() takes tens of seconds; generate() blocks until the request ends."""
 
     def __init__(self, library, model, draft=None, draft_vocab=None, draft_head_rows=0, placement=None,
-                 context=16384, prefill_columns=4096, lend_kv=False, swaps_per_window=0):
+                 context=16384, prefill_columns=4096, lend_kv=False, swaps_per_window=0, fast_prefill=False):
         lib = ctypes.CDLL(str(library))
         lib.torch_engine_abi_version.restype = c_uint32
         if lib.torch_engine_abi_version() != ABI_VERSION:
@@ -70,7 +71,7 @@ class Engine:
         self.context = context
         self._keep = [_bytes(model), _bytes(draft), _bytes(draft_vocab), _bytes(placement)]  # alive while opening
         o = Options(ctypes.sizeof(Options), self._keep[0], self._keep[1], self._keep[2], draft_head_rows, self._keep[3],
-                    context, prefill_columns, int(lend_kv), swaps_per_window)
+                    context, prefill_columns, int(lend_kv), swaps_per_window, int(fast_prefill))
         handle, error = c_void_p(), ctypes.create_string_buffer(1024)
         status = lib.torch_engine_open(ctypes.byref(o), ctypes.byref(handle), error, len(error))
         if status != OK or not handle.value:

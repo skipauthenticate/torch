@@ -55,7 +55,8 @@ int ring_rows(int context) {
 }
 
 // The draft's device memory: a K/V cache per variant first (zeroed with `zeros` at start), the inputs of an extend's
-// columns (embedding and positions per column), then one column of activations.
+// columns (embedding and positions per column), then the activations: kMaxColumns columns of those the KV-only pass
+// uses (it runs an extend's positions as columns), one column of the rest.
 struct Buffers {
     std::vector<uint16_t*> k_cache, v_cache;  // per variant: [ring_rows][kv heads x head dim], F16
     float* zeros;                             // hc zeros: the inject that adds e to every stream with weight 1
@@ -84,14 +85,16 @@ struct Buffers {
             k_cache[i] = d.take<uint16_t>(rows * KV);
             v_cache[i] = d.take<uint16_t>(rows * KV);
         }
-        zeros = d.take<float>(static_cast<size_t>(c.hc));
+        constexpr size_t C = kMaxColumns;
+        zeros = d.take<float>(static_cast<size_t>(c.hc) * C);
         zeroed = d.used();
         pos = d.take<int32_t>(3 * kMaxColumns), embd = d.take<float>(kMaxColumns * E);
-        res = d.take<float>(HCD), xn = d.take<float>(HCD);
-        lo = d.take<float>(static_cast<size_t>(c.hc_rank)), hc_gate = d.take<float>(HCD), mixed = d.take<float>(E);
+        res = d.take<float>(HCD * C), xn = d.take<float>(HCD * C);
+        lo = d.take<float>(static_cast<size_t>(c.hc_rank) * C), hc_gate = d.take<float>(HCD * C);
+        mixed = d.take<float>(E * C);
         inject = d.take<float>(static_cast<size_t>(c.hc)), out = d.take<float>(E);
-        en = d.take<float>(E), e = d.take<float>(E), n = d.take<float>(HCD);
-        q = d.take<float>(2 * HD), k = d.take<float>(KV), v = d.take<float>(KV), attn = d.take<float>(HD);
+        en = d.take<float>(E * C), e = d.take<float>(E * C), n = d.take<float>(HCD * C);
+        q = d.take<float>(2 * HD), k = d.take<float>(KV * C), v = d.take<float>(KV * C), attn = d.take<float>(HD);
         const int64_t scratch_floats = kernels::attention_scratch_floats(c.n_head, static_cast<int>(rows), 1);
         attn_scratch = d.take<float>(static_cast<size_t>(scratch_floats));
         router = d.take<float>(static_cast<size_t>(c.n_expert)), weights = d.take<float>(K);
@@ -101,7 +104,7 @@ struct Buffers {
         ids = d.take<int32_t>(K), table = d.take<const uint8_t*>(3 * K);
         logits = d.take<float>(static_cast<size_t>(c.n_vocab)), prob = d.take<float>(1);
         best = d.take<kernels::ArgmaxResult>(1), scratch = d.take<kernels::ArgmaxResult>(kernels::kArgmaxBlocks);
-        q8 = d.take<BlockQ8>(std::max(HCD, HD) / 32), q8_h = d.take<BlockQ8>(K * FF / 32);
+        q8 = d.take<BlockQ8>(std::max(HCD, HD) * C / 32), q8_h = d.take<BlockQ8>(K * FF / 32);
     }
 };
 
@@ -307,19 +310,39 @@ struct Draft::Impl {
         kernels::hc_combine(b.res, b.e, b.zeros, E, cfg.hc, stream);  // weight 2 sigmoid(0) = 1 on every stream
     }
 
-    // The KV-only pass of slot c, from H = the trunk's column c: the attention mixer, the K and V projections, k-norm,
-    // RoPE and the cache row at slot c's position.
-    void kv_only(int variant, int c) {
-        const int D = cfg.head_dim, HKV = cfg.n_head_kv;
+    // The KV-only passes of slots 0 .. n - 1, from H = the trunk's columns 0 .. n - 1: the input, the attention mixer,
+    // the K and V projections, then each slot's k-norm, RoPE and cache row at its position. Every matrix is read once
+    // for all the slots by the multi-column kernels (each column bitwise its one-column launch; fc_hidden takes the
+    // slots' streams as columns, kMaxColumns a launch).
+    void kv_only_columns(int variant, int n) {
+        const int E = cfg.n_embd, D = cfg.head_dim, HKV = cfg.n_head_kv, HCD = cfg.hc * E, KV = HKV * D;
+        const DraftVariant& dv = variants[static_cast<size_t>(variant)];
         const Layer& L = w->layer;
-        input(variants[static_cast<size_t>(variant)], trunk.residual(c), c);
-        mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, nullptr, false);
-        matvec(L.wk, b.mixed, b.k, true);
-        matvec(L.wv, b.mixed, b.v, true);
-        kernels::rms_norm(b.k, D, L.k_norm, 0, nullptr, 0, b.k, D, D, HKV, cfg.eps, stream);
-        kernels::rope_neox(b.k, D, HKV, cfg.n_rot, b.pos + c, cfg.rope_base, stream);
-        kernels::store_kv(b.k, b.v, b.k_cache[static_cast<size_t>(variant)], b.v_cache[static_cast<size_t>(variant)],
-                          HKV * D, b.pos + kMaxColumns + c, stream);
+        kernels::rms_norm(b.embd, E, w->enorm, 0, nullptr, 0, b.en, E, E, 1, cfg.eps, stream, n);
+        matvec(w->fc_embedding, b.en, b.e, false, n);
+        const float* x = trunk.residual(0);  // the trunk's columns, one after the other
+        if (dv.pooled_hnorm)
+            kernels::rms_norm(x, HCD, w->hnorm, 0, nullptr, 0, b.n, HCD, HCD, 1, cfg.eps, stream, n);
+        else
+            kernels::rms_norm(x, E, w->hnorm, E, nullptr, 0, b.n, E, E, cfg.hc, cfg.eps, stream, n);
+        for (int c = 0; c < n * cfg.hc; c += kMaxColumns)
+            matvec(w->fc_hidden, b.n + static_cast<size_t>(c) * E, b.res + static_cast<size_t>(c) * E, false,
+                   std::min(kMaxColumns, n * cfg.hc - c));
+        kernels::hc_combine(b.res, b.e, b.zeros, E, cfg.hc, stream, n);
+        kernels::rms_norm(b.res, E, L.hc_attn_norm, E, nullptr, 0, b.xn, E, E, cfg.hc, cfg.eps, stream, n);
+        matvec(L.hc_attn_down, b.xn, b.lo, false, n);
+        kernels::silu_scale(b.lo, cfg.hc_rank, 1.0f / static_cast<float>(cfg.hc), stream, n);
+        matvec(L.hc_attn_up, b.lo, b.hc_gate, false, n);
+        kernels::hc_collapse(b.xn, b.hc_gate, b.mixed, b.q8, E, cfg.hc, stream, n);
+        matvec(L.wk, b.mixed, b.k, true, n);
+        matvec(L.wv, b.mixed, b.v, true, n);
+        for (int c = 0; c < n; ++c) {
+            float* k = b.k + static_cast<size_t>(c) * KV;
+            kernels::rms_norm(k, D, L.k_norm, 0, nullptr, 0, k, D, D, HKV, cfg.eps, stream);
+            kernels::rope_neox(k, D, HKV, cfg.n_rot, b.pos + c, cfg.rope_base, stream);
+            kernels::store_kv(k, b.v + static_cast<size_t>(c) * KV, b.k_cache[static_cast<size_t>(variant)],
+                              b.v_cache[static_cast<size_t>(variant)], KV, b.pos + kMaxColumns + c, stream);
+        }
     }
 
     // The full pass of slot c from x (H, or the block's own state S' in b.res): the block, the head's mixer (b.res
@@ -424,8 +447,8 @@ struct Draft::Impl {
             set_slot(i, next[static_cast<size_t>(i)], t + i);
         launch(extend_graph(variant, depth > 0, n), [&] {
             upload(n);
-            for (int i = 0; i < (depth > 0 ? n - 1 : n); ++i)
-                kv_only(variant, i);
+            if (const int kv = depth > 0 ? n - 1 : n; kv > 0)
+                kv_only_columns(variant, kv);
             if (depth > 0)
                 full(variant, trunk.residual(n - 1), n - 1);
         });

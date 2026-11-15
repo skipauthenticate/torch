@@ -224,8 +224,9 @@ ms. The host's work per token is the embedding row, the PLE rows, one graph laun
     mixer and the K/V projections, about 15 MB of weights.
   - Its K/V rows of accepted positions always come from the trunk's own states. `--check-draft-kv` checks that after
     N windows they equal a fresh K/V-only pass over the accepted history, bit for bit.
-  - Its argmax scores a 40,960-row subset of the output head: the ids generated from the held-out calibration
-    prompts, by frequency, then the rest by id.
+  - Its argmax scores an 81,920-row subset of the output head: the ids generated from the held-out calibration
+    prompts, by frequency, then the rest by id. Measured [M8]: against 40,960 rows, depth-1 acceptance on the
+    code-review benchmark's answers rose from 79.8% to 83.8% for +0.55 ms a draft step.
   - Its passes run as CUDA graphs, one per extend width and one per depth step.
   - Measured [M4]: one RMS per stream accepted 89.6% at depth 1 against 86.0% for one RMS over all four. The 40,960
     rows lost 0.02 accepted drafts of 3 against the full head, and cut a draft step from 4.8 to 2.1 ms (eager).
@@ -264,13 +265,18 @@ keeps as many resident as the budget allows and reads the rest from the SSD:
   (core/placement.h). Each resident matrix sits in a slot of its own layer's exact size. Measured [M3]: with the same
   85% of experts resident, ranking by counts from 800 calibration tokens raised a held-out prompt's hits from 85.4%
   to 95.0% and its decode from 8.65 to 12.48 tok/s.
-- **Residency follows use.** After each window, up to 32 of the experts it read from the SSD take the slots of the
-  least recently routed resident experts of their layers (`--swap 32`, `core/swaps.h`). Ties go to the lower
+- **Residency follows use.** After each window, up to 128 of the experts it read from the SSD take the slots of the
+  least recently routed resident experts of their layers (`--swap 128`, `core/swaps.h`). Ties go to the lower
   calibration count, and memory stays constant.
+  - The staging holds 80 experts for a whole window. When a miss does not fit, the I/O thread first swaps in the misses
+    it holds (their layers are done for this window), within the same budget, with CPU copies: no GPU work may be queued
+    while the window waits on that thread. Measured [M8, one process, the nine benchmark requests in order, equal
+    bytes]: code review decode time -3.3% and -5.8% against 32 swaps without it, generation misses -27% to -56%; 128
+    swaps without it changed nothing. Off with KV lending (`--no-swap-when-full` turns it off).
   - The gate kernel stamps every routed (layer, expert) with its window.
-  - The newcomer's bytes are still in the staging buffers, so a GPU copy kernel moves them into the victim's slots on
-    the store's own stream, while the drafter runs, and the map entries change in place. The next window waits for
-    the copies.
+  - After the window, the newcomer's bytes are still in the staging buffers, so a GPU copy kernel moves them into
+    the victim's slots on the store's own stream, while the drafter runs, and the map entries change in place. The
+    next window waits for the copies.
   - None run during the prompt's one-token windows (`--swap-prompt 0`), which measured better.
   - Measured [M4]: generation misses fell 40-76% on the nine benchmark prompts. A swap costs about 0.05 ms, 0.25-0.40
     ms per generated window.

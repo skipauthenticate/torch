@@ -1,6 +1,6 @@
 // Checks expert placement: uniform k per layer, the capacity of a byte budget, the ranking by route counts (order,
-// ties, skipping an expert too large for the space left), extending a placement once more memory is known, and the
-// route-count file.
+// ties, skipping an expert too large for the space left), extending a placement once more memory is known, a
+// limit on the count, and the route-count file.
 //
 // usage: placement_test DIR (a writable directory for the round-trip file)
 #include "core/placement.h"
@@ -59,6 +59,13 @@ int main(int argc, char** argv) {
     for (const std::vector<int32_t>& layer : next.resident)
         CHECK(layer == (std::vector<int32_t>{2}));
     CHECK(place_ranked(uniform_ranking(3, 4), bytes, 120).resident == u.resident);
+    // A limit stops the ranking at a count, in the same order: 2 experts of the room-70 four, then the other 2.
+    const Placement two = place_ranked(c, bytes, 70, 2);
+    CHECK(two.count() == 2 && two.bytes == 40);
+    CHECK(two.resident[0] == (std::vector<int32_t>{2}) && two.resident[2] == (std::vector<int32_t>{0}));
+    const Placement rest = extend_ranked(c, bytes, two, 1000, 2);
+    CHECK(rest.count() == 2 && rest.bytes == 30);
+    CHECK(rest.resident[0] == (std::vector<int32_t>{0}) && rest.resident[1] == (std::vector<int32_t>{0}));
 
     const std::filesystem::path path = std::filesystem::path(argv[1]) / "route_counts_test.txt";
     c.write(path);

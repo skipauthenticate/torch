@@ -76,6 +76,10 @@ void check_shapes() {
     }
     CHECK(mixed.width() == 3);
     (void)keep_going;
+    // tight: drafting stops at the weak draft that width() leaves out, and goes on while every draft is kept
+    WindowPolicy tight(7, linear_costs(7, 37, 7.5), true);
+    CHECK(tight.more(1, 0.995f) && tight.more(2, 0.995f) && tight.more(3, 0.995f) && !tight.more(4, 0.05f));
+    CHECK(tight.width() == 3);
 }
 
 void check_learning() {
