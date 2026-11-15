@@ -5,6 +5,31 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
+### Added
+
+- Tool calls in `torch_server` (docs/server.md, Tool calls): OpenAI `tools`, `tool_choice` `auto` and `none`,
+  `parallel_tool_calls`, and assistant `tool_calls` and `tool` messages in the history. The model's calls come back as
+  `tool_calls`, streamed whole (one chunk per call), with arguments typed by each parameter's schema. The server runs
+  no tool, and text that is not a call comes back as text. A tool result that holds the text of a control token is
+  encoded as plain text. `/v1/models` reports `context_length`. Measured on the Jetson AGX Orin 64 GB on 2026-11-14:
+  15 tool requests with thinking off and on gave 15 parsed calls, all of their schema's types, none as text; the
+  follow-up turn kept turn 1's prompt (`cached_tokens` 484 of 608); requests without tools give 0.2.0's ids (9 of 9
+  benchmark bodies). `tool_choice` `required` or a named function is refused: it would need constrained decoding.
+- `reasoning: {"enabled", "effort"}` in a request, as some agent clients send it: another spelling of
+  `reasoning_effort` (`enabled: false` turns thinking off); `reasoning_effort` wins when both are given.
+
+### Changed
+
+- A prompt chunk reads its PLE rows on another thread while the GPU runs layer 0, instead of before its first kernel
+  is queued. The rows and the output are the same. Through one `torch_server` process on the Jetson AGX Orin 64 GB on
+  2026-11-14, with the nine benchmark requests in order, the mean time to the first token went from 14.47 to 14.29 s
+  for code review, 15.47 to 15.19 s for prose and 15.43 to 15.11 s for repetition. The ids were unchanged and the decode
+  speed was the same.
+- A request without `max_tokens` may generate what the context has left, instead of at most 4,096 tokens, as agent
+  clients that send none expect (thinking counts against it). `torch_server --max-tokens-default N` still caps it.
+
 ## [0.2.0] - 2026-11-14
 
 ### Changed

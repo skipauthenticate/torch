@@ -21,14 +21,14 @@ tokens.
 
 ## Speed
 
-Measured on the Orin on 2026-11-14. Each workload is three requests with 4,096-token prompts, a 262,144-token context
+Measured on the Orin on 2026-11-15. Each workload is three requests with 4,096-token prompts, a 262,144-token context
 and 256 generated tokens, all nine sent to one server process. Medians, greedy.
 
 | Workload | Answer speed | Prompt processing | 4,096-token prompt |
 | --- | ---: | ---: | ---: |
-| Code review | 36.2 tokens/s | about 280 tokens/s | 14.5 s |
-| Writing | 32.5 tokens/s | about 265 tokens/s | 15.5 s |
-| Repetitive text | 50.1 tokens/s | about 265 tokens/s | 15.5 s |
+| Code review | 35.7 tokens/s | about 285 tokens/s | 14.3 s |
+| Writing | 33.6 tokens/s | about 270 tokens/s | 15.1 s |
+| Repetitive text | 52.3 tokens/s | about 275 tokens/s | 15.0 s |
 
 With the opt-in `--fast-prefill`, the 4,096-token prompt takes about 10.6 s for code review and 11.5 s for the other
 two; answers can then differ slightly from the default exact path.
@@ -38,13 +38,14 @@ two; answers can then differ slightly from the default exact path.
 
 | Same settings | Code review | Writing | Repetitive text |
 | --- | ---: | ---: | ---: |
-| This release, answer speed | 36.2 | 32.5 | 50.1 |
+| This release, answer speed | 35.7 | 33.6 | 52.3 |
 | v0.1.0, answer speed (2026-11-13) | 31.9 | 32.5 | 46.2 |
-| This release, 4,096-token prompt | 14.5 s | 15.5 s | 15.5 s |
+| This release, 4,096-token prompt | 14.3 s | 15.1 s | 15.0 s |
 | v0.1.0, 4,096-token prompt | about 19 s | about 19 s | about 19 s |
 
 A long context takes memory that would otherwise hold more of the model's experts, so speed depends on the context you
-ask for and on how much memory is free on the board. v0.1.0's prompts took 18.6-19.8 s on 2026-11-13. A sampled
+ask for and on how much memory is free on the board (one request's speed moves by about 1 token/s between
+loads). v0.1.0's prompts took 18.6-19.8 s on 2026-11-13. A sampled
 request with a fixed seed gives the same tokens with speculation on or off.
 [How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
@@ -84,8 +85,9 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 }'
 ```
 
-Streaming, thinking (returned as `reasoning_content`), stop strings, seeds and multi-turn conversations that don't
-read the earlier turns again are all supported. The server answers one request at a time and listens only on your
+Streaming, thinking (returned as `reasoning_content`), stop strings, seeds, multi-turn conversations that don't
+read the earlier turns again, and tool calls for agent clients (the server runs no tool; your client does) are all
+supported. The server answers one request at a time and listens only on your
 machine unless you give it an API key. [Server guide](docs/server.md)
 
 `--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.5 -> 10.6 s on code

@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import queue
+import re
 import secrets
 import select
 import socket
@@ -18,16 +19,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import engine as E
-from .chat import END_IDS, ChatError, Output
+from .chat import END_IDS, NAME, ChatError, Output
 
 log = logging.getLogger("torch_server")
 
 DEFAULTS = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}  # the model file's recommended sampling
 UNSUPPORTED = {
-    "tools": "Tool calling is not supported by this server.",
-    "functions": "Function calling is not supported by this server.",
-    "tool_choice": "Tool calling is not supported by this server.",
-    "function_call": "Function calling is not supported by this server.",
+    "functions": "The legacy functions field is not supported; send tools.",
+    "function_call": "The legacy function_call field is not supported; send tool_choice.",
     "audio": "Audio output is not supported by this server.",
     "prediction": "Predicted outputs are not supported by this server.",
 }
@@ -67,6 +66,61 @@ def _text(content, role, param):
                                         "text.", param)
         return [{"type": "text", "text": p["text"]} for p in content]
     raise RequestError(400, "A message's content must be a string or a list of text parts.", param)
+
+
+def _name(x):
+    return isinstance(x, str) and re.fullmatch(NAME, x) is not None
+
+
+def _tools(body):
+    """(name -> parameters schema, the tools as sent) for a request with function tools, else (None, None)."""
+    tools = body.get("tools")
+    if tools is None or tools == []:
+        return None, None
+    if not isinstance(tools, list):
+        raise RequestError(400, "tools must be a list of function tools.", "tools")
+    schemas = {}
+    for i, t in enumerate(tools):
+        if not isinstance(t, dict) or t.get("type") != "function":
+            kind = t.get("type") if isinstance(t, dict) else None
+            raise RequestError(400, f"Only function tools are supported{f', not {kind}' if kind else ''}.",
+                               f"tools[{i}]")
+        f = t.get("function")
+        if not isinstance(f, dict) or not _name(f.get("name")):
+            raise RequestError(400, "Each tool needs a function name of 1 to 256 characters without whitespace, <, > "
+                                    "or =.", f"tools[{i}]")
+        if f["name"] in schemas:
+            raise RequestError(400, f"Two tools are named {f['name']}; give each tool its own name.", f"tools[{i}]")
+        if f.get("parameters") is not None and not isinstance(f["parameters"], dict):
+            raise RequestError(400, "A tool's parameters must be a JSON schema object.", f"tools[{i}]")
+        schemas[f["name"]] = f.get("parameters") or {}
+    return schemas, tools
+
+
+def _history_calls(calls, param):
+    """An assistant message's tool_calls as the template takes them: arguments as a mapping (sent as a JSON string,
+    an object, or nothing)."""
+    if not isinstance(calls, list):
+        raise RequestError(400, "tool_calls must be a list.", param)
+    out = []
+    for j, c in enumerate(calls):
+        f = c.get("function") if isinstance(c, dict) else None
+        if not isinstance(f, dict) or not _name(f.get("name")):
+            raise RequestError(400, "Each tool call needs a function name of 1 to 256 characters without whitespace, "
+                                    "<, > or =.", f"{param}[{j}]")
+        args = f.get("arguments")
+        if args is None or isinstance(args, str) and not args.strip():
+            args = {}
+        elif isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (ValueError, RecursionError):
+                args = None
+        if not isinstance(args, dict) or not all(_name(k) for k in args):
+            raise RequestError(400, "A tool call's function.arguments must be a JSON object (or its JSON text) whose "
+                                    "keys have no whitespace, <, > or =.", f"{param}[{j}]")
+        out.append({"type": "function", "function": {"name": f["name"], "arguments": args}})
+    return out
 
 
 class Job:
@@ -156,7 +210,7 @@ class Worker(threading.Thread):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, chat, engine, model_name, api_key=None, queue_depth=4, max_tokens_default=4096,
+    def __init__(self, address, chat, engine, model_name, api_key=None, queue_depth=4, max_tokens_default=None,
                  max_body=16 << 20):
         super().__init__(address, Handler)
         self.chat, self.engine, self.model_name, self.api_key = chat, engine, model_name, api_key
@@ -223,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/v1/models":
                 return self._json(200, {"object": "list", "data": [
                     {"id": self.server.model_name, "object": "model", "created": self.server.created,
-                     "owned_by": "torch"}]})
+                     "owned_by": "torch", "context_length": self.server.engine.context}]})
             raise RequestError(404, f"There is no GET {self.path}; the server has /v1/models and /health.")
         except RequestError as e:
             self._error(e)
@@ -240,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError(413, f"The request body is over {self.server.max_body >> 20} MiB.")
             try:
                 body = json.loads(self.rfile.read(int(length)))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 raise RequestError(400, "The request body is not valid JSON.") from None
             except TimeoutError:
                 self.close_connection = True
@@ -262,9 +316,18 @@ class Handler(BaseHTTPRequestHandler):
     def _prepare(self, body):
         s = self.server
         for key, message in UNSUPPORTED.items():
-            if body.get(key) not in (None, [], "none") and not (key == "tool_choice" and body.get(key) == "auto"
-                                                               and not body.get("tools")):
+            if body.get(key) not in (None, [], "none"):
                 raise RequestError(400, message, key)
+        schemas, tools = _tools(body)
+        if tools and not s.chat.tool_format:
+            raise RequestError(400, "This model file's chat template has no tool format this server can parse.",
+                               "tools")
+        choice = body.get("tool_choice")
+        if choice not in (None, "auto", "none"):
+            raise RequestError(400, "tool_choice must be auto or none: this server cannot force a call (required or a "
+                                    "named function).", "tool_choice")
+        if choice == "none":  # the tools stay in the prompt (it keeps its cached prefix); calls stay text
+            schemas = None
         if _number(body, "n", 1, 128, 1, integer=True) != 1:
             raise RequestError(400, "Only n = 1 is supported.", "n")
         fmt = body.get("response_format")
@@ -280,21 +343,31 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError(400, "messages must be a non-empty list.", "messages")
         rendered = []
         for i, m in enumerate(messages):
-            if not isinstance(m, dict) or m.get("role") not in ("system", "developer", "user", "assistant"):
-                raise RequestError(400, "Each message needs a role of system, developer, user or assistant (tool "
-                                        "messages need tool calling, which is not supported).", f"messages[{i}]")
-            if m.get("tool_calls"):
-                raise RequestError(400, "Tool calling is not supported by this server.", f"messages[{i}]")
+            if not isinstance(m, dict) or m.get("role") not in ("system", "developer", "user", "assistant", "tool"):
+                raise RequestError(400, "Each message needs a role of system, developer, user, assistant or tool.",
+                                   f"messages[{i}]")
+            if m["role"] == "tool" and not (rendered and (rendered[-1]["role"] == "tool"
+                                                          or rendered[-1].get("tool_calls"))):
+                raise RequestError(400, "Put each tool message after the assistant message that made the call.",
+                                   f"messages[{i}]")
             r = {"role": m["role"], "content": _text(m.get("content"), m["role"], f"messages[{i}].content")}
             if m["role"] == "assistant" and isinstance(m.get("reasoning_content"), str):
                 r["reasoning_content"] = m["reasoning_content"]
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                r["tool_calls"] = _history_calls(m["tool_calls"], f"messages[{i}].tool_calls")
             rendered.append(r)
 
-        # thinking: chat_template_kwargs.enable_thinking, else reasoning_effort ("none" turns it off), else on
-        effort, thinking = body.get("reasoning_effort"), True
+        # thinking: chat_template_kwargs.enable_thinking, else reasoning_effort ("none" turns it off), else the same in
+        # the spelling some clients send, reasoning: {"enabled": false} or {"effort": ...}, else on
+        effort, thinking, param = body.get("reasoning_effort"), True, "reasoning_effort"
+        reasoning = body.get("reasoning")
+        if effort is None and reasoning is not None:
+            if not isinstance(reasoning, dict) or not isinstance(reasoning.get("enabled", True), bool):
+                raise RequestError(400, "reasoning must be an object with enabled (true or false) and effort.",
+                                   "reasoning")
+            effort, param = "none" if reasoning.get("enabled") is False else reasoning.get("effort"), "reasoning.effort"
         if effort is not None and effort != "none" and effort not in EFFORT:
-            raise RequestError(400, "reasoning_effort must be none, minimal, low, medium, high or xhigh.",
-                               "reasoning_effort")
+            raise RequestError(400, f"{param} must be none, minimal, low, medium, high or xhigh.", param)
         if effort == "none":
             thinking, effort = False, None
         kwargs = body.get("chat_template_kwargs") or {}
@@ -302,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
             thinking = kwargs["enable_thinking"]
         template_effort = EFFORT.get(effort) if thinking and effort else None
         try:
-            ids, stable = s.chat.prompt(rendered, thinking, template_effort)
+            ids, stable = s.chat.prompt(rendered, thinking, template_effort, tools)
         except ChatError as e:
             raise RequestError(400, str(e), "messages") from None
 
@@ -318,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError(400, f"The prompt ({len(ids):,} tokens) and max_tokens ({asked:,}) are more than the "
                                         f"server's context of {s.engine.context:,} tokens.", "max_tokens",
                                    "context_length_exceeded")
-        max_tokens = asked if asked is not None else min(room, s.max_tokens_default)
+        max_tokens = asked if asked is not None else min(room, s.max_tokens_default or room)
 
         # sampling
         temperature = _number(body, "temperature", 0.0, 2.0, DEFAULTS["temperature"])
@@ -355,7 +428,8 @@ class Handler(BaseHTTPRequestHandler):
         stream = body.get("stream") is True
         options = body.get("stream_options") or {}
         usage = stream and isinstance(options, dict) and options.get("include_usage") is True
-        job = Job(self.connection, ids, stable, params, Output(s.chat, thinking, stops))
+        output = Output(s.chat, thinking, stops, schemas, body.get("parallel_tool_calls") is not False)
+        job = Job(self.connection, ids, stable, params, output)
         job.ext, job.thinking, job.created = ext, thinking, int(time.time())
         job.id = "chatcmpl-" + uuid.uuid4().hex
         return job, stream, usage
@@ -381,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
         return usage, torch
 
     def _finish_reason(self, job, stats):
+        if job.output.calls:
+            return "tool_calls"
         if job.output.stopped or stats.finish == E.FINISH_STOP:
             return "stop"
         return "length"
@@ -392,7 +468,6 @@ class Handler(BaseHTTPRequestHandler):
             ev = job.events.get()
             if ev[0] == "tokens":
                 job.tokens.extend(ev[1])
-                continue
             yield ev
             if ev[0] == "done":
                 return
@@ -417,6 +492,8 @@ class Handler(BaseHTTPRequestHandler):
             msg = {"role": "assistant", "content": job.output.text["content"]}
             if job.thinking or job.output.text["reasoning"]:
                 msg["reasoning_content"] = job.output.text["reasoning"].strip()
+            if job.output.calls:
+                msg["content"], msg["tool_calls"] = msg["content"] or None, job.output.calls
             self._json(200, {"id": job.id, "object": "chat.completion", "created": job.created,
                              "model": self.server.model_name,
                              "choices": [{"index": 0, "message": msg, "finish_reason": self._finish_reason(job, stats),
@@ -455,9 +532,13 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             job.mark_gone()
         send(chunk({"role": "assistant", "content": ""}))
+        quiet = time.monotonic()
         for ev in self._events(job):
             if ev[0] == "prefill":
                 send(b": prefill %d/%d\n\n" % (ev[1], ev[2]))  # keeps client and proxy read timeouts from firing
+            elif ev[0] == "tokens" and job.output.tail is not None and time.monotonic() - quiet > 5:
+                send(b": tool call %d tokens\n\n" % len(job.output.tail))  # tool calls are sent whole, at the end
+                quiet = time.monotonic()
             elif ev[0] == "delta":
                 d = {k if k == "content" else "reasoning_content": v for k, v in ev[1].items() if v}
                 send(chunk(d))
@@ -473,6 +554,8 @@ class Handler(BaseHTTPRequestHandler):
                 d = {k if k == "content" else "reasoning_content": v for k, v in tail.items() if v}
                 if d:
                     send(chunk(d))
+                for i, call in enumerate(job.output.calls or []):
+                    send(chunk({"tool_calls": [{"index": i} | call]}))
                 usage, torch = self._answer_parts(job, stats, None)
                 send(chunk({}, self._finish_reason(job, stats), torch=torch))
                 if include_usage:

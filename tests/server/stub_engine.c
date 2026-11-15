@@ -29,8 +29,8 @@ struct torch_engine {
 static atomic_int running; /* a request is in torch_engine_generate */
 
 static struct {
-    int32_t ids[MAX_IDS], n, stable, generated;
-    torch_engine_params params;
+    int32_t ids[MAX_IDS], n, stable, generated, stop_ids[64];
+    torch_engine_params params; /* its stop_ids point at the copy above: the caller's array is gone after the call */
     int cancelled_by_progress, stopped_by_tokens, requests;
 } last_request;
 
@@ -109,6 +109,10 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
         stable = n_ids;
     memcpy(last_request.ids, ids, sizeof(int32_t) * (size_t)n_ids);
     last_request.n = n_ids, last_request.stable = stable, last_request.params = *p, last_request.generated = 0;
+    last_request.params.n_stop_ids = p->n_stop_ids < 0 ? 0 : p->n_stop_ids < 64 ? p->n_stop_ids : 64;
+    if (last_request.params.n_stop_ids > 0)
+        memcpy(last_request.stop_ids, p->stop_ids, sizeof(int32_t) * (size_t)last_request.params.n_stop_ids);
+    last_request.params.stop_ids = last_request.stop_ids;
     last_request.cancelled_by_progress = 0, last_request.stopped_by_tokens = 0, ++last_request.requests;
 
     /* the session: keep the previous request's stable prefix when this prompt starts with it */

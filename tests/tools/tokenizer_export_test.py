@@ -8,7 +8,8 @@ goldens made with the base model's tokenizer.json:
   back to the goldens' text;
 - DIR/chat_template.jinja, rendered in the sandbox the server uses (`render` below), gives the goldens' ids for each
   conversation: system and developer messages, several turns, thinking on, off and unset, reasoning sent back,
-  content given as text parts, with and without the generation prompt.
+  content given as text parts, with and without the generation prompt, and tools: their definitions, calls in
+  history (arguments as mappings, as the server passes them), and tool results.
 
 usage: tokenizer_export_test.py DIR
        tokenizer_export_test.py --write-goldens BASE_TOKENIZER_JSON DIR   (regenerates the goldens' ids from the base
@@ -76,6 +77,48 @@ CHATS = [
      {"enable_thinking": False}),
     ("no generation prompt, thinking off", [{"role": "user", "content": U1}],
      {"enable_thinking": False, "add_generation_prompt": False}),
+]
+
+# Tool conversations (tests/server/test_server.py sends the same ones in the API's shape and expects these ids)
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_weather", "description": "The current weather in a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"},
+                                                        "units": {"type": "string", "enum": ["c", "f"]}},
+                       "required": ["city"]}}},
+    {"type": "function", "function": {
+        "name": "search_files", "description": "Finds files whose text matches a pattern.",
+        "parameters": {"type": "object", "properties": {"pattern": {"type": "string"},
+                                                        "paths": {"type": "array", "items": {"type": "string"}},
+                                                        "case_sensitive": {"type": "boolean"}},
+                       "required": ["pattern"]}}},
+]
+U3 = "What's the weather in Paris and in Tokyo, and which notes mention them?"
+CALLS = [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris", "days": 2}}},
+         {"type": "function", "function": {"name": "search_files", "arguments": {
+             "pattern": "Paris|Tokyo", "paths": ["notes/", "travel.md"], "case_sensitive": False}}}]
+RESULTS = [{"role": "tool", "tool_call_id": "call_1", "content": '{"temperature": 14, "sky": "cloudy"}'},
+           {"role": "tool", "tool_call_id": "call_2", "content": "notes/trip.md:3: Paris in May\ntravel.md:9: Tokyo"}]
+CHATS += [
+    ("tools, one user turn, thinking off", [{"role": "user", "content": U1}], {"enable_thinking": False,
+                                                                              "tools": TOOLS}),
+    ("tools and a system message, thinking on", [{"role": "system", "content": "You are a travel assistant."},
+                                                 {"role": "user", "content": U3}], {"enable_thinking": True,
+                                                                                    "tools": TOOLS}),
+    ("tools, a call and its result, thinking off",
+     [{"role": "user", "content": U3}, {"role": "assistant", "content": "", "tool_calls": CALLS[:1]}, RESULTS[0]],
+     {"enable_thinking": False, "tools": TOOLS}),
+    ("tools, two calls after text and reasoning, two results, thinking on",
+     [{"role": "system", "content": "You are a travel assistant."}, {"role": "user", "content": U3},
+      {"role": "assistant", "content": "Let me check both.", "reasoning_content": "Two lookups are needed.",
+       "tool_calls": CALLS}, *RESULTS], {"enable_thinking": True, "tools": TOOLS}),
+    ("tools, results then an answer and a new question, low effort",
+     [{"role": "user", "content": U3}, {"role": "assistant", "content": None, "tool_calls": CALLS}, *RESULTS,
+      {"role": "assistant", "content": "Paris is cloudy at 14 C; trip.md mentions it."},
+      {"role": "user", "content": U2}], {"reasoning_effort": "low", "tools": TOOLS}),
+    ("tools, a call and its result, no generation prompt",
+     [{"role": "user", "content": U3}, {"role": "assistant", "content": "", "tool_calls": CALLS[:1]}, RESULTS[0]],
+     {"enable_thinking": False, "tools": TOOLS, "add_generation_prompt": False}),
 ]
 
 

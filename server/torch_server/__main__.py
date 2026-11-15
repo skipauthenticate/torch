@@ -45,8 +45,9 @@ def main(argv=None):
                    help="require 'Authorization: Bearer KEY' (default: $TORCH_SERVER_API_KEY)")
     p.add_argument("--model-name", help="the model id the API reports (default: from --model's file name)")
     p.add_argument("--queue", type=int, default=4, help="requests that may wait for the engine (more: HTTP 429)")
-    p.add_argument("--max-tokens-default", type=int, default=4096,
-                   help="max_tokens of a request that gives none (and fits the context)")
+    p.add_argument("--max-tokens-default", type=int,
+                   help="the most tokens a request that gives no max_tokens may generate (default: what the context "
+                        "has left)")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 

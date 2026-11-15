@@ -7,6 +7,8 @@
   board_gates.py URL session                       turn 2's cached_tokens == turn 1's stable_tokens
   board_gates.py URL disconnect BODY BODY2         close a stream mid-answer (BODY), and a request mid-prompt (BODY2)
   board_gates.py URL speed BODY                    one speculative greedy request: decode tok/s
+  board_gates.py URL tools                         tool prompts, thinking off and on: calls parse and match their
+                                                   schemas, streamed equals not, the follow-up keeps the prefix
   board_gates.py compare OUT.json LOGS...          the server's ids against `torch run --quiet` logs
 """
 import http.client
@@ -23,8 +25,11 @@ def post(url, body, timeout=1200):
     c = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
     c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
     r = c.getresponse()
-    data = json.loads(r.read())
+    raw = r.read()
     c.close()
+    if body.get("stream"):
+        return [json.loads(x[6:]) for x in raw.decode().split("\n") if x.startswith("data: {")]
+    data = json.loads(raw)
     if r.status != 200:
         raise SystemExit(f"HTTP {r.status}: {data}")
     return data
@@ -147,6 +152,110 @@ def speed(url, body_path):
           f"{t['total_experts']} resident")
 
 
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_weather", "description": "The weather forecast for a city.",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string", "description": "City name"},
+            "days": {"type": "integer", "description": "Days ahead, 1 to 7"},
+            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["city"]}}},
+    {"type": "function", "function": {
+        "name": "calculator", "description": "Evaluates an arithmetic expression exactly.",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string"}, "precision": {"type": "integer", "description": "Decimal places"}},
+            "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "search_files", "description": "Finds files whose text matches a regular expression.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}},
+            "case_sensitive": {"type": "boolean"}}, "required": ["pattern"]}}},
+]
+TOOL_PROMPTS = [  # (name, prompt, calls expected)
+    ("single", "What will the weather be in Paris over the next 3 days, in celsius?", 1),
+    ("parallel", "Compare the current weather in Paris and in Tokyo.", 2),
+    ("calculator", "Use the calculator: what is 17.5% of 2,340, to 2 decimal places?", 1),
+    ("array", "Find the files under docs/ and src/ that mention 'invoice', ignoring case.", 1),
+    ("no call", "Say hello in French, nothing else.", 0),
+]
+JSON_TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+
+
+def schema_ok(name, args):
+    s = next((t["function"]["parameters"] for t in TOOLS if t["function"]["name"] == name), None)
+    if s is None or not isinstance(args, dict):
+        return False
+    props = s["properties"]
+    return all(k in args for k in s.get("required", [])) and all(
+        k in props and isinstance(v, JSON_TYPES[props[k]["type"]]) and not (props[k]["type"] in ("integer", "number")
+                                                                            and isinstance(v, bool))
+        and v in props[k].get("enum", [v]) for k, v in args.items())
+
+
+def streamed(chunks):
+    """(content, [(name, arguments)], finish_reason) from a stream's chunks."""
+    content, calls, finish = "", {}, None
+    for c in chunks:
+        for ch in c["choices"]:
+            content += ch["delta"].get("content") or ""
+            for t in ch["delta"].get("tool_calls") or []:
+                slot = calls.setdefault(t["index"], ["", ""])
+                slot[0] += t["function"].get("name") or ""
+                slot[1] += t["function"].get("arguments") or ""
+            finish = ch["finish_reason"] or finish
+    return content, [tuple(calls[i]) for i in sorted(calls)], finish
+
+
+def tool_gate(url):
+    bad, counts = 0, {"requests": 0, "calls": 0, "schema ok": 0, "as content": 0, "in reasoning": 0}
+    for thinking, seeds, limit in ((False, (1, 2), 1024), (True, (1,), 6144)):
+        for seed in seeds:
+            for name, prompt, want in TOOL_PROMPTS:
+                messages = [{"role": "user", "content": prompt}]
+                body = {"messages": messages, "tools": TOOLS, "seed": seed, "max_tokens": limit,
+                        "chat_template_kwargs": {"enable_thinking": thinking}}
+                r = post(url, body)
+                c, t = r["choices"][0], r["torch"]
+                m, calls = c["message"], c["message"].get("tool_calls") or []
+                args = [json.loads(x["function"]["arguments"]) for x in calls]
+                ok = [schema_ok(x["function"]["name"], a) for x, a in zip(calls, args)]
+                raw = "<tool_call>" in (m.get("content") or "")
+                counts["requests"] += 1
+                counts["calls"] += len(calls)
+                counts["schema ok"] += sum(ok)
+                counts["as content"] += raw
+                counts["in reasoning"] += "<tool_call>" in (m.get("reasoning_content") or "")
+                bad += raw or not all(ok)
+                print(f"thinking {'on ' if thinking else 'off'} seed {seed} {name:10}: {c['finish_reason']:10} "
+                      f"{len(calls)} calls (want {want}) {[(x['function']['name'], a) for x, a in zip(calls, args)]} "
+                      f"schema {sum(ok)}/{len(ok)}, {r['usage']['completion_tokens']} tokens "
+                      f"({r['usage']['completion_tokens_details']['reasoning_tokens']} reasoning), "
+                      f"prompt {r['usage']['prompt_tokens']} cached {t['cached_tokens']}, "
+                      f"{t['prompt_seconds'] + t['decode_seconds']:.1f} s"
+                      + (f"\n    content: {m.get('content')!r}" if raw or not calls else ""), flush=True)
+                if seed == 1 and name == "parallel":
+                    if not thinking:  # the same seeded request streamed: the same calls
+                        s_content, s_calls, s_finish = streamed(post(url, body | {"stream": True}))
+                        same = (s_content, s_calls, s_finish) == (m.get("content") or "", [
+                            (x["function"]["name"], x["function"]["arguments"]) for x in calls], c["finish_reason"])
+                        bad += not same
+                        print(f"    streamed: {'equal' if same else 'DIFFER'} ({s_finish}, {len(s_calls)} calls)")
+                    if calls:  # the follow-up turn with results keeps turn 1's stable prefix
+                        follow = messages + [m] + [{"role": "tool", "tool_call_id": x["id"], "content": json.dumps(
+                            {"city": a.get("city"), "temperature_c": 14 + 9 * i, "sky": ["cloudy", "clear"][i % 2]})}
+                            for i, (x, a) in enumerate(zip(calls, args))]
+                        if not thinking:  # the stream above was the last request: send turn 1 again first
+                            post(url, body)
+                        r2 = post(url, body | {"messages": follow})
+                        cached = r2["usage"]["prompt_tokens_details"]["cached_tokens"]
+                        bad += cached != t["stable_tokens"]
+                        print(f"    follow-up: {r2['choices'][0]['finish_reason']}, cached {cached} of "
+                              f"{r2['usage']['prompt_tokens']} (turn 1 stable {t['stable_tokens']}), prompt "
+                              f"{r2['torch']['prompt_seconds']:.2f} s: {(r2['choices'][0]['message'].get('content') or '')[:120]!r}",
+                              flush=True)
+    print(json.dumps(counts))
+    sys.exit(1 if bad else 0)
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[0] == "compare":
@@ -156,4 +265,4 @@ if __name__ == "__main__":
     else:
         {"sampled": lambda: sampled(a[0], a[2:]), "openai": lambda: openai_client(a[0]),
          "session": lambda: session(a[0]), "disconnect": lambda: disconnect(a[0], a[2], a[3]),
-         "speed": lambda: speed(a[0], a[2])}[a[1]]()
+         "speed": lambda: speed(a[0], a[2]), "tools": lambda: tool_gate(a[0])}[a[1]]()
