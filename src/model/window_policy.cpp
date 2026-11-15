@@ -17,8 +17,8 @@ constexpr int kProbeEvery = 32;  // windows of no drafts after which one draft i
 
 }  // namespace
 
-WindowPolicy::WindowPolicy(int max_drafts, std::vector<double> seed_costs)
-    : max_drafts_(max_drafts), cost_(std::move(seed_costs)) {
+WindowPolicy::WindowPolicy(int max_drafts, std::vector<double> seed_costs, bool tight)
+    : max_drafts_(max_drafts), tight_(tight), cost_(std::move(seed_costs)) {
     if (max_drafts < 0 || max_drafts > 7)
         throw Error("A window has at most 7 drafts; lower max_drafts.");
     if (cost_.size() != static_cast<size_t>(max_drafts) + 1)
@@ -63,8 +63,12 @@ bool WindowPolicy::more(int drafted, float p_last) {
     if (drafted >= max_drafts_)
         return false;
     double best = 0.0, optimistic = 0.0;
+    int best_d = 0;
     for (int d = 0; d <= drafted; ++d)
-        best = std::max(best, expected_per_ms(d, 0.0));
+        if (const double v = expected_per_ms(d, 0.0); v > best)
+            best = v, best_d = d;
+    if (tight_ && best_d < drafted)
+        return false;
     double top = 0.0;
     for (size_t b = 0; b < kBuckets; ++b)
         top = std::max(top, accepted_[b] / trials_[b]);

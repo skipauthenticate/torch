@@ -5,6 +5,61 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
+### Changed
+
+- Faster code review (M8). Measured on the Jetson AGX Orin 64 GB on 2026-11-14 with nine 4,096-token chat requests
+  (three code review, three prose, three repetitive text, 256 greedy tokens each) sent in that order to one
+  `torch_server` process, F16 KV for 262,144 tokens allocated up front: the code review median went from 32.6 to
+  35.0 tok/s with the three new defaults below (31.9 for v0.1.0's own build in the same session), and to 36.0-37.3
+  tok/s with the prefill chunk's buffer lent as well. The generated ids are unchanged on all nine requests.
+  docs/performance.md, M8, has every measurement.
+- New defaults, measured together in one process with 15,500 experts pinned (one ABBA pair): code review decode time
+  -7.9%, prose -1.5%, repetition -9.6%.
+  - When a window's misses fill the 80-slot staging, the misses held so far are swapped in at that point instead of
+    being dropped (CPU copies inside the window; off with KV lending; `torch run --no-swap-when-full` or
+    `TORCH_SWAP_WHEN_FULL=0`).
+  - 128 swaps a window instead of 32 (`torch run --swap`, `torch_server --swaps`); none during the prompt.
+  - The draft head has 81,920 rows instead of 40,960 (`calibration/ed59f920/draft-vocab.txt`).
+- Between a prompt's end and the next prefill, the prefill chunk's idle device buffer (1.47 GiB at 4,096 columns)
+  holds ~760 more experts: the ones the prompt routed most that are not resident. One server process, two ABBA pairs:
+  code review decode time -4.1%, prose -1.6%, repetition -1.4%, time to the first token +0.43 s. `torch run
+  --no-lend-chunk` or `TORCH_LEND_CHUNK=0` turns it off.
+- Time to the first token through the server: code review 19.7 -> 17.1 s, prose and repetition 19.6 -> 18.7 s. Each
+  distinct PLE row is read once per prompt, the draft's K/V-only pass over a prompt chunk runs 8 positions as columns,
+  three prefill GEMM changes, and the chunk buffer's reads overlap the draft's last pass.
+- Time to the first token on the default (exact) path, through the server in the benchmark's order on 2026-11-14:
+  code review 17.3 -> 14.5 s, prose and repetition 18.8 -> 15.5 s, with the same answers and decode speed. In prefill
+  the shared expert's gate and up run on the tensor cores, the routed experts' SwiGLU, Q8 and activation re-layouts read
+  and write whole rows, the K = 640 down projections run each output's tree in one warp, the resident experts run while
+  the SSD reads the rest of the layer's experts, and a product's few rows past its last 64-row tile no longer take a
+  tile. Each output is bitwise what it was. `--fast-prefill` gains as much: code review 12.9 -> 10.6 s.
+- Window kernels: IQ3_XXS gate and up with the grid's signs applied, short BF16 matrices reading their activations
+  directly, and 192-unit dense rows on a whole warp at 3-4 columns: code review's GPU compute -0.5 ms a window at 2
+  columns and -1.15 ms at 3.
+- Mixers and dense products in verify windows: a mixer's up projection and collapse run as one launch, and the dense
+  products at 3-6 columns stage their columns once per resident block. Code review's GPU time per window -0.4 ms at
+  width 2 and -1.4 ms at width 4, its most common width; the generated ids are unchanged.
+- Experts in lent memory (`--lend-kv` and the chunk buffer) are read through the hedged reads, so a read that stalls in
+  the SSD is issued again after 50 ms instead of holding the lend for the driver's 30 s timeout.
+
+### Added
+
+- `--fast-prefill` (torch run and torch_server; `TORCH_FAST_PREFILL=1`; the C API's `fast_prefill`, ABI 2, with ABI 1
+  callers' shorter struct still accepted): the prompt's BF16 products on the tensor cores with the activations rounded
+  to BF16. Time to the first token on the nine 4,096-token benchmark prompts 16.9 -> 13.0 s (code review) and 18.4 ->
+  14.4 s (prose, repetition); not bitwise the default path, so greedy answers can differ (7 of the 9 benchmark answers
+  did), deterministic and independent of the chunk size, model parity mean KL 0.00158 (gate 0.0041). Off by default.
+- `torch run --resident-total N`: the ranked placement and the top-up after loading stop at N experts in total, to
+  compare runs at equal bytes. torch run's generation line also prints the misses' read time and the swaps made when
+  the staging filled; `bench/run_workloads.py` records both.
+- `TORCH_DECODE_STAGES=1` prints the GPU milliseconds per window by stage and window width.
+- `torch run --carry-policy` (the window policy keeps what it learned across `--then` requests) and
+  `--spec-policy adaptive-tight` (drafting stops once a draft would not be verified). Both measured slower on code
+  review in one process (+8.4% and +11.6% decode time: a carried policy locks at one draft a window), so neither is a
+  default.
+
 ## [0.1.0] - 2026-11-14
 
 ### Added

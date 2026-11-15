@@ -457,6 +457,37 @@ void check_bf16_columns(int rows, int rows2, int cols, float silu) {
     std::printf("%-40s %s\n", what.c_str(), same ? "ok" : "FAIL");
 }
 
+// gemv_bf16_collapse at T = 1..8 against gemv_bf16 and hc_collapse one column at a time: mixed and its Q8 blocks bit
+// for bit (a mixer's up projection, hc x n rows of `cols`).
+void check_bf16_collapse(int n, int hc, int cols) {
+    const int T8 = kernels::kMaxColumns, rows = hc * n;
+    const std::vector<uint8_t> m = random_bf16(rows, cols, 95);
+    const std::vector<float> x = activations(T8 * cols, 96), xn = activations(T8 * rows, 97);
+    DeviceBuffer<uint8_t> dm(m);
+    DeviceBuffer<float> dx(x), dxn(xn), gate(static_cast<size_t>(rows)), want(static_cast<size_t>(T8) * n),
+        got(static_cast<size_t>(T8) * n);
+    DeviceBuffer<kernels::BlockQ8> want_q8(static_cast<size_t>(T8) * n / 32), got_q8(static_cast<size_t>(T8) * n / 32);
+    for (int c = 0; c < T8; ++c) {
+        kernels::gemv_bf16(dm.get(), rows, cols, dx.get() + static_cast<size_t>(c) * cols, gate.get(), nullptr);
+        kernels::hc_collapse(dxn.get() + static_cast<size_t>(c) * rows, gate.get(),
+                             want.get() + static_cast<size_t>(c) * n, want_q8.get() + static_cast<size_t>(c) * n / 32,
+                             n, hc, nullptr);
+    }
+    const std::vector<float> w = want.download();
+    const std::vector<kernels::BlockQ8> wq = want_q8.download();
+    bool same = true;
+    for (int T = 1; T <= T8; ++T) {
+        same = same && kernels::gemv_bf16_collapse(dm.get(), n, hc, cols, dx.get(), dxn.get(), got.get(), got_q8.get(),
+                                                   nullptr, T);
+        const std::vector<float> g = got.download();
+        const std::vector<kernels::BlockQ8> gq = got_q8.download();
+        same = same && std::memcmp(g.data(), w.data(), static_cast<size_t>(T) * n * sizeof(float)) == 0 &&
+               std::memcmp(gq.data(), wq.data(), static_cast<size_t>(T) * n / 32 * sizeof(kernels::BlockQ8)) == 0;
+    }
+    CHECK(same);
+    std::printf("%-40s %s\n", "columns 1-8 bf16 up + hc_collapse", same ? "ok" : "FAIL");
+}
+
 }  // namespace
 
 // A window's routes as the window gate numbers them: 10 distinct routes a column out of 24 experts (so columns share
@@ -646,6 +677,7 @@ int main() {
         check_group_columns({{Type::Q4_K, 37}, {Type::IQ4_XS, 37}}, true);
         check_bf16_columns(37, 0, 320, 0.0f);
         check_bf16_columns(320, 4, 10240, 0.25f);
+        check_bf16_collapse(2560, 4, 320);
         check_bf16_columns(37, 5, 2560, 0.0f);
         for (Type t : {Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S, Type::IQ4_XS})
             check_experts_window(t, 37, 2560);  // gate and up of the routed experts, 37 rows of 2,560

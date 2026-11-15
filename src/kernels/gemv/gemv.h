@@ -83,6 +83,13 @@ void gemv_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, c
 void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, int cols, const float* x, float* y,
                     float* y2, cudaStream_t stream, float silu_scale = 0.0f, int columns = 1);
 
+// A hyper-connection mixer's up projection and collapse in one launch, over `columns` (1 to kMaxColumns) columns:
+// gate = W x for W of hc * n BF16 rows of `cols` values, then mixed[e] and its n / 32 Q8 blocks exactly as
+// hc_collapse(xn, gate, mixed, q8, n, hc) computes them (kernels/hc/hc.h), bitwise; gate itself is not stored.
+// Supports hc == 4, n % 32 == 0 and cols <= 320 (gemv_bf16's short rows); returns false, launching nothing, otherwise.
+bool gemv_bf16_collapse(const uint8_t* w, int n, int hc, int cols, const float* x, const float* xn, float* mixed,
+                        BlockQ8* q8, cudaStream_t stream, int columns = 1);
+
 // Routed experts. For each slot s < slots, W_s = table[s] (a device-readable pointer table, so a resident expert and
 // one read into a staging slot run the same code) and x_s = x + s * x_stride blocks:
 //   up_table == nullptr: y[s * rows + r] = W_s[r] . x_s                      (the down projection)

@@ -36,6 +36,11 @@ public:
     // ple_dim floats each), issuing all count x ple_heads reads at once. count is at most the constructor's columns.
     void read_window(std::span<const int32_t> history, size_t first, int count, float* out);
 
+    // read_window for any count (a prefill chunk): each distinct row is read and dequantized once, however many
+    // tokens and heads share it (a code prompt's n-grams repeat: review-1 has 6,968 distinct rows in 65,536), at most
+    // the constructor's columns x ple_heads reads at a time. The same values as read_window.
+    void read_tokens(std::span<const int32_t> history, size_t first, int count, float* out);
+
     // The table row each head reads for history[i]. Predecessors before the start of the history read as the PLE
     // end-of-sequence token, and an end of sequence among the predecessors cuts the window there (the token's own
     // end of sequence does not).

@@ -30,8 +30,10 @@ public:
     static constexpr int kBuckets = 8;
 
     // seed_costs[d] is the expected milliseconds of a window of d drafts, for d = 0 .. max_drafts (one more than
-    // max_drafts entries, all positive); max_drafts is at most 7, the window having at most 8 columns.
-    WindowPolicy(int max_drafts, std::vector<double> seed_costs);
+    // max_drafts entries, all positive); max_drafts is at most 7, the window having at most 8 columns. With `tight`,
+    // more() also stops once width() would not verify every draft so far (a draft that is drafted and then not
+    // verified costs a full draft pass for nothing).
+    WindowPolicy(int max_drafts, std::vector<double> seed_costs, bool tight = false);
 
     // The drafter has produced draft number `drafted` (1 for the first of a window) with probability p_last. Returns
     // true when another draft is worth drafting: fewer than max_drafts so far and one or two more drafts, accepted as
@@ -50,12 +52,15 @@ public:
     // The learned acceptance rate for a draft of probability p, and the current cost estimate of d drafts.
     double acceptance(float p) const;
     double cost(int drafts) const { return cost_[static_cast<size_t>(drafts)]; }
+    int max_drafts() const { return max_drafts_; }
+    bool tight() const { return tight_; }
 
 private:
     static int bucket(float p);
     double expected_per_ms(int drafts, double next_acceptance) const;
 
     int max_drafts_;
+    bool tight_;
     std::vector<double> cost_;
     std::array<double, kBuckets> accepted_{}, trials_{};  // observations including the prior
     std::vector<float> verified_;                         // probabilities of the drafts width() chose, for observe()

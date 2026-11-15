@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <random>
 
 #include "core/error.h"
@@ -127,6 +128,11 @@ Result Generator::generate(const Request& r, const Observer& o) {
             if (i + t + 1 == sequence.size())                   // greedy: the GPU's argmax, ties to the lowest id
                 next = r.sample ? m_.sample(params, chunked ? 0 : static_cast<int>(t), 1)[0]
                                 : m_.argmax(chunked ? 0 : static_cast<int>(t));
+        // The prompt's last prefill chunk: the chunk buffer's lend (Model::lend_chunk) reads its experts from the SSD
+        // while the draft's KV-only passes over the chunk run, and is joined before anything else uses the model.
+        std::future<int> early;
+        if (chunked && i + kept == prefilled && sequence.size() < total)
+            early = std::async(std::launch::async, [this] { return m_.lend_chunk(true); });
         // The draft layer over the window's kept positions i .. i + kept - 1: the KV-only pass at prompt positions
         // whose next token is known, then drafts from the argmax at the last position while tokens are still to be
         // generated (the KV-only pass at the window's other positions in the same call). A chunk's positions go
@@ -156,10 +162,14 @@ Result Generator::generate(const Request& r, const Observer& o) {
                 else
                     ++st.draft_steps;
             }
+        if (early.valid())
+            early.get();
         if (kept < width && !m_.accept(static_cast<int>(kept)))
             throw Error(m_.error());
         i += kept;
         if (i == prompt.size()) {  // the prompt is in (once): the caller counts the generation's misses from here
+            if (sequence.size() < total)
+                m_.lend_chunk();  // its reads count in the prompt's time
             out.prompt_s = ms_since(prompt_start) / 1000.0;
             if (o.on_prompt_end)
                 o.on_prompt_end();
@@ -184,13 +194,16 @@ Result Generator::generate(const Request& r, const Observer& o) {
     // the last one.
     if (r.spec > 0 && sequence.size() > prompt.size() && !out.cancelled) {
         const auto spec_start = Clock::now();
-        const bool adaptive = r.policy != "fixed", stop_early = r.policy == "adaptive-stop";
+        const bool adaptive = r.policy != "fixed", tight = r.policy == "adaptive-tight",
+                   stop_early = r.policy == "adaptive-stop" || tight;
         // Seed costs of a window of d drafts (milliseconds, drafting included): about 16 ms per verified column after
         // ~50 ms (measured with D = 3 on the review prompts, 96 ms a window); the policy follows the observed times.
         std::vector<double> seed_costs;
         for (int k = 0; k <= r.spec; ++k)
             seed_costs.push_back(50.0 + 16.0 * k);
-        model::WindowPolicy policy(r.spec, seed_costs);
+        if (!r.carry_policy || !policy_ || policy_->max_drafts() != r.spec || policy_->tight() != tight)
+            policy_.emplace(r.spec, seed_costs, tight);
+        model::WindowPolicy& policy = *policy_;
         const std::function<bool(int, float)> more = [&](int drafted, float prob) {
             return policy.more(drafted, prob);
         };

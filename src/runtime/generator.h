@@ -24,6 +24,7 @@
 #include "kernels/sampling/sample.h"
 #include "model/draft.h"
 #include "model/model.h"
+#include "model/window_policy.h"
 
 namespace torch::runtime {
 
@@ -32,9 +33,12 @@ struct Request {
     int max_tokens = 16;
     std::vector<int32_t> stop_ids;  // generation stops after any of these (the stop id is kept)
     // Speculation: up to `spec` drafts per verify window (0: one token at a time; needs the draft layer) and how many a
-    // window verifies: "fixed" (all), "adaptive" or "adaptive-stop" (model/window_policy.h).
+    // window verifies: "fixed" (all), "adaptive", "adaptive-stop" or "adaptive-tight" (model/window_policy.h).
     int spec = 0;
     std::string policy = "adaptive-stop";
+    // The adaptive policy keeps what it learned (acceptance by draft probability, window costs) from the last request
+    // with the same spec on this generator, instead of starting from its seeds.
+    bool carry_policy = false;
     int draft_depth = 3;          // drafts per generated token without speculation (acceptance measurements)
     int swaps_after_prompt = -1;  // Model::set_swaps_per_window once the prompt is in (-1: unchanged)
     // Sampling instead of the argmax: the parameters (their seed is ignored), and the seed (a random one when absent,
@@ -118,6 +122,7 @@ private:
     model::Draft* draft_;
     int variants_, prefill_columns_;
     std::vector<int32_t> sequence_;
+    std::optional<model::WindowPolicy> policy_;  // the last request's, for Request::carry_policy
 };
 
 }  // namespace torch::runtime

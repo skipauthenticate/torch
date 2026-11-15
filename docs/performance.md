@@ -68,12 +68,12 @@ it at start and prints its own version of this table.
 ## Prefill
 
 Prefill is compute-bound on this board, not SSD-bound as first estimated: a 4,096-token chunk reads its ~4,950
-non-resident experts (~10 GB) in the background while ~16.3 s of GPU work runs (architecture decision 11). The race's
-review prompt 1 (4,096 tokens, `--context 262144`, `calib-g-spec.txt`, one chunk), GPU seconds per stage from CUDA
-events (`TORCH_PREFILL_STAGES=1`), on the Orin, before and after the tuning round of 2026-11-13. Its three kept commits
-measured, one run each: cfc67c8 20.3 s (GEMM tree nodes padded against bank conflicts), 51c7338 18.7 s (BF16 passes
-staged as one sequence, so the 10240 x 320 mixer up projection leaves the one-column kernel; BF16 5.02 s), af4641e
-17.8 s (two 256-thread int8 GEMM blocks an SM; experts 5.36 to 4.57 s). The experts stage varies by about 0.1 s
+non-resident experts (~10 GB) in the background while ~13.7 s of GPU work runs (architecture decision 11; M8 below). The
+race's review prompt 1 (4,096 tokens, `--context 262144`, `calib-g-spec.txt`, one chunk), GPU seconds per stage from
+CUDA events (`TORCH_PREFILL_STAGES=1`), on the Orin, before and after the tuning round of 2026-11-13. Its three kept
+commits measured, one run each: cfc67c8 20.3 s (GEMM tree nodes padded against bank conflicts), 51c7338 18.7 s (BF16
+passes staged as one sequence, so the 10240 x 320 mixer up projection leaves the one-column kernel; BF16 5.02 s),
+af4641e 17.8 s (two 256-thread int8 GEMM blocks an SM; experts 5.36 to 4.57 s). The experts stage varies by about 0.1 s
 between runs (the read-ahead).
 
 | Stage | 2026-11-12, ac29367 | 2026-11-13, af82794 (final) |
@@ -509,6 +509,216 @@ instead of 4,096 under the same harness gave 583 more resident experts but media
 `tools/check_orin.sh` at f1e1b8b: unit and kernel parity tests, model parity (mean KL 0.00211), graph = eager and the
 residency identity pass; the kernel gates carried from M3 are missed (35 launch classes of 1 MiB or more below 85% of
 the ceiling, launches under 1 MiB 2.30 ms against 2). `ctest`: every unit and parity test passes.
+
+## M8: the code-review benchmark
+
+Measured on 2026-11-13 and 2026-11-14 on the Jetson AGX Orin 64 GB with the benchmark's settings: nine chat requests of
+4,096 prompt tokens each (three code review, three prose, three repetitive text), 256 greedy tokens each, F16 KV for
+262,144 tokens allocated up front, prefill chunks of 4,096. They run in one process, a short warmup first, then code
+review 1-3, prose 1-3 and repetition 1-3 in that order, so the experts that swaps make resident carry from one request
+to the next. MemAvailable before loading was 50.4-50.7 GiB in every session, but what the top-up could fill after
+loading moved by up to ~1,650 experts within a session (15,960-18,240 resident; another user's session was on the
+board). Decode follows the resident count (about 0.72 tok/s per 1,000 experts), so A/B runs either pin the count with
+`torch run --resident-total N` (equal bytes) or alternate ABBA at a free fill. One pair resolves about 1% of total
+decode time on review (two identical passes at 17,000 experts differed by 1.0%) and about 5% of generation misses. In
+every run below, all nine answers have the same generated ids as v0.1.0's.
+
+**Where a code-review window goes** (one `torch run --then` process in that order, 16,888 resident, measured with
+temporary timing instrumentation; ms per speculative window):
+
+| Request | Window | GPU compute | Miss stall | Draft | Host | Tokens per window | Misses per window (re-missed) | tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| Review 1 | 81.0 | 58.0 | 16.7 | 4.9 | 1.4 | 2.28 | 28.6 (36%) | 27.94 |
+| Review 2 | 73.5 | 58.0 | 8.7 | 5.6 | 1.3 | 2.42 | 13.3 (17%) | 32.81 |
+| Review 3 | 76.3 | 60.6 | 8.5 | 5.8 | 1.3 | 2.71 | 12.5 (3%) | 35.28 |
+
+Review 2, the median, is compute-bound: GPU compute is ~39-40 ms for one column plus ~9 ms for each more. Its misses are
+mostly cold (82-92% first in the request). With no misses at all it would run at ~37.3 tok/s [est].
+
+**Swaps when the staging fills.** The staging holds 80 experts for a whole window, and a miss that did not fit used to
+drop every miss held so far, so a wide window kept only its last layers' experts. Now the I/O thread swaps the held
+misses in first (CPU copies: GPU work queued from that thread while the window waits on it never runs). One process,
+equal bytes, total decode time of the three review requests:
+
+| Experts | Swap 32 (old) | Swap 64 | Swap 128 | Swap 64 + when full | Swap 128 + when full |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16,000 | 25.50 s | 25.20 / 25.15 s | | 24.89 s | 24.02 s (-5.8%) |
+| 15,500 | 25.87 / 25.81 s | | 26.00 / 25.75 s | | 25.15 / 24.82 s (-3.3%) |
+
+Review generation misses fall 27-56%; at 15,500 prose is -0.9% and repetition -5.9%. Most of the gain carries across
+requests: review 2 needs about half the misses after review 1 kept its own. Without the swaps when full, 128 swaps a
+window change nothing.
+
+**Draft head rows.** The draft scores a subset of the output head, ordered by the calibration prompts' generated ids.
+6.8% of the code-review answers' tokens fall outside 40,960 rows (1.0% outside 81,920). Depth-1 acceptance on the
+benchmark's answers (accepted drafts of 3 in parentheses) and the cost of a draft step (eager, 7 steps):
+
+| Head rows | Review | Prose | Repetition | Draft ms per 7 steps |
+| ---: | --- | --- | --- | ---: |
+| 40,960 | 79.8% (1.82) | 72.7% (1.38) | 95.2% (2.64) | 12.2 |
+| 81,920 | 83.8% (1.96) | 75.5% (1.48) | 98.4% (2.82) | 16.0 |
+| 102,400 | 84.3% (1.98) | 77.1% (1.54) | 100.0% (2.92) | 17.9 |
+
+Through the server in the benchmark's order (~16,400 resident, two passes each), 81,920 rows took review 1-3 from 25.07
+/ 24.95 s to 24.28 / 24.18 s (-3.1%) and the review median from 31.6-31.9 to 33.5-33.9; 102,400 rows were no better.
+
+**Both together**, one process at 15,500 experts, ABBA: swap 128 with swaps when full and the 81,920-row head against
+the old defaults took review from 26.03 to 23.98 s (-7.9%; median 30.7 to 34.0), prose -1.5% and repetition -9.6%.
+
+**Window kernels** (review 2's GPU compute by window width, from a stage timeline in the window graphs): an IQ3_XXS grid
+with its signs applied, BF16 rows of short matrices read directly, and 192-unit dense rows on a whole warp at 3-4
+columns took width 2 from 50.4 to ~49.9 ms and width 3 from 59.5 to ~58.3 ms. The remaining gap to 85% of the bandwidth
+ceiling is ~3 ms a window, in steps of 0.1-0.4 ms; the kernel gates carried from M3 are still missed.
+
+**Mixers and dense products at 2-6 columns** (the same stage timeline; one `torch_server` process per pass with a
+warmup and code review 1-3, passes in the order before, after, after, before, ~17,000 experts resident). Width 4 was the
+most common width on code review 2 in three of the four passes (44-50 of ~97 windows; width 3 in the fourth), then
+width 2 (35-37). Three changes, each bitwise the
+previous kernels:
+
+- a mixer's up projection and its collapse into the block input run as one launch (`gemv_bf16_collapse`): 97 launches
+  fewer a window;
+- the dense group launches at two rows a lane group (3-8 columns), and `ssm_out` and `attn_output` at 3-4 columns, run
+  only the blocks that stay resident, each staging the columns' activations once while its warps loop over the rows;
+- a mixer's down projection with its inject rows reads its activations directly at 2 columns.
+
+| Width | GPU compute per window | Dense stage | Mixers stage |
+| ---: | --- | --- | --- |
+| 2 | 50.01-50.08 -> 49.59-49.67 ms | 15.34-15.37 -> 15.33-15.34 | 10.07-10.09 -> 9.77-9.78 |
+| 3 | 58.31-58.69 -> 57.58-57.90 | 16.36 -> 15.66-15.68 | 10.65 -> 10.53-10.54 |
+| 4 | 66.41-66.52 -> 64.67-65.07 | 17.74-17.75 -> 16.66 | 11.83-11.85 -> 11.66-11.67 |
+| 6 | 87.46-87.53 -> 85.99-86.56 | 21.73-21.75 -> 20.84-20.86 | 15.07-15.11 -> 14.62-14.66 |
+
+Over the nine requests (one pass each, 16,972 and 17,003 experts resident) decode time went from 22.39 to 22.21 s on
+code review, 23.43 to 23.22 s on prose and 15.70 to 15.55 s on repetitive text, about 1%, which one pair cannot
+separate from noise; the generated ids are v0.1.0's on all nine. The kernel harness at one column now counts 1,010
+launches a token, 476 of them under 1 MiB taking 2.05 ms (was 573 taking 2.29 ms). Measured and not kept: 32 lanes a
+row for group launches at 2-3 columns, the looping launch for one-row groups, for the 16-lane dense kernel (the output
+head slower) and at 5-8 columns for `ssm_out`, 256-chunk staging segments or one block per SM for the mixer's down
+projection, and loading all of a short BF16 row's chunks before the first product (the router slower).
+
+**The prefill chunk's buffer lent to experts during decode.** The chunk's 1.47 GiB device buffer is idle once the prompt
+is in. It now holds the ~760 non-resident experts the prompt routed most, read at the prompt's end and taken back before
+the next prefill (this is scratch memory, not the KV cache). One server process in the benchmark's order, two pairs:
+review -4.1%, prose -1.6%, repetition -1.4% total decode time, +0.43 s to the first token. Lending the next experts of
+the calibration ranking instead gave +0.9% / -1.2% / -1.5%.
+
+**Time to the first token.** Code review 1 alone (4,096 tokens, `torch run`, two runs each), then the server in the
+benchmark's order:
+
+| Change | Review 1 prompt | Of it, GPU prefill |
+| --- | ---: | ---: |
+| Base (lending on) | 19.3 / 19.4 s | 16.45 / 16.54 s |
+| The M6 near-miss GEMM changes (SwiGLU, Q8 and re-layout over a pass's slots only; down's route indices loaded early; BF16 GEMM warps as 16 x 2 groups) | 19.0 / 19.1 s | 16.11 / 16.14 s |
+| The draft's K/V-only pass over a chunk as multi-column passes (up to 8 positions) instead of one position at a time | 18.3 / 18.3 s | 16.09-16.11 s |
+| Each distinct PLE row read and dequantized once (code prompts repeat their n-grams: 6,968 distinct rows of 4,096 positions x 16 on review 1) | 17.1 / 17.2 s | 16.20 / 16.23 s |
+
+The SSD serves the PLE rows' 4 KiB reads at ~47,000 a second whatever the thread count, so fewer reads is the lever:
+1.39 s -> 0.15 s on review 1. Overlapping the chunk lend's reads with the draft's last K/V pass saves another ~0.3 s.
+Through the server: review 19.7 -> 17.1 s, prose and repetition 19.6 -> 18.7 s (their PLE rows repeat less: 81%
+distinct). The prefill stays bitwise against windows of 8 (300 and 2,200 tokens), the draft K/V bitwise against a fresh
+pass, ids unchanged, decode unchanged within noise.
+
+**Prompt speed on the exact path, continued (2026-11-14, evening).** GPU times per call site (CUDA events around each
+launch site of the chunk, in a build with extra timing) showed small kernels around the GEMMs costing far more than
+their work, and the GPU idle inside the experts stage while it waited for SSD reads. Code review 1 (4,096 tokens),
+`torch run` as above; the first rows each in their own run of the model, the last three alternating in one session at
+~15,385 resident experts (the resident count varies by 1,000-2,000 experts between model loads, and the experts stage
+with it):
+
+| Change | Review 1 prompt | Prose 1 | Repetition 1 | Of review 1, GPU prefill |
+| --- | ---: | ---: | ---: | ---: |
+| Base (de2bf53) | 16.8 / 16.8 s | 18.2 s | 18.3 s | 16.17 / 16.20 s |
+| The shared expert's gate and up on the tensor cores (in prefill they still ran the 8-column window kernel) | 16.1 / 16.1 s | 17.7 s | 17.6 s | 15.47 / 15.51 s |
+| The experts' SwiGLU and Q8 one thread a unit instead of a warp (587 -> 145 ms); activation gathers through shared memory (264 -> 71 ms; q8_to_columns 63 -> 33 ms) | 15.4 / 15.4 s | 16.4 s | 16.4 s | 14.81 / 14.81 s |
+| K <= 640 down projections (IQ4_NL, Q2_0) with each output's tree in one warp: routed downs 1,356 -> 859 ms, the shared expert's 88 -> 51 ms | 15.0 / 15.1 s | 16.2 s | 16.2 s | 14.42 / 14.44 s |
+| The resident experts as their own pass after the read-ahead's two pools (the GPU had waited 518 ms for reads) | 14.6 / 14.5 s | 15.5 s | 15.5 s | 13.97 / 13.92 s |
+| The rows past a BF16 product's last whole tile (a mixer's 4 inject rows, the router's shared gate) a warp a column instead of a 64-row tile | 14.3 / 14.3 / 14.4 s | 15.3 s | 15.3 s | 13.71-13.77 s |
+
+GPU seconds by stage, base -> final: dense int8 3.53 -> 2.65, BF16 4.83 -> 4.61, routed experts 4.55 -> 3.19, attention
+1.24, DeltaNet 0.91, everything else 1.12; total 16.18 -> 13.73. `--fast-prefill` gains the same: code review 1 12.9 ->
+10.6 s, prose 1 and repetition 1 14.2 -> 11.5 s (one run each, one session, the final stack before the last row).
+Through the server in the benchmark's order (one process each, same session, 2026-11-14 21:55-22:03):
+
+| Prompt seconds | Code review 1-3 | Prose 1-3 | Repetition 1-3 | Decode medians (tok/s) | Ids equal to v0.1.0's |
+| --- | --- | --- | --- | --- | ---: |
+| de2bf53 | 17.34 / 17.22 / 17.20 | 18.84 / 18.85 / 18.86 | 18.82 / 18.88 / 18.79 | 36.24 / 32.48 / 50.14 | 9 of 9 |
+| This change set | 14.55 / 14.49 / 14.44 | 15.48 / 15.48 / 15.41 | 15.49 / 15.42 / 15.51 | 36.01 / 32.52 / 49.98 | 9 of 9 |
+
+No decode code changed; the medians differ within one pass's noise (an earlier session before the last row: 37.43 /
+33.39 / 51.54 against 37.42 / 33.38 / 51.62). Every change keeps the prefill bitwise against windows of 8 (300 and 2,200
+tokens) and the draft K/V bitwise. Tried and dropped, measured: gemm_bf16 at two blocks an SM (tree levels 2-4 in shared
+memory, stages of 4 chunks): 1.5x slower; gemm_bf16 with each stage unrolled as one sequence: slower on every shape;
+loading a single word of x or w per value instead of 16 or 8 bytes: no faster (the kernel is bound by latency at 192
+registers, not by shared memory); without the tree folds mixer up would be 12% faster, so pairing the folds could save
+~0.1 s; prefetching each GEMM block's next rows into L2: no change; the down kernel at 256 threads (914 ms) and 1,024
+threads (741 ms) against 512 (707 ms). Read-ahead pools of 2 x 128 also remove the read wait, but take 0.32 GiB (~100
+resident experts) from decode.
+
+**`--fast-prefill` (opt-in; the default stays the exact path).** The prefill's BF16 products (the hyper-connection
+mixers, the router and the other BF16 projections) on the tensor cores, activations rounded to BF16, F32 accumulation
+(`kernels::gemm_bf16_tc`, 128 x 64 tiles, K 64 at a time). Code review 1 alone: the BF16 stage 4.82 -> 0.88 s, the
+prompt 16.7 -> 12.7 s. Through the server in the benchmark's order (2026-11-14, one pass each, same session):
+
+| Prompt seconds | Code review 1-3 | Prose 1-3 | Repetition 1-3 | Answers equal to v0.1.0's |
+| --- | --- | --- | --- | ---: |
+| Default (exact) | 17.00 / 16.88 / 16.81 | 18.36 / 18.37 / 18.44 | 18.38 / 18.35 / 18.38 | 9 of 9 |
+| `--fast-prefill` | 13.13 / 13.03 / 12.97 | 14.47 / 14.47 / 14.44 | 14.43 / 14.39 / 14.39 | 2 of 9 |
+
+Its error against the exact prefill on the nine benchmark prompts (chunks of 1,024, 16 tokens one at a time): logits at
+the 36 chunk ends within 2.73 (mean |difference| 0.118, KL median 1.6e-3, max 0.23); generated steps while both runs saw
+the same tokens within 4.70 (mean 0.096, KL median 1.3e-4, max 0.023). Model parity against the reference: mean KL
+0.00158 (the default 0.00211; gate 0.0041). The answers that change diverge at a near-tie in three of the four checked
+(top-2 logit margin 0.002 to 0.09) and at a 0.50 margin in one. Deterministic, and the same at chunks of 4,096, 2,048
+and 1,024 (`tools/check_orin.sh` checks 1,100, 550 and 275); `gemm_test` checks each product against the exact sum
+within 2^-8 x sum |w x|. Decode is unchanged.
+
+**The window policy.** It picks how many drafts to verify from learned acceptance by draft probability and the measured
+cost of each width. Variants, one process at 15,500 experts with the new defaults, total review time:
+
+| Policy | Review | Prose | Repetition |
+| --- | ---: | ---: | ---: |
+| Fresh per request (default) | 23.82 s | 24.79 s | 16.77 s |
+| Carried across requests (an earlier A/B, before the window kernels) | +8.4% | | |
+| Carried, and drafting stops once a draft would not be verified (the same earlier A/B) | +11.6% | | |
+| Fresh, drafting stops once a draft would not be verified | +2.7% | -0.6% | -1.1% |
+| Carried acceptance rates, costs from the seeds each request | +0.3% | +0.1% | -0.6% |
+| One draft wider every 16th window | +0.8% | -0.3% | +0.4% |
+
+A carried policy locks at one draft a window: it updates the cost only of the width it uses, so the stall-heavy wide
+windows of the first request keep wider widths expensive forever. The default stays a fresh policy per request.
+
+**Where drafting time goes** (review 2, graph mode, events): a draft step is 1.69-1.72 ms of GPU time and 1.74 ms of
+wall time, so launches and syncs cost ~0.05 ms. A full draft pass reads the layer's weights once for one column: head
+rows 0.53 ms, attention and its projections 0.46, the three mixers 0.37, experts 0.28, input 0.15. A window drafts ~2.7
+times and verifies ~2.2 drafts. After a window with a rejected draft the trunk's commit runs on the same stream first
+(~0.6 ms a window that the draft's timer counts). The prompt's draft K/V pass took 0.96 s of each 4,096-token prompt as
+one-column passes.
+
+**Old against new defaults through `torch_server`** (the benchmark's order, free fill, one build with the window
+kernels; old: `--swaps 32 --draft-head-rows 40960`, TORCH_SWAP_WHEN_FULL=0; the v0.1.0 release's own build as the third
+arm; order A B C C B A), total decode time and median tok/s:
+
+| Pass | Resident | Review | Prose | Repetition | First token |
+| --- | ---: | --- | --- | --- | ---: |
+| A old defaults | 16,677 / 16,517 | 24.45 / 24.33 s, 32.76 / 32.41 | 24.12 / 24.18 s | 17.18 / 17.33 s | 19.4 s |
+| B new defaults | 16,619 / 16,602 | 22.93 / 23.28 s, 35.31 / 34.64 | 24.25 / 24.07 s | 16.21 / 16.15 s | 19.3 s |
+| C v0.1.0 | 16,347 / 16,219 | 24.92 / 25.34 s, 32.36 / 31.52 | 24.67 / 24.73 s | 17.78 / 17.63 s | 19.5 s |
+
+The new defaults: review -5.3% against the old ones on the same build and -8.0% against v0.1.0 (C loaded ~300 fewer
+experts), prose 0.0% / -2.2%, repetition -6.2% / -8.6%.
+
+**With the chunk buffer lent** (same server harness, B L L B, the board's free memory rose ~1,650 experts between the
+pairs, so compare within a pair):
+
+| Pass | Resident | Review | Prose | Repetition | First token |
+| --- | ---: | --- | --- | --- | ---: |
+| B, not lent | 16,078 | 23.74 s, median 34.34 | 24.59 s, 31.90 | 16.48 s, 48.54 | 19.59 s |
+| L, lent | 16,358 | 22.90 s, median 36.04 | 23.86 s, 32.00 | 16.10 s, 48.88 | 19.79 s |
+| L, lent | 18,241 | 21.72 s, median 37.27 | 23.08 s, 33.16 | 15.27 s, 50.77 | 19.36 s |
+| B, not lent | 17,726 | 22.40 s, median 36.31 | 23.64 s, 32.45 | 15.99 s, 50.09 | 19.09 s |
+
+Code review median with every M8 change: 36.04 tok/s at ~16,300 resident and 37.27 at ~18,200.
 
 ## Targets
 

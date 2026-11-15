@@ -8,6 +8,7 @@
 // every expert with the same kernel), only speed.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -45,13 +46,14 @@ Placement place_uniform(int k, int n_expert, const std::vector<uint64_t>& expert
 int uniform_capacity(uint64_t room, int n_expert, const std::vector<uint64_t>& expert_bytes);
 
 // The most-routed experts within `room` bytes, in order of count (ties: lower layer, then lower expert id); an expert
-// that does not fit is skipped and smaller ones are still tried.
-Placement place_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, uint64_t room);
+// that does not fit is skipped and smaller ones are still tried. At most `limit` experts.
+Placement place_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, uint64_t room,
+                       size_t limit = SIZE_MAX);
 
-// The next experts in the same order that are not in `have`, within `room` more bytes: what to add once the memory
-// actually left after loading is known.
+// The next experts in the same order that are not in `have`, within `room` more bytes and at most `limit` of them:
+// what to add once the memory actually left after loading is known.
 Placement extend_ranked(const RouteCounts& counts, const std::vector<uint64_t>& expert_bytes, const Placement& have,
-                        uint64_t room);
+                        uint64_t room, size_t limit = SIZE_MAX);
 
 // Counts that rank in place_uniform's order: expert 0 of every layer, then expert 1, and so on.
 RouteCounts uniform_ranking(int n_layer, int n_expert);

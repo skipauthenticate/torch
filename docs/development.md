@@ -92,11 +92,12 @@ FILE` writes every step's top log-probabilities for the parity script. The conte
 milestone M6: below that, the model's sparse attention selects every cell, so dense attention is exact.
 
 `--tokens @FILE` reads the ids from a file (as `bench/workloads/` stores them), `--placement COUNTS` keeps the
-most-routed experts of a route-count file resident and `--route-counts COUNTS` adds the routing of this run's generated
-tokens to one (the prompt's routing predicts the generation's poorly), and `--quiet --profile` prints only the speed,
-the generated ids and where decode time went. Each token runs as one CUDA graph; `TORCH_EAGER=1` launches kernel by
-kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir TORCH_DUMP_STAGES=router,...` writes the named
-stages' values per position and layer.
+most-routed experts of a route-count file resident (with `--resident-total N`, the placement and the top-up stop at N
+experts in total, so two runs compare at equal bytes whatever memory is free) and `--route-counts COUNTS` adds the
+routing of this run's generated tokens to one (the prompt's routing predicts the generation's poorly), and `--quiet
+--profile` prints only the speed, the generated ids and where decode time went. Each token runs as one CUDA graph;
+`TORCH_EAGER=1` launches kernel by kernel instead (the output is byte-identical), and `TORCH_DUMP_DIR=dir
+TORCH_DUMP_STAGES=router,...` writes the named stages' values per position and layer.
 
 ### Verify windows and speculative decoding
 

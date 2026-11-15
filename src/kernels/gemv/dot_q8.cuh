@@ -25,6 +25,9 @@ namespace torch::kernels {
 __device__ __align__(16) uint64_t g_iq2s_grid[1024];
 __device__ __align__(16) uint32_t g_iq3xxs_grid[256];
 __device__ __align__(16) uint32_t g_iq3s_grid[512];
+// IQ3_XXS grid entries already signed, for the multi-column decode: entry i with sign nibble n at 16 i + n, the bytes
+// whose bit is set in n negated as set_signed negates them (one shared-memory load instead of the sign arithmetic).
+__device__ __align__(16) uint32_t g_iq3xxs_signed[256 * 16];
 
 // Bytes of the grid a format's decode reads from shared memory.
 template <Type T>
@@ -41,6 +44,18 @@ __device__ __forceinline__ const void* grid_source() {
         return g_iq3xxs_grid;
     else
         return g_iq3s_grid;
+}
+
+// The table the multi-column kernels stage for decode_unit: IQ3_XXS's signed grid, the plain grid otherwise.
+template <Type T>
+inline constexpr int kColumnGridBytes = T == Type::IQ3_XXS ? sizeof g_iq3xxs_signed : kGridBytes<T>;
+
+template <Type T>
+__device__ __forceinline__ const void* column_grid_source() {
+    if constexpr (T == Type::IQ3_XXS)
+        return g_iq3xxs_signed;
+    else
+        return grid_source<T>();
 }
 
 // One block of 32 activations as the kernels keep it in shared memory (48 bytes, three 16-byte loads).
@@ -593,8 +608,8 @@ __device__ __forceinline__ Unit decode_iq3xxs(const uint8_t* row, int u, const u
         const uint32_t signs7 = aux >> 7 * j & 127;
         const uint32_t signs = signs7 | (__popc(signs7) & 1u) << 7;
         const uint32_t pair = qs[j / 2] >> 16 * (j % 2);
-        set_signed(w, 2 * j, grid[pair & 0xff], signs);
-        set_signed(w, 2 * j + 1, grid[pair >> 8 & 0xff], signs >> 4);
+        w.w[2 * j] = static_cast<int>(grid[(pair & 0xff) << 4 | (signs & 0xf)]);  // grid: g_iq3xxs_signed
+        w.w[2 * j + 1] = static_cast<int>(grid[(pair >> 8 & 0xff) << 4 | (signs >> 4 & 0xf)]);
     }
     w.s0 = 2 * static_cast<int>(aux >> 28) + 1;
     w.d = f16_to_f32(load_u16(b));

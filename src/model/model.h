@@ -40,6 +40,9 @@ struct Options {
     // Tokens the KV cache holds, up to 262,144, allocated at start; above indexer_top_k attention is sparse.
     int context = 2048;
     std::optional<int> resident;  // experts 0 to resident - 1 of every layer resident, exactly, with no top-up (tests)
+    // With `placement`: the placement and the top-up after loading stop at this many experts in total, in the same
+    // order, so two runs compare at equal bytes whatever memory the board has free (measurements).
+    std::optional<int> resident_total;
     // Route counts (core/placement.h) ranking which experts to keep resident; without them, and without `resident`,
     // as many of every layer's first experts as the budget allows.
     std::filesystem::path placement;
@@ -49,6 +52,22 @@ struct Options {
     // After each window, up to this many of the experts it read from the SSD take the slots of the least recently
     // routed resident experts of their layers (core/swaps.h); 0: residency stays as placed. Output does not change.
     int swaps_per_window = 0;
+    // When a window's misses fill the staging, the ones held so far are swapped in then, within the window's swap
+    // budget, instead of being dropped: a wide window's early layers can still be kept (M8: code review -3% to -6%
+    // decode time with 128 swaps a window). The CPU copies those swaps, so it is off with lend_from (tenants are
+    // device memory), and TORCH_SWAP_WHEN_FULL=0 turns it off. Output does not change.
+    bool swap_when_full = true;
+    // Between a prompt's end and the next prefill, the prefill chunk's device buffer (1.47 GiB at 4,096 columns) holds
+    // the experts the prompt routed most that are not resident (then the placement's ranking), read when the prompt is
+    // in (its time to first token, ~0.4 s); prefill() takes the buffer back first. M8: code review -4.1% decode time,
+    // prose -1.6%, repetition -1.4% in one process. TORCH_LEND_CHUNK=0 turns it off. Output does not change.
+    bool lend_chunk = true;
+    // Prefill's BF16 products (the hyper-connection mixers, the router and the other BF16 projections) on the tensor
+    // cores with the activations rounded to BF16 (kernels::gemm_bf16_tc): time to the first token -22% on a 4,096-token
+    // code review prompt, but the prompt is then not computed bitwise as the default path computes it, so a greedy
+    // answer can differ from the default's. Deterministic and independent of the chunk size either way. Off by default;
+    // TORCH_FAST_PREFILL=1 turns it on.
+    bool fast_prefill = false;
     // Positions from which the KV cache's unused tail holds more experts (0: none). Before a window writes K/V rows
     // there, the experts in the next lend_from positions' bytes stop being resident. Output does not change.
     int lend_from = 0;
@@ -75,14 +94,15 @@ struct ExpertStats {
 // Where decode time went, summed over every decode() call (host wall-clock, milliseconds).
 struct DecodeTimes {
     double total = 0;
-    double ple = 0;           // reading and dequantizing the PLE rows
-    double ple_max = 0;       // the slowest token's PLE rows
-    uint64_t ple_slow = 0;    // tokens whose PLE rows took over 5 ms
-    uint64_t ple_hedged = 0;  // PLE row reads issued a second time (hedged_reads.h)
-    double gpu = 0;           // waiting for the GPU after the last launch: the work not yet done, including misses
-    double expert_reads = 0;  // the I/O thread reading non-resident experts (overlaps `gpu`)
-    uint64_t swaps = 0;       // experts made resident after windows (Options::swaps_per_window)
-    double swap_ms = 0;       // choosing them and queueing their copies, between windows
+    double ple = 0;                // reading and dequantizing the PLE rows
+    double ple_max = 0;            // the slowest token's PLE rows
+    uint64_t ple_slow = 0;         // tokens whose PLE rows took over 5 ms
+    uint64_t ple_hedged = 0;       // PLE row reads issued a second time (hedged_reads.h)
+    double gpu = 0;                // waiting for the GPU after the last launch: the work not yet done, including misses
+    double expert_reads = 0;       // the I/O thread reading non-resident experts (overlaps `gpu`)
+    uint64_t swaps = 0;            // experts made resident after windows (Options::swaps_per_window)
+    uint64_t swaps_when_full = 0;  // of those, swapped in when the staging filled (Options::swap_when_full)
+    double swap_ms = 0;            // choosing them and queueing their copies, between windows
 };
 
 class Model {
@@ -140,6 +160,13 @@ public:
     // Changes Options::swaps_per_window from the next window on (for example fewer during a prompt's one-token
     // windows).
     void set_swaps_per_window(int n) noexcept;
+    // Options::lend_chunk: lends the prefill chunk's idle device buffer to experts; call when the prompt is in (the
+    // reads count in its time). prefill() takes the buffer back before it writes there. Swaps never pick these experts,
+    // so nothing else writes into the buffer. Returns how many; 0 when off, without prefill, or already lent.
+    // With early, after the prompt's last prefill chunk and from another thread, while the draft layer's KV-only
+    // passes over the chunk run (nothing else may use the model meanwhile): only the buffer after the chunk's
+    // residuals, which those passes read; the call when the prompt is in then lends the residuals' part.
+    int lend_chunk(bool early = false);
 
     // For the draft layer (draft.h), which runs on the model's stream and reads these, never writes them: the
     // weights (the token embedding and the output head), the stream every window runs on, and column t's 4-stream

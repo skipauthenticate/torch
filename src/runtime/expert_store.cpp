@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <span>
 #include <string>
 
@@ -180,41 +181,59 @@ void ExpertStore::load(const std::vector<std::vector<int32_t>>& resident) {
 }
 
 void ExpertStore::add_tenants(const std::vector<Tenant>& tenants) {
-    uint64_t stride = 0;  // a bounce buffer holds the pages of any matrix
-    for (const model::Layer& L : layers_)
-        for (int kind = 0; kind < 3; ++kind)
-            stride = std::max(stride, slot_bytes(tensor(L, kind).slice_bytes));
     for (const Tenant& t : tenants)
         if (resident(t.layer, t.expert))
             throw Error("Expert " + std::to_string(t.expert) + " of layer " + std::to_string(t.layer) +
                         " is already resident; this is a bug in the engine.");
-    void* p = nullptr;
-    TORCH_CUDA_CHECK(cudaHostAlloc(&p, kReadThreads * stride, cudaHostAllocDefault));
-    uint8_t* bounce = static_cast<uint8_t*>(p);
-    const int n = 3 * static_cast<int>(tenants.size());
-    try {
-        for (int first = 0; first < n; first += kReadThreads)  // one bounce buffer per read thread
-            pool_.run(std::min(kReadThreads, n - first), [&](int j) {
-                const Tenant& t = tenants[static_cast<size_t>((first + j) / 3)];
-                const int kind = (first + j) % 3;
-                const model::Layer& L = layers_[static_cast<size_t>(t.layer)];
-                uint64_t slot = 0;  // the kind's slot in the tenant's memory, as load() lays out an expert
-                for (int k = 0; k < kind; ++k)
-                    slot += slot_bytes(tensor(L, k).slice_bytes);
+    // Through the hedged reads and the staging buffers, kGateSlots experts at a time (no window is running): a read
+    // that stalls in the SSD is issued again after 50 ms instead of holding the lend for 30 s.
+    std::lock_guard lock(io_mutex_);
+    io_->release();
+    held_ = 0;
+    staged_.clear();
+    std::vector<size_t> set;  // map entries written so far, undone if a read fails
+    for (size_t first = 0; first < tenants.size(); first += kGateSlots) {
+        const size_t count = std::min<size_t>(kGateSlots, tenants.size() - first);
+        std::vector<HedgedReads::Request> reads(3 * count);
+        for (size_t i = 0; i < count; ++i) {
+            const Tenant& t = tenants[first + i];
+            for (int kind = 0; kind < 3; ++kind) {
+                const model::ExpertTensor& m = tensor(layers_[static_cast<size_t>(t.layer)], kind);
+                reads[3 * i + static_cast<size_t>(kind)] = {
+                    kind, m.file_offset + static_cast<uint64_t>(t.expert) * m.slice_bytes, m.slice_bytes};
+            }
+        }
+        std::vector<const uint8_t*> data(reads.size());
+        io_->read_all(reads, data);
+        bool failed = false;
+        for (size_t i = 0; i < count && !failed; ++i) {
+            const Tenant& t = tenants[first + i];
+            const model::Layer& L = layers_[static_cast<size_t>(t.layer)];
+            uint64_t slot = 0;  // the kind's slot in the tenant's memory, as load() lays out an expert
+            for (int kind = 0; kind < 3 && !failed; ++kind) {
                 const model::ExpertTensor& m = tensor(L, kind);
-                const uint64_t offset = m.file_offset + static_cast<uint64_t>(t.expert) * m.slice_bytes;
-                const uint8_t* src = file_.read(offset, m.slice_bytes, bounce + static_cast<uint64_t>(j) * stride);
-                uint8_t* dst = t.at + slot + offset % kPage;  // the file's offset within a page, as in a slot
-                TORCH_CUDA_CHECK(cudaMemcpy(dst, src, m.slice_bytes, cudaMemcpyHostToDevice));
+                const HedgedReads::Request& r = reads[3 * i + static_cast<size_t>(kind)];
+                const uint8_t* src = data[3 * i + static_cast<size_t>(kind)];
+                failed = src == nullptr;
+                if (failed)
+                    break;
+                uint8_t* dst = t.at + slot + r.offset % kPage;  // the file's offset within a page, as in a slot
+                TORCH_CUDA_CHECK(cudaMemcpyAsync(dst, src, m.slice_bytes, cudaMemcpyHostToDevice, copies_));
                 const size_t entry =
                     static_cast<size_t>(t.layer) * static_cast<size_t>(n_expert_) + static_cast<size_t>(t.expert);
                 host_map_[entry * 3 + static_cast<size_t>(kind)] = dst;
-            });
-    } catch (...) {
-        cudaFreeHost(bounce);
-        throw;
+                set.push_back(entry * 3 + static_cast<size_t>(kind));
+                slot += slot_bytes(m.slice_bytes);
+            }
+        }
+        TORCH_CUDA_CHECK(cudaStreamSynchronize(copies_));  // before the staging buffers are read into again
+        io_->release();
+        if (failed) {
+            for (const size_t e : set)
+                host_map_[e] = nullptr;
+            throw Error("Reading an expert to lend memory to failed; check the disk.");
+        }
     }
-    cudaFreeHost(bounce);
     std::copy(host_map_.begin(), host_map_.end(), map_);
 }
 
@@ -284,8 +303,15 @@ void ExpertStore::serve() {
         const int count = static_cast<int>(std::min<uint32_t>(mailbox_->count, kGateSlots));
         std::lock_guard lock(io_mutex_);
         // The GPU has finished the earlier requests' experts. Their buffers stay reserved for swaps after the window,
-        // unless this request would not fit next to them.
+        // unless this request would not fit next to them: then on_full_ may swap them in first.
         if (held_ + count > kGateSlots) {
+            if (on_full_ && !staged_.empty()) {
+                try {
+                    on_full_(staged_);
+                } catch (const std::exception&) {
+                    swap_failed_ = true;
+                }
+            }
             io_->release();
             held_ = 0;
             staged_.clear();
@@ -392,7 +418,7 @@ void ExpertStore::clear_stamps() {
     std::fill(last_use_, last_use_ + n_route_counts_, 0u);
 }
 
-void ExpertStore::swap_in(const Staged& in, int out) {
+void ExpertStore::swap_in(const Staged& in, int out, bool on_cpu) {
     const size_t n = static_cast<size_t>(n_expert_), l = static_cast<size_t>(in.layer);
     const size_t to = (l * n + static_cast<size_t>(in.expert)) * 3, from = (l * n + static_cast<size_t>(out)) * 3;
     if (host_map_[to] != nullptr || host_map_[from] == nullptr)
@@ -402,13 +428,16 @@ void ExpertStore::swap_in(const Staged& in, int out) {
         // the slot starts at the page the resident matrix starts in; the newcomer keeps its own offset in a page
         const uintptr_t slot = page_floor(reinterpret_cast<uintptr_t>(host_map_[from + static_cast<size_t>(kind)]));
         uint8_t* dst = reinterpret_cast<uint8_t*>(slot + reinterpret_cast<uintptr_t>(in.data[kind]) % kPage);
-        // a GPU copy: both ends are mapped pinned memory, which cudaMemcpyAsync copies on the CPU, synchronously
-        copy_bytes(dst, in.data[kind], t.slice_bytes, copies_);
+        // both ends are pinned memory the CPU can address; between windows a kernel on copies_ copies them
+        if (on_cpu)
+            std::memcpy(dst, in.data[kind], t.slice_bytes);
+        else
+            copy_bytes(dst, in.data[kind], t.slice_bytes, copies_);
         // the map entries change now: no window reads them before before_window() has waited for the copies
         host_map_[to + static_cast<size_t>(kind)] = map_[to + static_cast<size_t>(kind)] = dst;
         host_map_[from + static_cast<size_t>(kind)] = map_[from + static_cast<size_t>(kind)] = nullptr;
     }
-    pending_ = true;
+    pending_ = pending_ || !on_cpu;
 }
 
 void ExpertStore::end_swaps() {
@@ -431,6 +460,8 @@ void ExpertStore::before_window() {
 void ExpertStore::check() const {
     if (failed_)
         throw Error("Reading a non-resident expert from the SSD failed; check the disk.");
+    if (swap_failed_)
+        throw Error("Swapping in a window's misses when the staging was full failed; this is a bug in the engine.");
     if (mailbox_->error)
         throw Error("A non-resident expert did not arrive within 2 s; the I/O thread stalled.");
 }

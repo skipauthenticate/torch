@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "../unit/check.h"
 #include "device.h"
 #include "formats/types.h"
+#include "kernels/moe/moe.h"
 
 using namespace torch;
 using kernels::BlockQ8;
@@ -166,6 +168,68 @@ void check_experts(Type type, int rows, int cols, bool per_route, int columns, u
     CHECK(books);
 }
 
+// expert_h_columns over a pass's experts: their real slots bitwise swiglu, quantize_q8 and q8_to_columns.
+void check_expert_h() {
+    constexpr int kExperts = 12, k = 10, columns = 37, FF = 640, units = FF / 32;
+    const int routes = columns * k;
+    std::mt19937 rng(77);
+    std::vector<int32_t> ids(static_cast<size_t>(routes));
+    for (int t = 0; t < columns; ++t)
+        for (int r = 0; r < k; ++r)
+            ids[static_cast<size_t>(t * k + r)] = r == 0 ? 3 : static_cast<int32_t>(rng() % 10);
+    DeviceBuffer<int32_t> did(ids);
+    DeviceBuffer<uint8_t> bucket_memory(kernels::expert_buckets_bytes(kExperts, routes));
+    const kernels::ExpertBuckets b = kernels::expert_buckets_at(bucket_memory.get(), kExperts, routes);
+    DeviceBuffer<int32_t> pos(std::vector<int32_t>{100});
+    DeviceBuffer<unsigned long long> counts(std::vector<unsigned long long>(kExperts, 5));
+    DeviceBuffer<uint32_t> stamps(std::vector<uint32_t>(kExperts, 7));
+    kernels::expert_buckets(did.get(), routes, k, kExperts, b, 0, pos.get(), counts.get(), stamps.get(), nullptr);
+    const std::vector<int32_t> pass = {1, 3, 4};  // as routed_experts writes a pass's list
+    const int32_t n = static_cast<int32_t>(pass.size());
+    TORCH_CUDA_CHECK(cudaMemcpy(b.list, pass.data(), sizeof(int32_t) * pass.size(), cudaMemcpyHostToDevice));
+    TORCH_CUDA_CHECK(cudaMemcpy(b.n_list, &n, sizeof n, cudaMemcpyHostToDevice));
+    const size_t values = static_cast<size_t>(b.slots) * FF;
+    DeviceBuffer<float> g(test::random_floats(values, -4.0f, 4.0f, 78)),
+        u(test::random_floats(values, -2.0f, 2.0f, 79));
+    DeviceBuffer<float> h(values);
+    DeviceBuffer<BlockQ8> hq(values / 32);
+    const size_t bytes = kernels::q8_columns_bytes(units, b.slots + 64);
+    DeviceBuffer<uint8_t> want_memory(std::vector<uint8_t>(bytes, 0)), got_memory(std::vector<uint8_t>(bytes, 0));
+    kernels::Q8Columns want = kernels::q8_columns_at(want_memory.get(), units, b.slots + 64);
+    kernels::Q8Columns got = kernels::q8_columns_at(got_memory.get(), units, b.slots + 64);
+    want.columns = got.columns = b.slots;
+    kernels::swiglu(g.get(), u.get(), h.get(), b.slots * FF, nullptr);
+    kernels::quantize_q8(h.get(), static_cast<int64_t>(values), hq.get(), nullptr);
+    kernels::q8_to_columns(hq.get(), want, nullptr);
+    kernels::expert_h_columns(g.get(), u.get(), b, kExperts, got, nullptr);
+    std::vector<int32_t> first(kExperts), count(kExperts);
+    TORCH_CUDA_CHECK(cudaMemcpy(first.data(), b.first, sizeof(int32_t) * kExperts, cudaMemcpyDeviceToHost));
+    TORCH_CUDA_CHECK(cudaMemcpy(count.data(), b.counts, sizeof(int32_t) * kExperts, cudaMemcpyDeviceToHost));
+    const std::vector<uint8_t> a = want_memory.download(), c = got_memory.download();
+    // q, d and sum of one (unit, slot), at the same offsets in both layouts
+    const auto d_base = static_cast<size_t>(reinterpret_cast<const uint8_t*>(want.d) - want_memory.get());
+    const auto s_base = static_cast<size_t>(reinterpret_cast<const uint8_t*>(want.sum) - want_memory.get());
+    const auto cell = [&](const std::vector<uint8_t>& m, int64_t at) {
+        const auto i = static_cast<size_t>(at);
+        std::vector<uint8_t> v(m.begin() + static_cast<std::ptrdiff_t>(32 * i),
+                               m.begin() + static_cast<std::ptrdiff_t>(32 * i + 32));
+        v.insert(v.end(), m.begin() + static_cast<std::ptrdiff_t>(d_base + 4 * i),
+                 m.begin() + static_cast<std::ptrdiff_t>(d_base + 4 * i + 4));
+        v.insert(v.end(), m.begin() + static_cast<std::ptrdiff_t>(s_base + 2 * i),
+                 m.begin() + static_cast<std::ptrdiff_t>(s_base + 2 * i + 2));
+        return v;
+    };
+    size_t compared = 0, differ = 0;
+    for (const int e : pass)
+        for (int s2 = first[static_cast<size_t>(e)]; s2 < first[static_cast<size_t>(e)] + count[static_cast<size_t>(e)];
+             ++s2)
+            for (int unit = 0; unit < units; ++unit, ++compared)
+                differ += cell(a, int64_t{unit} * want.stride + s2) != cell(c, int64_t{unit} * want.stride + s2);
+    std::printf("%-44s %s (%zu of %zu cells differ)\n", "expert_h_columns over a pass's slots",
+                differ == 0 && compared > 0 ? "ok" : "FAIL", differ, compared);
+    CHECK(differ == 0 && compared > 0);
+}
+
 // BF16 weights x F32 activations: every column bitwise gemv_bf16 (and gemv_bf16_pair's SiLU of a scaled sum).
 void check_bf16(int rows, int cols, int columns, float silu_scale, uint32_t seed, int rows2 = 0) {
     const int total = rows + rows2;
@@ -204,6 +268,71 @@ void check_bf16(int rows, int cols, int columns, float silu_scale, uint32_t seed
     CHECK(differ == 0);
 }
 
+// gemm_bf16_tc (--fast-prefill) against the exact sum in double: every output within gemm.h's bound, 2^-8 x
+// sum_k |w_k x_k| before the SiLU (after it, x 1.1 x the scale: the SiLU's slope is at most 1.0998); a second launch
+// gives the same bits, and so does a launch of one column (the result does not depend on the column count).
+void check_bf16_tc(int rows, int cols, int columns, float silu_scale, uint32_t seed, int rows2 = 0) {
+    const int total = rows + rows2;
+    std::vector<uint8_t> w(static_cast<size_t>(total) * static_cast<size_t>(cols) * 2);
+    std::vector<float> wf(static_cast<size_t>(total) * static_cast<size_t>(cols));
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.05f);
+    for (size_t i = 0; i < wf.size(); ++i) {
+        const uint16_t h = static_cast<uint16_t>(std::bit_cast<uint32_t>(normal(rng)) >> 16);
+        std::memcpy(w.data() + 2 * i, &h, 2);
+        wf[i] = std::bit_cast<float>(static_cast<uint32_t>(h) << 16);
+    }
+    const std::vector<float> xf = test::random_floats(static_cast<size_t>(cols) * columns, -3.0f, 3.0f, seed + 1);
+    DeviceBuffer<uint8_t> dw(w);
+    DeviceBuffer<float> x(xf);
+    const uint8_t* w2 = rows2 > 0 ? dw.get() + static_cast<size_t>(rows) * cols * 2 : nullptr;
+    const size_t n1 = static_cast<size_t>(rows) * columns, n2 = static_cast<size_t>(std::max(rows2, 1)) * columns;
+    DeviceBuffer<float> got(n1), got2(n2), again(n1), again2(n2), one(rows), one2(std::max(rows2, 1));
+    CHECK(kernels::gemm_bf16_tc(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2,
+                                got2.get()));
+    CHECK(kernels::gemm_bf16_tc(dw.get(), rows, cols, x.get(), again.get(), columns, silu_scale, nullptr, w2, rows2,
+                                again2.get()));
+    const int last = columns - 1;  // one column alone: the last, which a full launch puts in a partial tile
+    CHECK(kernels::gemm_bf16_tc(dw.get(), rows, cols, x.get() + static_cast<size_t>(last) * cols, one.get(), 1,
+                                silu_scale, nullptr, w2, rows2, one2.get()));
+    const std::vector<float> a = got.download(), a2 = got2.download(), b = again.download(), b2 = again2.download();
+    const std::vector<float> o = one.download(), o2 = one2.download();
+    double worst = 0.0;  // the largest error as a fraction of its bound
+    size_t over = 0;
+    for (int c = 0; c < columns; ++c)
+        for (int r = 0; r < total; ++r) {
+            double sum = 0.0, mag = 0.0;
+            for (int k = 0; k < cols; ++k) {
+                const double p =
+                    static_cast<double>(wf[static_cast<size_t>(r) * cols + k]) * xf[static_cast<size_t>(c) * cols + k];
+                sum += p, mag += std::abs(p);
+            }
+            const bool first = r < rows;
+            double want = sum, bound = mag / 256.0;
+            if (first && silu_scale != 0.0f) {
+                const double z = sum * silu_scale;
+                want = z / (1.0 + std::exp(-z)), bound *= 1.1 * std::abs(silu_scale);
+            }
+            const float v =
+                first ? a[static_cast<size_t>(c) * rows + r] : a2[static_cast<size_t>(c) * rows2 + r - rows];
+            const double err = std::abs(v - want) / std::max(bound, 1e-30);
+            worst = std::max(worst, err);
+            over += err > 1.0;
+        }
+    const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0 &&
+                      (rows2 == 0 || std::memcmp(a2.data(), b2.data(), a2.size() * 4) == 0);
+    const bool alone = std::memcmp(o.data(), a.data() + static_cast<size_t>(last) * rows, o.size() * 4) == 0 &&
+                       (rows2 == 0 || std::memcmp(o2.data(), a2.data() + static_cast<size_t>(last) * rows2,
+                                                  static_cast<size_t>(rows2) * 4) == 0);
+    const std::string what = "gemm_bf16_tc " + std::to_string(rows) + "x" + std::to_string(cols) + " at " +
+                             std::to_string(columns) + " columns" + (silu_scale != 0.0f ? ", SiLU" : "") +
+                             (rows2 > 0 ? " + " + std::to_string(rows2) + " paired" : "");
+    std::printf("%-44s %s (largest error %.3f of the bound, %zu over; %s; %s)\n", what.c_str(),
+                over == 0 && same && alone ? "ok" : "FAIL", worst, over, same ? "repeatable" : "NOT repeatable",
+                alone ? "one column alone the same" : "one column alone DIFFERS");
+    CHECK(over == 0 && same && alone);
+}
+
 }  // namespace
 
 int main() {
@@ -219,6 +348,8 @@ int main() {
         for (const Type t : {Type::IQ4_NL, Type::Q8_0})  // K = 640 (the shared expert's down): a short last octet
             for (const int columns : {9, 200})
                 check_shape(t, 32, 640, columns, 201u + static_cast<uint32_t>(columns));
+        for (const int columns : {9, 600})  // whole 128-row items: gemm_short_kernel's column ranges
+            check_shape(Type::IQ4_NL, 256, 640, columns, 211u + static_cast<uint32_t>(columns));
         CHECK(!kernels::gemm_q8_supports(Type::IQ3_S));
         kernels::upload_gemm_tables();
         for (const Type t : {Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S, Type::IQ4_XS})
@@ -229,7 +360,14 @@ int main() {
         check_bf16(320, 10240, 70, 0.25f, 501u, 4);       // with its inject rows paired in
         check_bf16(10240, 320, 9, 0.0f, 502u);            // up (the short-row kernel's shape)
         check_bf16(512, 2560, 130, 0.0f, 503u);           // the router
+        check_bf16(512, 2560, 70, 0.0f, 505u, 1);         // with the shared expert's gate row: one row past the tiles
         check_bf16(48, 264, 5, 0.0f, 504u);               // 33 chunks: lane 0's pass has two; rows short of a tile
+        check_expert_h();
+        check_bf16_tc(320, 10240, 37, 0.25f, 600u);     // --fast-prefill: a mixer's down projection, its SiLU
+        check_bf16_tc(320, 10240, 70, 0.25f, 601u, 4);  // with its inject rows paired in
+        check_bf16_tc(10240, 320, 9, 0.0f, 602u);       // up
+        check_bf16_tc(512, 2560, 130, 0.0f, 603u);      // the router
+        check_bf16_tc(37, 256, 5, 0.0f, 604u);          // rows and columns short of a tile
     } catch (const std::exception& e) {
         std::fprintf(stderr, "gemm_test: %s\n", e.what());
         return 1;

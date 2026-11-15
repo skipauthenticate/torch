@@ -374,7 +374,8 @@ class Handler(BaseHTTPRequestHandler):
                  if stats.prompt_seconds > 0 else None,
                  "decode_tokens_per_second": round(stats.generated_tokens / decode, 2) if decode > 0 else None,
                  "tokens_per_window": round(stats.tokens_per_window, 3),
-                 "resident_experts": stats.resident_experts, "total_experts": stats.total_experts}
+                 "resident_experts": stats.resident_experts, "total_experts": stats.total_experts,
+                 "expert_hits": stats.expert_hits, "expert_misses": stats.expert_misses}  # over the process
         if job.ext.get("token_ids"):
             torch["token_ids"] = job.tokens[: out.tokens]
         return usage, torch

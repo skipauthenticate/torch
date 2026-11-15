@@ -97,6 +97,21 @@ def events(text):
     return [d if d == "[DONE]" else json.loads(d) for d in data], comments
 
 
+class Options(unittest.TestCase):
+    def test_fast_prefill(self):
+        # the server's flag reaches the library (ABI 2); an ABI 1 caller's shorter struct is accepted and runs exact
+        engine = E.Engine(LIBRARY, ANSWER, context=4096, prefill_columns=512, fast_prefill=True)
+        self.assertEqual(STUB.torch_stub_last_fast_prefill(), 1)
+        engine.close()
+        o = E.Options(E.Options.fast_prefill.offset, str(ANSWER).encode(), None, None, 0, None, 4096, 512, 0, 0, 1)
+        handle, error = ctypes.c_void_p(), ctypes.create_string_buffer(256)
+        self.assertEqual(STUB.torch_engine_open(ctypes.byref(o), ctypes.byref(handle), error, len(error)), E.OK)
+        self.assertEqual(STUB.torch_stub_last_fast_prefill(), 0)
+        STUB.torch_engine_close(handle)
+        o.struct_size = E.Options.fast_prefill.offset - 4
+        self.assertNotEqual(STUB.torch_engine_open(ctypes.byref(o), ctypes.byref(handle), error, len(error)), E.OK)
+
+
 class Basic(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(torch VERSION 0.1.0 LANGUAGES CXX)
+project(torch VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -85,6 +85,7 @@ if(TORCH_CUDA)
   add_library(torch_engine STATIC
     src/kernels/gemv/gemv.cu
     src/kernels/gemm/gemm.cu
+    src/kernels/gemm/gemm_bf16_tc.cu
     src/kernels/attention/attention.cu
     src/kernels/deltanet/deltanet.cu
     src/kernels/hc/hc.cu

@@ -25,8 +25,8 @@ spec = "--spec" in args
 print("loaded in 15.5 s; MemAvailable now 7.48 GiB")
 print("generated tokens: 1919,1970,41643")
 if spec:
-    print("generation: 145646 routed hits, 1234 misses; 980 swaps, 21.5 ms (0.27 ms per window); the prompt's: 0 "
-          "swaps, 0.0 ms")
+    print("generation: 145646 routed hits, 1234 misses, read in 610.4 ms; 980 swaps (212 when the staging filled), "
+          "21.5 ms (0.27 ms per window); the prompt's: 0 swaps, 0.0 ms")
     print("prompt 1491 tokens, generated 256")
 else:
     print("prompt 1491 tokens, generated 256: 22.65 tok/s (44.2 ms per token)")
@@ -79,8 +79,9 @@ def main() -> None:
         assert r["speculative"] == {"policy": "adaptive-stop", "windows": 80, "max_drafts": 5, "drafts_verified": 2.83,
                                     "tokens_per_window": 3.21, "tok_s": 36.96, "ms_per_window": 86.4,
                                     "verify_accept_ms": 79.4, "draft_ms": 7.1, "host_ms": 0.0}
-        assert r["generation"] == {"hits": 145646, "misses": 1234, "swaps": 980, "swap_ms": 21.5,
-                                   "swap_ms_per_window": 0.27, "prompt_swaps": 0, "prompt_swap_ms": 0.0}
+        assert r["generation"] == {"hits": 145646, "misses": 1234, "read_ms": 610.4, "swaps": 980,
+                                   "swaps_when_full": 212, "swap_ms": 21.5, "swap_ms_per_window": 0.27,
+                                   "prompt_swaps": 0, "prompt_swap_ms": 0.0}
         assert (r["resident"], r["hits"], r["misses"], r["hedged"]) == (20110, 857591, 4969, 2)  # the run's totals
         assert r["mem_available_after_load_gib"] == 7.48 and r["mem_available_end_gib"] == 9.10
         lowest = r["mem_available_lowest_gib"]

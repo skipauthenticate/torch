@@ -5,6 +5,7 @@
 #include "formats/codebooks.h"
 #include "kernels/common.cuh"
 #include "kernels/gemm/gemm.h"
+#include "kernels/gemv/q8.cuh"
 
 namespace torch::kernels {
 namespace {
@@ -401,6 +402,15 @@ __global__ void __launch_bounds__(kT, 512 / kT) gemm_kernel(GemmArgs a) {
         for (int col0 = first; col0 < last; col0 += kPass) {
             uint8_t* wring = ring + warp * kStages * kWarpStage;
             const int wcol = col0 + 32 * half;
+            // the output column of each of this thread's tree outputs (i = tid + kT m: column i / 16), read now so a
+            // routed down projection's route index is not a load in the tree
+            constexpr int kOuts = 16 * kPass / kT;
+            int outs[kOuts];
+#pragma unroll
+            for (int m = 0; m < kOuts; ++m) {
+                const int c = (static_cast<int>(threadIdx.x) + kT * m) / 16;
+                outs[m] = col0 + c >= last ? -1 : a.index ? a.index[col0 + c] : col0 + c;
+            }
             const auto issue = [&](int b) {  // this warp's unit of octet b (an empty group past the end)
                 if (b < octets && 8 * b + ls < a.units) {
                     uint8_t* stage = wring + (b % kStages) * kWarpStage;
@@ -470,9 +480,9 @@ __global__ void __launch_bounds__(kT, 512 / kT) gemm_kernel(GemmArgs a) {
                     *reinterpret_cast<float2*>(&node[ls][g + 8 * h][32 * half + 8 * n + 2 * t]) =
                         make_float2(pair(n, 2 * h), pair(n, 2 * h + 1));
             __syncthreads();
-            for (int i = threadIdx.x; i < 16 * kPass; i += kT) {  // ^4, ^2, ^1 across the lane sets
-                const int row = i % 16, c = i / 16;
-                const int out = col0 + c >= last ? -1 : a.index ? a.index[col0 + c] : col0 + c;
+#pragma unroll
+            for (int m = 0; m < kOuts; ++m) {  // ^4, ^2, ^1 across the lane sets
+                const int i = static_cast<int>(threadIdx.x) + kT * m, row = i % 16, c = i / 16, out = outs[m];
                 if (out < 0)
                     continue;
                 float v[8];
@@ -498,9 +508,15 @@ void run_gemm(const GemmArgs& a, size_t shared, int blocks, cudaStream_t stream)
     gemm_kernel<T, kT><<<blocks, kT, shared, stream>>>(a);
 }
 
-// Two blocks of 256 threads an SM when their shared memory fits (K up to ~4,000), else one of 512.
+template <Type T>
+bool launch_short(const GemmArgs& a, cudaStream_t stream);
+
+// K <= 640 in the formats gemm_short_kernel takes; else two blocks of 256 threads an SM when their shared memory fits
+// (K up to ~4,000), else one of 512.
 template <Type T>
 void launch_gemm(const GemmArgs& a, cudaStream_t stream) {
+    if (launch_short<T>(a, stream))
+        return;
     static int sms = 0, per_sm = 0, reserved = 0;
     if (sms == 0) {
         TORCH_CUDA_CHECK(cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0));
@@ -513,25 +529,258 @@ void launch_gemm(const GemmArgs& a, cudaStream_t stream) {
     run_gemm<T, 512>(a, base + kRing, sms, stream);
 }
 
-__global__ void q8_to_columns_kernel(const BlockQ8* x, Q8Columns out) {
-    const int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;  // one (column, unit) per thread
-    if (i >= int64_t{out.columns} * out.units)
-        return;
-    const int c = static_cast<int>(i / out.units), u = static_cast<int>(i % out.units);
-    const BlockQ8& b = x[i];
-    const auto* q = reinterpret_cast<const uint32_t*>(b.q);
-    const int64_t at = int64_t{u} * out.stride + c;
-    auto* o = reinterpret_cast<uint4*>(out.q + at * 32);
-    o[0] = make_uint4(q[0], q[4], q[1], q[5]);
-    o[1] = make_uint4(q[2], q[6], q[3], q[7]);
-    out.d[at] = f16_to_f32(b.d);
-    out.sum[at] = b.sum;
+// ---- K <= 640 (the experts' down projections, the shared expert's down): a warp runs an output's whole tree ----
+//
+// With at most 20 units, every canonical lane holds at most one unit: a lane's sum is that unit's value, and an output
+// is warp_sum's butterfly over them. A block of 16 warps takes items of 128 rows x a column range or bucket: it stages
+// the item's raw rows, decodes them into fragments as gemm_kernel does, then for each 32-column pass (the activations
+// staged by the block, two stages) each warp takes 16 rows x 2 of the 4 n-tiles, runs their units in the butterfly's
+// depth-first order (lanes 0, 16, 8, 24, ...: bitrev5) and folds each finished pair into the tree at once, as
+// gemm_bf16_kernel folds its passes: no tree through shared memory. Measured (Orin, 2026-11-14) against gemm_kernel on
+// the experts' IQ4_NL down projections of a 4,096-token prompt: 1,115 -> 707 ms.
+constexpr int kShortUnits = 20, kShortRows = 128, kShortThreads = 512, kShortTilesN = 2;  // n-tiles a warp
+constexpr int kShortActQ = kShortUnits * 32 * 32, kShortActD = kShortUnits * 32 * 4;
+constexpr int kShortStage = kShortActQ + kShortActD + kShortUnits * 32 * 2;
+template <Type T>
+__host__ __device__ constexpr int short_pitch() {  // a row's raw run, 16-byte aligned with its offset kept
+    return ((kShortUnits + Fmt<T>::kUnits - 1) / Fmt<T>::kUnits * Fmt<T>::kBytes + 15 + 15) / 16 * 16 + 16;
+}
+template <Type T>
+constexpr int kShortShared =
+    kShortRows / 16 * kShortUnits * 640 + std::max(2 * kShortStage, kShortRows* short_pitch<T>());
+
+template <int L>
+__device__ __forceinline__ void short_fold(float (&node)[5][kShortTilesN][4], float (&s)[kShortTilesN][4]) {
+#pragma unroll
+    for (int n = 0; n < kShortTilesN; ++n)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float v = s[n][q];
+#pragma unroll
+            for (int t = 0; t < L; ++t)
+                v = node[t][n][q] + v;
+            if constexpr (L < 5)
+                node[L][n][q] = v;
+            else
+                s[n][q] = v;
+        }
+}
+
+template <Type T>
+__global__ void __launch_bounds__(kShortThreads, 1) gemm_short_kernel(GemmArgs a) {
+    using F = Fmt<T>;
+    constexpr int kPitch = short_pitch<T>(), kRawChunks = kPitch / 16, kTiles = kShortRows / 16;
+    extern __shared__ uint4 smem[];
+    uint8_t* const frags = reinterpret_cast<uint8_t*>(smem);   // [tile][unit][32 lanes][16 B]
+    uint8_t* const recs = frags + kTiles * kShortUnits * 512;  // [tile][unit][8 g][16 B]
+    uint8_t* const act = recs + kTiles * kShortUnits * 128;    // raw rows, then the passes' two stages
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp, g = lane / 4, t = lane % 4;
+    const int tile = warp % kTiles, n0 = warp / kTiles * kShortTilesN;  // the warp's 16 rows and 8-column n-tiles
+    const uint8_t* const frag = frags + tile * kShortUnits * 512;
+    const uint8_t* const rec = recs + tile * kShortUnits * 128;
+    const bool routed = a.table != nullptr;
+    const int row_items = a.rows / kShortRows;
+    const int ranges = routed ? *a.buckets.n_list : (a.x.columns + a.range - 1) / a.range, items = row_items * ranges;
+    const int run = (a.units + F::kUnits - 1) / F::kUnits * F::kBytes;
+    for (int item = blockIdx.x; item < items; item += gridDim.x) {
+        const int row0 = item % row_items * kShortRows, group = item / row_items;
+        const int expert = routed ? a.buckets.list[group] : 0;
+        const uint8_t* const w = routed ? a.table[expert] : a.w;
+        const int first = routed ? a.buckets.first[expert] : group * a.range;
+        const int last = routed ? first + a.buckets.counts[expert] : min(first + a.range, a.x.columns);
+        if (first >= last)
+            continue;  // an unrouted expert of a read-ahead pass (the whole block)
+        // ---- the item's raw rows, then their fragments and records (gemm_kernel's decode)
+        const auto row_of = [&](int i) { return w + int64_t{row0 + i} * a.row_bytes; };
+        for (int f = threadIdx.x; f < kShortRows * kRawChunks; f += kShortThreads) {
+            const int i = f / kRawChunks, j = f % kRawChunks;
+            const uint8_t* r = row_of(i);
+            const auto* src =
+                reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(r) & ~uintptr_t{15}) + 16 * j;
+            if (src < r + run)
+                copy16(act + i * kPitch + 16 * j, src);
+        }
+        copy_commit();
+        copy_wait<0>();
+        __syncthreads();
+        for (int task = threadIdx.x; task < kTiles * a.units * kWarp; task += kShortThreads) {
+            const int l = task % kWarp, u = task / kWarp % a.units, m = task / kWarp / a.units;
+            const int gg = l / 4, tt = l % 4, s = u % F::kUnits, at = u / F::kUnits * F::kBytes;
+            const int ia = 16 * m + gg, ib = ia + 8;
+            const uint8_t* ra = act + ia * kPitch + (reinterpret_cast<uintptr_t>(row_of(ia)) & 15) + at;
+            const uint8_t* rb = act + ib * kPitch + (reinterpret_cast<uintptr_t>(row_of(ib)) & 15) + at;
+            uint32_t a0, a1, a2, a3;
+            F::words(ra, s, tt, a0, a2);
+            F::words(rb, s, tt, a1, a3);
+            *reinterpret_cast<uint4*>(frags + (m * kShortUnits + u) * 512 + 16 * l) = make_uint4(a0, a1, a2, a3);
+            if (tt == 0)
+                *reinterpret_cast<uint4*>(recs + (m * kShortUnits + u) * 128 + 16 * gg) = F::record(ra, rb, s);
+        }
+        __syncthreads();  // the fragments are ready; the passes' stages take the raw rows' memory
+        // ---- 32-column passes
+        const int passes = (last - first + 31) / 32;
+        const auto issue = [&](int p) {  // pass p's activations (units x 32 columns) into stage p % 2
+            uint8_t* st = act + (p % 2) * kShortStage;
+            const int col0 = first + 32 * p, nq = 64 * a.units, nd = 8 * a.units, ns = F::kSums ? 4 * a.units : 0;
+            for (int f = threadIdx.x; f < nq + nd + ns; f += kShortThreads) {
+                if (f < nq)
+                    copy16(st + 1024 * (f / 64) + 16 * (f % 64),
+                           a.x.q + (int64_t{f / 64} * a.x.stride + col0) * 32 + 16 * (f % 64));
+                else if (f < nq + nd)
+                    copy16(st + kShortActQ + 128 * ((f - nq) / 8) + 16 * ((f - nq) % 8),
+                           a.x.d + int64_t{(f - nq) / 8} * a.x.stride + col0 + 4 * ((f - nq) % 8));
+                else
+                    copy16(st + kShortActQ + kShortActD + 64 * ((f - nq - nd) / 4) + 16 * ((f - nq - nd) % 4),
+                           a.x.sum + int64_t{(f - nq - nd) / 4} * a.x.stride + col0 + 8 * ((f - nq - nd) % 4));
+            }
+            copy_commit();
+        };
+        issue(0);
+        for (int p = 0; p < passes; ++p) {
+            if (p + 1 < passes) {
+                issue(p + 1);
+                copy_wait<1>();
+            } else {
+                copy_wait<0>();
+            }
+            __syncthreads();  // pass p's stage is in
+            const uint8_t* st = act + (p % 2) * kShortStage;
+            const int col0 = first + 32 * p;
+            float node[5][kShortTilesN][4], s[kShortTilesN][4];  // [level][n-tile][rows g, g + 8 x columns 2t, 2t + 1]
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {  // canonical lane bitrev5(i): unit u (or none)
+                const int u = static_cast<int>(__brev(static_cast<unsigned>(i)) >> 27);
+#pragma unroll
+                for (int n = 0; n < kShortTilesN; ++n)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q)
+                        s[n][q] = 0.0f;
+                if (u < a.units) {
+                    const uint4 fr = *reinterpret_cast<const uint4*>(frag + 512 * u + 16 * lane);
+                    const uint4 rc = *reinterpret_cast<const uint4*>(rec + 128 * u + 16 * g);
+#pragma unroll
+                    for (int n = 0; n < kShortTilesN; ++n) {
+                        const int c = 8 * (n0 + n);
+                        const uint2 xb = *reinterpret_cast<const uint2*>(st + (32 * u + c + g) * 32 + 8 * t);
+                        const float2 dx = *reinterpret_cast<const float2*>(st + kShortActQ + (32 * u + c + 2 * t) * 4);
+                        int xs[2] = {0, 0};
+                        if constexpr (F::kSums) {
+                            const uint32_t two = *reinterpret_cast<const uint32_t*>(st + kShortActQ + kShortActD +
+                                                                                    (32 * u + c + 2 * t) * 2);
+                            xs[0] = static_cast<int16_t>(two & 0xffff), xs[1] = static_cast<int16_t>(two >> 16);
+                        }
+                        int h0[4], h1[4] = {};
+                        if constexpr (F::kHalves) {
+                            mma16(h0, fr.x, fr.y, xb.x);
+                            mma16(h1, fr.z, fr.w, xb.y);
+                        } else {
+                            mma32(h0, fr, xb);
+                        }
+#pragma unroll
+                        for (int q = 0; q < 4; ++q)  // the lane's sum: 0 + its one unit's value, as gemm_kernel's
+                            s[n][q] += F::value(rc, q / 2, h0[q], h1[q], q % 2 == 0 ? dx.x : dx.y, xs[q % 2]);
+                    }
+                }
+                switch (__ffs(i + 1) - 1) {  // known once unrolled: levels 0 .. L - 1 complete
+                    case 0:
+                        short_fold<0>(node, s);
+                        break;
+                    case 1:
+                        short_fold<1>(node, s);
+                        break;
+                    case 2:
+                        short_fold<2>(node, s);
+                        break;
+                    case 3:
+                        short_fold<3>(node, s);
+                        break;
+                    case 4:
+                        short_fold<4>(node, s);
+                        break;
+                    default:
+                        short_fold<5>(node, s);
+                        break;
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < kShortTilesN; ++n)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int c = col0 + 8 * (n0 + n) + 2 * t + q % 2, row = row0 + 16 * tile + g + 8 * (q / 2);
+                    const int out = c >= last ? -1 : a.index ? a.index[c] : c;
+                    if (out >= 0)
+                        a.y[int64_t{out} * a.rows + row] = s[n][q];
+                }
+            __syncthreads();  // every warp is done with this stage (and, after the last pass, the fragments)
+        }
+    }
+}
+
+// K <= 640 in IQ4_NL or Q2_0 with whole 128-row items: gemm_short_kernel, one block an SM.
+template <Type T>
+bool launch_short(const GemmArgs& a, cudaStream_t stream) {
+    if constexpr (T != Type::IQ4_NL && T != Type::Q2_0) {
+        return false;
+    } else {
+        if (a.units > kShortUnits || a.rows % kShortRows != 0)
+            return false;
+        static int sms = 0;
+        if (sms == 0) {
+            TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_short_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  kShortShared<T>));
+            TORCH_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+        }
+        gemm_short_kernel<T><<<sms, kShortThreads, kShortShared<T>, stream>>>(a);
+        return true;
+    }
 }
 
 // Buckets (gemm.h): block e counts expert e's routes; one block turns the counts into bucket starts (padded to
 // multiples of 8 slots) and the list of routed experts; block e then writes its routes' slots in route order, marks its
 // padding, adds its count to the route counts and stamps it with the window stamp of its last route.
 constexpr int kBucketThreads = 256;
+
+// h = silu(g) * u (as swiglu) of the real slots of each expert in b's list, quantized (as quantize_q8) into out's
+// column layout (as q8_to_columns): one thread a (slot, unit), one block a listed expert. A thread quantizes its 32
+// values as quantize_q8_block does across a warp: the same per-value arithmetic, and the maximum and the integer sum
+// do not depend on order.
+__global__ void expert_h_columns_kernel(const float* g, const float* u, ExpertBuckets b, Q8Columns out) {
+    if (static_cast<int>(blockIdx.x) >= *b.n_list)
+        return;
+    const int e = b.list[blockIdx.x], first = b.first[e], tasks = b.counts[e] * out.units;
+    for (int task = threadIdx.x; task < tasks; task += kBucketThreads) {
+        const int s = first + task / out.units, unit = task % out.units;
+        const int64_t i = (int64_t{s} * out.units + unit) * 32;
+        const auto* g4 = reinterpret_cast<const float4*>(g + i);
+        const auto* u4 = reinterpret_cast<const float4*>(u + i);
+        float v[32];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const float4 a = g4[k], c = u4[k];
+            v[4 * k] = silu(a.x) * c.x, v[4 * k + 1] = silu(a.y) * c.y;
+            v[4 * k + 2] = silu(a.z) * c.z, v[4 * k + 3] = silu(a.w) * c.w;
+        }
+        float amax = fabsf(v[0]);
+#pragma unroll
+        for (int k = 1; k < 32; ++k)
+            amax = fmaxf(amax, fabsf(v[k]));
+        const float d = amax / 127.0f;
+        uint32_t q[8] = {};
+        int sum = 0;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const int x = amax == 0.0f ? 0 : static_cast<int>(roundf(v[k] / d));
+            sum += x;
+            q[k / 4] |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(x))) << 8 * (k % 4);
+        }
+        const int64_t at = int64_t{unit} * out.stride + s;
+        auto* o = reinterpret_cast<uint4*>(out.q + at * 32);
+        o[0] = make_uint4(q[0], q[4], q[1], q[5]);
+        o[1] = make_uint4(q[2], q[6], q[3], q[7]);
+        out.d[at] = f16_to_f32(__half_as_ushort(__float2half_rn(d)));
+        out.sum[at] = static_cast<int16_t>(sum);
+    }
+}
 
 __global__ void bucket_count_kernel(const int32_t* ids, int routes, int32_t* counts) {
     __shared__ int partial[kBucketThreads / kWarp];
@@ -609,25 +858,41 @@ __global__ void bucket_fill_kernel(const int32_t* ids, int routes, int k, Expert
     }
 }
 
+// A block gathers 32 slots x 8 units through shared memory: it reads each slot's 8 BlockQ8 (72 words in a row of its
+// route's column), then writes each unit's 32 slots in a row. A null slot_route re-lays columns in order (slot s is
+// column s: q8_to_columns).
+constexpr int kGatherSlots = 32, kGatherUnits = 8, kGatherWords = kGatherUnits * 9, kGatherPitch = kGatherWords + 1;
 __global__ void q8_gather_kernel(const BlockQ8* x, int units, const int32_t* slot_route, int k, Q8Columns out) {
-    const int64_t i = blockIdx.x * int64_t{blockDim.x} + threadIdx.x;  // one (slot, unit) per thread
-    if (i >= int64_t{out.columns} * units)
+    __shared__ uint32_t tile[kGatherSlots * kGatherPitch];  // [slot][BlockQ8 words], pitch 73: no bank conflicts
+    __shared__ int32_t routes[kGatherSlots];
+    const int s0 = static_cast<int>(blockIdx.x) * kGatherSlots, u0 = static_cast<int>(blockIdx.y) * kGatherUnits;
+    const int t = static_cast<int>(threadIdx.x);
+    if (t < kGatherSlots)
+        routes[t] = s0 + t >= out.columns ? -1 : slot_route ? slot_route[s0 + t] : s0 + t;
+    __syncthreads();
+    const int words = min(kGatherUnits, units - u0) * 9;
+    for (int w = t; w < kGatherSlots * kGatherWords; w += kBucketThreads) {
+        const int j = w / kGatherWords, wi = w % kGatherWords, r = routes[j];
+        if (r >= 0 && wi < words)
+            tile[j * kGatherPitch + wi] = reinterpret_cast<const uint32_t*>(x + int64_t{r / k} * units + u0)[wi];
+    }
+    __syncthreads();
+    const int j = t % kGatherSlots, s = s0 + j, u = u0 + t / kGatherSlots;  // a warp: one unit's 32 slots
+    if (s >= out.columns || u >= units)
         return;
-    const int s = static_cast<int>(i / units), u = static_cast<int>(i % units), r = slot_route[s];
     const int64_t at = int64_t{u} * out.stride + s;
     auto* o = reinterpret_cast<uint4*>(out.q + at * 32);
-    if (r < 0) {  // padding
+    if (routes[j] < 0) {  // padding
         o[0] = o[1] = make_uint4(0, 0, 0, 0);
         out.d[at] = 0.0f;
         out.sum[at] = 0;
         return;
     }
-    const BlockQ8& b = x[int64_t{r / k} * units + u];
-    const auto* q = reinterpret_cast<const uint32_t*>(b.q);
-    o[0] = make_uint4(q[0], q[4], q[1], q[5]);
-    o[1] = make_uint4(q[2], q[6], q[3], q[7]);
-    out.d[at] = f16_to_f32(b.d);
-    out.sum[at] = b.sum;
+    const uint32_t* b = tile + j * kGatherPitch + (u - u0) * 9;  // d and sum, then the 8 words of q
+    o[0] = make_uint4(b[1], b[5], b[2], b[6]);
+    o[1] = make_uint4(b[3], b[7], b[4], b[8]);
+    out.d[at] = f16_to_f32(static_cast<uint16_t>(b[0] & 0xffff));
+    out.sum[at] = static_cast<int16_t>(b[0] >> 16);
 }
 
 // ---- BF16 (gemm.h) ----
@@ -637,6 +902,7 @@ constexpr uint16_t kBfLast = 0x8000;  // in the pass sequence: the chunk ends it
 struct BfArgs {
     const uint8_t *w, *w2;    // rows r < rows from w (into y), the rest from w2 (into y2): a pair shares the launch
     int rows, total, chunks;  // chunks of 8 values a row
+    int end;                  // gemm_bf16_kernel stores rows < end; gemm_bf16_few_kernel the rest
     const float* x;
     float *y, *y2;
     int columns;
@@ -683,14 +949,15 @@ __device__ __forceinline__ void bf_fold(float (&node)[5][4][4], float (&acc)[4][
         }
 }
 
-// Thread (ty, tx) = (threadIdx.x / 16, threadIdx.x % 16) holds rows 4 ty .. 4 ty + 3 and columns 4 tx .. 4 tx + 3 of
-// the block's tile. Pass i runs canonical lane bitrev5(i) over its chunks in order; the 32 passes' chunks form one
-// sequence (shared memory after the stages: chunk index, kBfLast on a pass's last), which goes through two
-// shared-memory stages kBfStage chunks at a time whatever the passes' bounds (the next stage's loads in flight while
-// the current one is multiplied), multiplied in chunk then value order into one accumulator per output. At a pass's
-// last chunk its sums join the tree: a binary counter over the passes, level t combining when 2^(t + 1) passes are
-// done, which with the bit-reversed order pairs lanes l and l ^ 16 first, then ^ 8, ^ 4, ^ 2, ^ 1, as warp_sum does.
-// Every lane has a chunk (chunks >= 32), so no pass is empty.
+// Thread (ty, tx) = (threadIdx.x % 16, threadIdx.x / 16) holds rows 4 ty .. 4 ty + 3 and columns 4 tx .. 4 tx + 3 of
+// the block's tile: a warp's weight loads at one value are 128 contiguous bytes and its activation loads two
+// broadcasts, one shared-memory wavefront each. Pass i runs canonical lane bitrev5(i) over its chunks in order; the 32
+// passes' chunks form one sequence (shared memory after the stages: chunk index, kBfLast on a pass's last), which goes
+// through two shared-memory stages kBfStage chunks at a time whatever the passes' bounds (the next stage's loads in
+// flight while the current one is multiplied), multiplied in chunk then value order into one accumulator per output. At
+// a pass's last chunk its sums join the tree: a binary counter over the passes, level t combining when 2^(t + 1) passes
+// are done, which with the bit-reversed order pairs lanes l and l ^ 16 first, then ^ 8, ^ 4, ^ 2, ^ 1, as warp_sum
+// does. Every lane has a chunk (chunks >= 32), so no pass is empty.
 __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
     extern __shared__ uint4 bf_shared[];
     BfStage* stage = reinterpret_cast<BfStage*>(bf_shared);
@@ -707,7 +974,7 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
             order[f + j] = static_cast<uint16_t>((lane + 32 * j) | (j == n - 1 ? kBfLast : 0));
     }
     __syncthreads();
-    const int ty = threadIdx.x / 16, tx = threadIdx.x % 16;
+    const int ty = threadIdx.x % 16, tx = threadIdx.x / 16;  // a warp: 16 row groups, 2 column groups
     const int row0 = blockIdx.y * kBfRows, col0 = blockIdx.x * kBfCols;
     const auto weights = [&](int row) {
         const int r = min(row, a.total - 1);
@@ -810,7 +1077,7 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             const int row = row0 + 4 * ty + r, col = col0 + 4 * tx + c;
-            if (row >= a.total || col >= a.columns)
+            if (row >= a.end || col >= a.columns)
                 continue;
             if (row < a.rows)
                 a.y[int64_t{col} * a.rows + row] =
@@ -820,13 +1087,66 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
         }
 }
 
+// The last few rows of a product (at most kBfFewMax past its whole 64-row tiles: a mixer's inject rows, the router's
+// shared gate), which would otherwise take a tile of their own: a warp a column and 4 rows, as gemv_bf16 runs a row
+// (lane l's chunks l, l + 32, ... as one FMA chain each, then warp_sum), so each output is the same sum as the tiles'.
+constexpr int kBfFewRows = 4, kBfFewMax = 16;
+__global__ void __launch_bounds__(kBfThreads) gemm_bf16_few_kernel(BfArgs a) {
+    const int lane = static_cast<int>(threadIdx.x) % kWarp;
+    const int col = static_cast<int>(blockIdx.x) * (kBfThreads / kWarp) + static_cast<int>(threadIdx.x) / kWarp;
+    const int row0 = a.end + static_cast<int>(blockIdx.y) * kBfFewRows;
+    if (col >= a.columns)
+        return;
+    const uint4* w[kBfFewRows];
+#pragma unroll
+    for (int i = 0; i < kBfFewRows; ++i) {
+        const int r = min(row0 + i, a.total - 1);
+        w[i] = reinterpret_cast<const uint4*>(r < a.rows ? a.w + int64_t{r} * a.chunks * 16
+                                                         : a.w2 + int64_t{r - a.rows} * a.chunks * 16);
+    }
+    const auto* x = reinterpret_cast<const float4*>(a.x + int64_t{col} * a.chunks * 8);
+    float acc[kBfFewRows] = {};
+    for (int j = lane; j < a.chunks; j += kWarp) {
+        const float4 x0 = x[2 * j], x1 = x[2 * j + 1];
+        const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int i = 0; i < kBfFewRows; ++i) {
+            const uint4 v = w[i][j];
+            const uint32_t ws[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e)  // as gemv's bf16_chunk
+                acc[i] += bf16_value(e % 2 == 0 ? ws[e / 2] & 0xffff : ws[e / 2] >> 16) * xs[e];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kBfFewRows; ++i) {
+        const float v = warp_sum(acc[i]);
+        const int row = row0 + i;
+        if (lane != 0 || row >= a.total)
+            continue;
+        if (row < a.rows)
+            a.y[int64_t{col} * a.rows + row] = a.silu_scale != 0.0f ? silu(v * a.silu_scale) : v;
+        else
+            a.y2[int64_t{col} * (a.total - a.rows) + row - a.rows] = v;
+    }
+}
+
 }  // namespace
 
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
                cudaStream_t stream, const uint8_t* w2, int rows2, float* y2) {
     if (cols % 8 != 0 || cols < 256 || cols / 8 > kBfLast || rows < 1 || columns < 1 || rows2 < 0)
         throw Error("gemm_bf16 takes rows of 256 to 262,144 values (a multiple of 8) and at least one column.");
-    const BfArgs a{w, w2, rows, rows + rows2, cols / 8, x, y, y2, columns, silu_scale};
+    BfArgs a{w, w2, rows, rows + rows2, cols / 8, rows + rows2, x, y, y2, columns, silu_scale};
+    const int few = a.total % kBfRows;
+    if (a.total > kBfRows && few <= kBfFewMax) {
+        a.end = a.total - few;
+        if (few > 0)
+            gemm_bf16_few_kernel<<<dim3(
+                                       static_cast<unsigned>((columns + kBfThreads / kWarp - 1) / (kBfThreads / kWarp)),
+                                       static_cast<unsigned>((few + kBfFewRows - 1) / kBfFewRows)),
+                                   kBfThreads, 0, stream>>>(a);
+    }
     const size_t shared = 2 * sizeof(BfStage) + sizeof(uint16_t) * static_cast<size_t>(a.chunks);
     static size_t allowed = 0;
     if (shared > allowed) {
@@ -835,7 +1155,7 @@ void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, i
         allowed = shared;
     }
     const dim3 grid(static_cast<unsigned>((columns + kBfCols - 1) / kBfCols),
-                    static_cast<unsigned>((a.total + kBfRows - 1) / kBfRows));
+                    static_cast<unsigned>((a.end + kBfRows - 1) / kBfRows));
     gemm_bf16_kernel<<<grid, kBfThreads, shared, stream>>>(a);
 }
 
@@ -865,8 +1185,10 @@ void expert_buckets(const int32_t* ids, int routes, int k, int n_expert, const E
 
 void q8_gather_columns(const BlockQ8* x, int units, const ExpertBuckets& b, int k, const Q8Columns& out,
                        cudaStream_t stream) {
-    const int64_t n = int64_t{out.columns} * units;
-    q8_gather_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(x, units, b.slot_route, k, out);
+    static_assert(kBucketThreads == kGatherSlots * kGatherUnits, "a thread writes one (unit, slot)");
+    const dim3 grid(static_cast<unsigned>((out.columns + kGatherSlots - 1) / kGatherSlots),
+                    static_cast<unsigned>((units + kGatherUnits - 1) / kGatherUnits));
+    q8_gather_kernel<<<grid, kBucketThreads, 0, stream>>>(x, units, b.slot_route, k, out);
 }
 
 void upload_gemm_tables() {
@@ -889,9 +1211,15 @@ Q8Columns q8_columns_at(void* memory, int units, int columns) {
     return {q, d, sum, units, columns, stride};
 }
 
+void expert_h_columns(const float* g, const float* u, const ExpertBuckets& b, int n_expert, const Q8Columns& out,
+                      cudaStream_t stream) {
+    expert_h_columns_kernel<<<n_expert, kBucketThreads, 0, stream>>>(g, u, b, out);
+}
+
 void q8_to_columns(const BlockQ8* x, const Q8Columns& out, cudaStream_t stream) {
-    const int64_t n = int64_t{out.columns} * out.units;
-    q8_to_columns_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(x, out);
+    const dim3 grid(static_cast<unsigned>((out.columns + kGatherSlots - 1) / kGatherSlots),
+                    static_cast<unsigned>((out.units + kGatherUnits - 1) / kGatherUnits));
+    q8_gather_kernel<<<grid, kBucketThreads, 0, stream>>>(x, out.units, nullptr, 1, out);
 }
 
 bool gemm_q8_supports(Type type) {

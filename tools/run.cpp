@@ -52,6 +52,8 @@ constexpr const char* kUsage =
     "  --top K         log-probabilities to print per step (default 5)\n"
     "  --context N     tokens the KV cache holds (default 2048, maximum 262144); above 2048 attention is sparse\n"
     "  --resident K    keep exactly experts 0 to K - 1 of every layer resident (residency tests)\n"
+    "  --resident-total N  with --placement: stop the placement and the top-up after loading at N experts in total,\n"
+    "                  in the same order, to compare runs at equal bytes (measurements)\n"
     "  --placement F   keep the experts most routed in route-count file F resident (default: every layer's first\n"
     "                  experts, as many as fit in memory)\n"
     "  --route-counts F  after the run, add how often each expert was routed for the generated tokens (not the\n"
@@ -71,9 +73,15 @@ constexpr const char* kUsage =
     "  --accept K      keep only K tokens of each prompt window and run the next window from there (tests rollback)\n"
     "  --accept-from P apply --accept only to windows starting at position P or later (default 0)\n"
     "  --quiet         no per-step lines, and no logits copied to the host (for timing)\n"
-    "  --swap N        after each window, up to N of the experts it read from the SSD become resident in place of the\n"
-    "                  least recently routed ones of their layers (the output is unchanged)\n"
-    "  --swap-prompt N at most N swaps after each of the prompt's windows (default: --swap's N)\n"
+    "  --swap N        after each generated window, up to N of the experts it read from the SSD become resident in\n"
+    "                  place of the least recently routed ones of their layers (default 128; the output is unchanged)\n"
+    "  --swap-prompt N at most N swaps after each of the prompt's windows (default 0)\n"
+    "  --no-swap-when-full  when a window's misses fill the staging, drop the ones held so far instead of swapping\n"
+    "                  them in then, within --swap's budget (the default, except with --lend-kv or --lend-from)\n"
+    "  --fast-prefill  prefill's BF16 products on the tensor cores, the activations rounded to BF16: a shorter\n"
+    "                  time to the first token, but prefill is not bitwise the windows, so the answer can differ\n"
+    "  --no-lend-chunk  keep the prefill chunk's buffer idle between a prompt's end and the next prefill (by default\n"
+    "                  it holds the experts the prompt routed most that are not resident; the output is unchanged)\n"
     "  --draft FILE    load the draft layer (tools/make_draft.py) and run it after every window: the KV-only\n"
     "                  pass at prompt positions, --draft-depth drafts at generated ones (M4 R3; the model's output\n"
     "                  is unchanged)\n"
@@ -83,7 +91,9 @@ constexpr const char* kUsage =
     "                  without)\n"
     "  --spec-policy P how many drafts a window verifies: fixed (all D), adaptive (the width that maximises\n"
     "                  expected tokens per millisecond, learned online; drafts all D first) or adaptive-stop (also\n"
-    "                  stops drafting early; default adaptive-stop)\n"
+    "                  stops drafting early; default adaptive-stop) or adaptive-tight (also stops once a draft would\n"
+    "                  not be verified)\n"
+    "  --carry-policy  with --then, the adaptive policy keeps what it learned from the request before (one process)\n"
     "  --draft-variants LIST  comma-separated HNORM:HEAD, HNORM stream or pooled, HEAD full or a number of\n"
     "                  --draft-vocab ids (default stream:full); each keeps its own draft K/V cache\n"
     "  --check-draft-kv  after --spec, decode the history again one token at a time and require the draft layer's\n"
@@ -254,13 +264,15 @@ int run(int argc, char** argv) {
     bool profile = false, quiet = false;
     std::filesystem::path route_counts_path;
     model::Options options;
+    options.swaps_per_window = 128;  // M8: with swaps when the staging fills, code review -3% to -6% against 32
     std::FILE* logits_file = nullptr;
     std::FILE* json_file = nullptr;
-    int draft_depth = 3, spec = 0, swap_prompt = -1;
+    int draft_depth = 3, spec = 0, swap_prompt = 0;
     bool sample = false;  // any sampling option given: sampled instead of greedy
     kernels::SamplingParams sampling;
     std::optional<uint64_t> seed;
     std::string spec_policy = "adaptive-stop";
+    bool carry_policy = false;
     bool check_kv = false;
     std::filesystem::path draft_path, report_path;
     std::vector<model::DraftVariant> variants{{}};
@@ -302,6 +314,8 @@ int run(int argc, char** argv) {
                 options.context = parse_count(value(), "--context", 1);
             } else if (arg == "--resident") {
                 options.resident = parse_count(value(), "--resident", 0);
+            } else if (arg == "--resident-total") {
+                options.resident_total = parse_count(value(), "--resident-total", 0);
             } else if (arg == "--placement") {
                 options.placement = value();
             } else if (arg == "--lend-kv") {
@@ -346,6 +360,14 @@ int run(int argc, char** argv) {
                     throw Error("--spec takes 1 to " + std::to_string(model::kMaxColumns - 1) + " drafts.");
             } else if (arg == "--swap") {
                 options.swaps_per_window = parse_count(value(), "--swap", 0);
+            } else if (arg == "--carry-policy") {
+                carry_policy = true;
+            } else if (arg == "--swap-when-full" || arg == "--no-swap-when-full") {
+                options.swap_when_full = arg == "--swap-when-full";
+            } else if (arg == "--lend-chunk" || arg == "--no-lend-chunk") {
+                options.lend_chunk = arg == "--lend-chunk";
+            } else if (arg == "--fast-prefill") {
+                options.fast_prefill = true;
             } else if (arg == "--swap-prompt") {
                 swap_prompt = parse_count(value(), "--swap-prompt", 0);
             } else if (arg == "--temperature" || arg == "--top-p" || arg == "--min-p" ||
@@ -374,8 +396,9 @@ int run(int argc, char** argv) {
                 sample = true;
             } else if (arg == "--spec-policy") {
                 spec_policy = value();
-                if (spec_policy != "fixed" && spec_policy != "adaptive" && spec_policy != "adaptive-stop")
-                    throw Error("--spec-policy takes fixed, adaptive or adaptive-stop.");
+                if (spec_policy != "fixed" && spec_policy != "adaptive" && spec_policy != "adaptive-stop" &&
+                    spec_policy != "adaptive-tight")
+                    throw Error("--spec-policy takes fixed, adaptive, adaptive-stop or adaptive-tight.");
             } else if (arg == "--draft-depth") {
                 draft_depth = parse_count(value(), "--draft-depth", 1);
             } else if (arg == "--draft-variants") {
@@ -452,6 +475,7 @@ int run(int argc, char** argv) {
             request.stop_ids = stop_ids;
             request.spec = spec;
             request.policy = spec_policy;
+            request.carry_policy = carry_policy;
             request.draft_depth = draft_depth;
             request.swaps_after_prompt = swap_generate;  // --swap-prompt sets the prompt's windows apart
             request.window = window, request.keep = keep, request.accept_from = accept_from;
@@ -553,11 +577,13 @@ int run(int argc, char** argv) {
                 const model::DecodeTimes t = m.decode_times();
                 const int gen_windows = std::max(spec > 0 ? windows : decoded, 1);
                 std::printf(
-                    "\ngeneration: %llu routed hits, %llu misses; %llu swaps, %.1f ms (%.2f ms per window); the "
-                    "prompt's: %llu swaps, %.1f ms\n",
+                    "\ngeneration: %llu routed hits, %llu misses, read in %.1f ms; %llu swaps (%llu when the staging "
+                    "filled), %.1f ms (%.2f ms per window); the prompt's: %llu swaps, %.1f ms\n",
                     static_cast<unsigned long long>(s.hits - at_prompt_end.hits),
                     static_cast<unsigned long long>(s.misses - at_prompt_end.misses),
+                    t.expert_reads - times_at_prompt_end.expert_reads,
                     static_cast<unsigned long long>(t.swaps - times_at_prompt_end.swaps),
+                    static_cast<unsigned long long>(t.swaps_when_full - times_at_prompt_end.swaps_when_full),
                     t.swap_ms - times_at_prompt_end.swap_ms, (t.swap_ms - times_at_prompt_end.swap_ms) / gen_windows,
                     static_cast<unsigned long long>(times_at_prompt_end.swaps), times_at_prompt_end.swap_ms);
                 if (prompt_s > 0)  // the prompt is in

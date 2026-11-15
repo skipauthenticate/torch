@@ -6,9 +6,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -135,7 +137,6 @@ struct Buffers {
     uint8_t* q8_columns = nullptr;
     uint8_t *route_buckets = nullptr, *q8_routes = nullptr, *q8_h_routes = nullptr;
     float *gate_routes = nullptr, *up_routes = nullptr;
-    BlockQ8* h_routes = nullptr;
     const uint8_t** expert_table = nullptr;
 
     // d's column picks the activations' copy. chunk > 0 lays out a prefill chunk of that many columns instead: no
@@ -204,7 +205,6 @@ struct Buffers {
         route_buckets = d.take<uint8_t>(kernels::expert_buckets_bytes(c.n_expert, routes));
         q8_routes = d.take<uint8_t>(kernels::q8_columns_bytes(static_cast<int>(E / 32), slots + 64));
         gate_routes = d.take<float>(S * FF), up_routes = d.take<float>(S * FF);
-        h_routes = d.take<BlockQ8>(S * FF / 32);
         q8_h_routes = d.take<uint8_t>(kernels::q8_columns_bytes(static_cast<int>(FF / 32), slots + 64));
         d.rewind(region);  // the PLE block (its ple_x stays: the ring takes it at the chunk's end)
         key = d.cols<float>(HCD), key_n = d.cols<float>(HCD), value = d.cols<float>(E), query = d.cols<float>(HCD);
@@ -365,7 +365,14 @@ struct Model::Impl {
     int chunk_cap = 0;
     Buffers chunk, chunk_last;  // the chunk from its column 0, and from its last column (the head's)
     uint8_t* chunk_device = nullptr;
+    uint64_t chunk_device_bytes = 0;
     uint8_t* chunk_host = nullptr;
+    // Options::lend_chunk: experts lent the chunk's device buffer until the next prefill, ranked by prompt_routes
+    bool lend_chunk_on = false;
+    bool fast_prefill = false;            // Options::fast_prefill: kernels::gemm_bf16_tc for a chunk's BF16 products
+    std::vector<uint64_t> prompt_routes;  // the prefill chunks' route counts since the last lend
+    int chunk_tenants = 0;
+    bool lent_early = false;                            // lend_chunk(true) has lent the part after the residuals
     float *chunk_embd = nullptr, *chunk_ple = nullptr;  // [chunk_cap][n_embd]
     int32_t* chunk_pos = nullptr;                       // [chunk_cap]
     // The routed experts of a chunk's layer: their route counts, and each pass's experts and matrix table on the host,
@@ -393,7 +400,7 @@ struct Model::Impl {
     std::vector<std::vector<std::pair<int, std::vector<int32_t>>>> chunk_passes;
     const Buffers* ops = nullptr;
     bool prefilling = false;
-    static constexpr int kPleBatch = 256;  // a chunk's PLE rows are read this many tokens at a time
+    static constexpr int kPleBatch = 256;  // a chunk's PLE reads go this many tokens' worth at a time
     // TORCH_PREFILL_STAGES=1: the GPU time of each stage of the prefill chunks (CUDA events), printed at the end.
     enum Stage { kDense, kBf16, kExperts, kAttention, kDeltaNet, kTotal, kStages };
     const bool stage_times = std::getenv("TORCH_PREFILL_STAGES") != nullptr;
@@ -427,6 +434,90 @@ struct Model::Impl {
         }
         stage_marks.clear();
         ++stage_chunks;
+    }
+    // TORCH_DECODE_STAGES=1: the GPU time between consecutive marks of a window, by the stage each mark ends, recorded
+    // as event nodes in each width's graph (cudaEventRecordExternal), so the windows still replay graphs. Printed at
+    // each new prompt (the windows since the last one) and at the end. Graph mode only.
+    enum DStage {
+        dCopies,
+        dPle,
+        dMixers,
+        dDense,
+        dAttention,
+        dDeltaNet,
+        dRouter,
+        dGate,
+        dGateUp,
+        dQuantize,
+        dDown,
+        dShared,
+        dCombine,
+        dHead,
+        dOther,
+        kDStages
+    };
+    static constexpr const char* kDStageNames[kDStages] = {"copies",   "ple",    "mixers",    "dense",   "attention",
+                                                           "deltanet", "router", "gate+wait", "gate+up", "quantize",
+                                                           "down",     "shared", "combine",   "head",    "other"};
+    const bool dstage_times = std::getenv("TORCH_DECODE_STAGES") != nullptr;  // used only when !eager
+    struct Timeline {
+        std::vector<cudaEvent_t> events;
+        std::vector<int> stages;
+    };
+    std::array<std::array<Timeline, kMaxColumns + 1>, 2> timelines;
+    Timeline* recording = nullptr;  // the timeline a graph capture is filling
+    std::array<std::array<double, kDStages>, kMaxColumns + 1> dstage_ms{};
+    std::array<int, kMaxColumns + 1> dstage_windows{};
+    int dstage_report = 0;
+    void mark(DStage s) {
+        if (!recording || prefilling)
+            return;
+        cudaEvent_t e = nullptr;
+        TORCH_CUDA_CHECK(cudaEventCreate(&e));
+        TORCH_CUDA_CHECK(cudaEventRecordWithFlags(e, stream, cudaEventRecordExternal));
+        recording->events.push_back(e);
+        recording->stages.push_back(s);
+    }
+    void collect_window(const Timeline& t, int columns) {  // after the window's work has finished
+        for (size_t i = 1; i < t.events.size(); ++i) {
+            float elapsed = 0;
+            TORCH_CUDA_CHECK(cudaEventElapsedTime(&elapsed, t.events[i - 1], t.events[i]));
+            dstage_ms[static_cast<size_t>(columns)][static_cast<size_t>(t.stages[i])] += elapsed;
+        }
+        ++dstage_windows[static_cast<size_t>(columns)];
+    }
+    void report_windows() {
+        int windows = 0;
+        std::array<double, kDStages> sum{};
+        for (int w = 1; w <= kMaxColumns; ++w) {
+            const auto& row = dstage_ms[static_cast<size_t>(w)];
+            const int n = dstage_windows[static_cast<size_t>(w)];
+            if (n == 0)
+                continue;
+            windows += n;
+            double total = 0;
+            std::string line;
+            for (int k = 0; k < kDStages; ++k) {
+                sum[static_cast<size_t>(k)] += row[static_cast<size_t>(k)];
+                total += row[static_cast<size_t>(k)];
+                line += std::string(" ") + kDStageNames[k] + " " + std::to_string(row[static_cast<size_t>(k)] / n);
+            }
+            std::fprintf(stderr, "DECODE %d width %d: %d windows, GPU ms per window %.3f:%s\n", dstage_report, w, n,
+                         total / n, line.c_str());
+        }
+        if (windows) {
+            double total = 0;
+            std::string line;
+            for (int k = 0; k < kDStages; ++k) {
+                total += sum[static_cast<size_t>(k)];
+                line +=
+                    std::string(" ") + kDStageNames[k] + " " + std::to_string(sum[static_cast<size_t>(k)] / windows);
+            }
+            std::fprintf(stderr, "DECODE %d all: %d windows, GPU ms per window %.3f:%s\n", dstage_report, windows,
+                         total / windows, line.c_str());
+        }
+        dstage_ms = {}, dstage_windows = {};
+        ++dstage_report;
     }
     size_t window_start = 0;  // the last window's first position, and its width
     int window = 0;
@@ -462,6 +553,9 @@ struct Model::Impl {
     int swaps_per_window = 0;
     Residency residency;
     std::vector<uint32_t> stamps_cache;  // the store's stamps of the layers a swap decision reads
+    std::mutex swap_mutex;               // residency, stamps_cache and swapped_in_window: swaps on either thread
+    int swapped_in_window = 0;
+    std::atomic<uint32_t> window_stamp{0};  // the gate's stamp for the running window (window_start + 1)
 
     explicit Impl(const Options& o)
         : shard1(gguf::File::open(o.shard1)),
@@ -539,6 +633,7 @@ struct Model::Impl {
             chunk.lay_out(chunk_dry, cfg, context, chunk_cap);
             TORCH_CUDA_CHECK(cudaMalloc(&d, chunk_dry.used()));
             chunk_device = static_cast<uint8_t*>(d);
+            chunk_device_bytes = chunk_dry.used();
             DeviceLayout layout(chunk_device, 0, chunk_cap);
             chunk.lay_out(layout, cfg, context, chunk_cap);
             share_state(chunk);
@@ -575,10 +670,19 @@ struct Model::Impl {
         if (chunk_cap >= kReadAheadColumns && o.prefill_staging > 0)
             prefill_reads = std::make_unique<runtime::PrefillReads>(weights->layers, file1, o.prefill_staging);
         if (!o.resident)
-            top_up(placement);
+            top_up(placement, o.resident_total);
         if (o.lend_from > 0)
             lend(o.lend_from);
         swaps_per_window = o.swaps_per_window;
+        // the CPU copies those swaps (lent tenants are device memory); TORCH_SWAP_WHEN_FULL=0 turns them off where no
+        // option reaches (the C API, torch_server)
+        const char* fast = std::getenv("TORCH_FAST_PREFILL");
+        fast_prefill = o.fast_prefill || (fast && std::string(fast) == "1");
+        const char* lend = std::getenv("TORCH_LEND_CHUNK");
+        lend_chunk_on = o.lend_chunk && chunk_device != nullptr && !(lend && std::string(lend) == "0");
+        const char* full = std::getenv("TORCH_SWAP_WHEN_FULL");
+        if (o.swap_when_full && o.lend_from == 0 && !(full && std::string(full) == "0"))
+            store->on_full([this](std::span<const runtime::ExpertStore::Staged> s) { swap_staged(s, true); });
         residency.n_layer = cfg.n_layer, residency.n_expert = cfg.n_expert;
         const size_t pairs = static_cast<size_t>(cfg.n_layer) * static_cast<size_t>(cfg.n_expert);
         residency.resident.assign(pairs, 0);
@@ -592,17 +696,24 @@ struct Model::Impl {
     }
 
     // Measures MemAvailable now that everything is allocated and makes the next-ranked experts resident until it is
-    // down to the floor plus kTopUpMargin (budget.h). Output does not change, only the hit rate.
-    void top_up(const Placement& placement) {
+    // down to the floor plus kTopUpMargin (budget.h), or until `total` experts are resident. Output does not change,
+    // only the hit rate.
+    void top_up(const Placement& placement, std::optional<int> total) {
         budget.available_after_load = mem_available();
         const uint64_t keep = budget.floor + kTopUpMargin + reserved_later;
-        if (budget.available_after_load <= keep)
-            return;
-        const Placement more = extend_ranked(ranking, runtime::ExpertStore::layer_expert_bytes(cfg, shard1), placement,
-                                             budget.available_after_load - keep);
-        store->add(more.resident);
-        budget.added = more.count();
-        budget.added_bytes = more.bytes;
+        const int want = total ? *total - placement.count() : INT_MAX;
+        if (budget.available_after_load > keep && want > 0) {
+            const Placement more =
+                extend_ranked(ranking, runtime::ExpertStore::layer_expert_bytes(cfg, shard1), placement,
+                              budget.available_after_load - keep, static_cast<size_t>(want));
+            store->add(more.resident);
+            budget.added = more.count();
+            budget.added_bytes = more.bytes;
+        }
+        if (total && placement.count() + budget.added < *total)
+            throw Error("Only " + std::to_string(placement.count() + budget.added) +
+                        " experts fit in free memory, not " + std::to_string(*total) +
+                        "; ask for fewer with --resident-total.");
     }
 
     // Lends the bytes of positions [from, context) of every attention layer's K rows, V rows and pooled keys to the
@@ -686,11 +797,76 @@ struct Model::Impl {
         }
     }
 
+    // Model::lend_chunk(): the experts that are not resident, the prompt's most routed first and then the placement's
+    // ranking, each expert's three slots together and page-aligned, in the chunk's device buffer. Residency (the swaps'
+    // view) keeps them out, so no swap evicts them or writes into the buffer; the store routes to them as to any
+    // resident expert.
+    // early: only the part after the chunk's residuals, which the draft's KV-only passes still read (stage_residuals),
+    // from another thread while they run; the prefill's GPU work is done. Then a later lend_chunk() adds the residuals'
+    // part. Not early: the whole buffer, or the residuals' part after an early lend.
+    int lend_chunk(bool early) {
+        if (!lend_chunk_on || chunk_device == nullptr || (chunk_tenants > 0 && !(lent_early && !early)))
+            return 0;
+        const uint64_t base = reinterpret_cast<uint64_t>(chunk_device);
+        const uint64_t residuals_end =
+            reinterpret_cast<uint64_t>(chunk.res) +
+            static_cast<uint64_t>(chunk_cap) * static_cast<uint64_t>(cfg.hc) * static_cast<uint64_t>(cfg.n_embd) * 4;
+        uint64_t begin = runtime::page_ceil(base), end = base + chunk_device_bytes;
+        if (early)
+            begin = runtime::page_ceil(residuals_end);
+        else if (lent_early)
+            end = runtime::page_ceil(residuals_end);  // where the early lend began
+        if (!early)
+            TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));  // nothing still reads the chunk's buffers
+        store->before_window();                               // swaps still queued land first
+        Placement have;
+        have.resident.resize(static_cast<size_t>(cfg.n_layer));
+        for (int l = 0; l < cfg.n_layer; ++l)
+            for (int e = 0; e < cfg.n_expert; ++e)
+                if (store->resident(l, e))
+                    have.resident[static_cast<size_t>(l)].push_back(e);
+        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
+        RouteCounts order = ranking.counts.empty() ? uniform_ranking(cfg.n_layer, cfg.n_expert) : ranking;
+        if (prompt_routes.size() == order.counts.size())
+            for (size_t i = 0; i < order.counts.size(); ++i)  // calibration counts stay far below 2^32
+                order.counts[i] += prompt_routes[i] << 32;
+        if (!early)
+            std::fill(prompt_routes.begin(), prompt_routes.end(), 0);
+        const Placement next = extend_ranked(order, bytes, have, end > begin ? end - begin : 0);
+        std::vector<runtime::ExpertStore::Tenant> tenants;
+        uint64_t at = begin;
+        for (int l = 0; l < cfg.n_layer; ++l)
+            for (const int32_t e : next.resident[static_cast<size_t>(l)]) {
+                const uint64_t need = bytes[static_cast<size_t>(l)];
+                if (at + need > end)
+                    break;
+                tenants.push_back({l, e, reinterpret_cast<uint8_t*>(at)});
+                at += need;
+            }
+        store->add_tenants(tenants);
+        chunk_tenants += static_cast<int>(tenants.size());
+        lent_early = early;
+        return static_cast<int>(tenants.size());
+    }
+    // Before a prefill writes the chunk's buffers: the lent experts are not resident any more.
+    void reclaim_chunk() {
+        if (chunk_tenants == 0)
+            return;
+        const auto out = store->evict(chunk_device, chunk_device + chunk_device_bytes);
+        chunk_tenants = 0, lent_early = false;
+        if (out.empty())
+            throw Error("The prefill chunk's lent experts were not resident; this is a bug in the engine.");
+    }
+
     // Which experts are resident: exactly --resident per layer, the most-routed in Options::placement, or as many of
     // every layer's first experts as fit. Fills in the budget's placement lines and the ranking top_up() continues.
     Placement place(const Options& o) {
         const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
         Placement p;
+        if (o.resident_total && (o.resident || o.placement.empty() || *o.resident_total < 0))
+            throw Error(
+                "--resident-total takes a count of experts and keeps a ranked placement: give --placement, "
+                "not --resident.");
         if (o.resident) {
             if (*o.resident < 0 || *o.resident > cfg.n_expert)
                 throw Error("--resident must be between 0 and " + std::to_string(cfg.n_expert) + ".");
@@ -706,8 +882,10 @@ struct Model::Impl {
             const RouteCounts counts = RouteCounts::read(o.placement);
             if (counts.n_layer != cfg.n_layer || counts.n_expert != cfg.n_expert)
                 throw Error("The route counts in " + o.placement.string() + " were recorded with another model.");
-            p = place_ranked(counts, bytes, budget.room());
-            budget.placement = "the most-routed experts in " + o.placement.string();
+            p = place_ranked(counts, bytes, budget.room(),
+                             o.resident_total ? static_cast<size_t>(*o.resident_total) : SIZE_MAX);
+            budget.placement = "the most-routed experts in " + o.placement.string() +
+                               (o.resident_total ? ", " + std::to_string(*o.resident_total) + " in total" : "");
             ranking = counts;
         } else {
             const int k = uniform_capacity(budget.room(), cfg.n_expert, bytes);
@@ -736,6 +914,12 @@ struct Model::Impl {
         }
         for (cudaEvent_t e : stage_events)
             cudaEventDestroy(e);
+        if (dstage_times)
+            report_windows();
+        for (const auto& row : timelines)
+            for (const Timeline& t : row)
+                for (cudaEvent_t e : t.events)
+                    cudaEventDestroy(e);
         if (std::getenv("TORCH_HOST_STAGES") && hs_windows)
             std::fprintf(
                 stderr,
@@ -883,8 +1067,8 @@ struct Model::Impl {
                 for (int i = 0; i < nb; i += 2) {
                     const Matrix& m = *bf16[i].m;
                     const Matrix* m2 = i + 1 < nb ? bf16[i + 1].m : nullptr;
-                    kernels::gemm_bf16(m.data, m.rows, m.cols, x, bf16[i].y, columns, 0.0f, stream,
-                                       m2 ? m2->data : nullptr, m2 ? m2->rows : 0, m2 ? bf16[i + 1].y : nullptr);
+                    bf16_chunk(m.data, m.rows, m.cols, x, bf16[i].y, columns, 0.0f, m2 ? m2->data : nullptr,
+                               m2 ? m2->rows : 0, m2 ? bf16[i + 1].y : nullptr);
                 }
                 return;
             }
@@ -911,6 +1095,14 @@ struct Model::Impl {
             f(g, std::min(width, columns - g));
     }
 
+    // A chunk's BF16 product: the window order (gemm_bf16, bitwise the windows), or with Options::fast_prefill the
+    // tensor cores (gemm_bf16_tc), which take K in multiples of 64.
+    void bf16_chunk(const uint8_t* w, int rows, int width, const float* x, float* y, int columns, float silu_scale,
+                    const uint8_t* w2, int rows2, float* y2) {
+        if (!fast_prefill || !kernels::gemm_bf16_tc(w, rows, width, x, y, columns, silu_scale, stream, w2, rows2, y2))
+            kernels::gemm_bf16(w, rows, width, x, y, columns, silu_scale, stream, w2, rows2, y2);
+    }
+
     // A hyper-connection mixer over the window's columns: the hc streams of each column's residual, normalized, mixed
     // into one block input (b.mixed, and its Q8), and, when `inject` is given, the block output's per-stream weights
     // (b.inject). With `combine`, the previous block's output (b.out, weighted by b.inject) is first added to the
@@ -930,8 +1122,8 @@ struct Model::Impl {
             inject && down.type == Type::BF16 && inject->type == Type::BF16 && inject->cols == down.cols;
         if (down.type == Type::BF16 && prefilling && kernels::gemm_bf16_wins(down.cols)) {  // a chunk: all columns
             stage(kBf16, [&] {
-                kernels::gemm_bf16(down.data, down.rows, down.cols, c.xn, c.lo, columns, scale, stream,
-                                   paired ? inject->data : nullptr, paired ? inject->rows : 0, c.inject);
+                bf16_chunk(down.data, down.rows, down.cols, c.xn, c.lo, columns, scale, paired ? inject->data : nullptr,
+                           paired ? inject->rows : 0, c.inject);
             });
         } else if (down.type == Type::BF16) {
             stage(kBf16, [&] {
@@ -946,10 +1138,14 @@ struct Model::Impl {
             matvec(down, c.xn, c.lo, false, columns);
             kernels::silu_scale(c.lo, cfg.hc_rank, scale, stream, columns);
         }
-        matvec(up, c.lo, c.hc_gate, false, columns);
         if (inject && !paired)
             matvec(*inject, c.xn, c.inject, false, columns);
-        kernels::hc_collapse(c.xn, c.hc_gate, c.mixed, c.q8, E, cfg.hc, stream, columns);
+        // A window's up projection and collapse share one launch, bitwise the two (gemv_bf16_collapse).
+        if (prefilling || up.type != Type::BF16 ||
+            !kernels::gemv_bf16_collapse(up.data, E, cfg.hc, up.cols, c.lo, c.xn, c.mixed, c.q8, stream, columns)) {
+            matvec(up, c.lo, c.hc_gate, false, columns);
+            kernels::hc_collapse(c.xn, c.hc_gate, c.mixed, c.q8, E, cfg.hc, stream, columns);
+        }
         each_column(columns, [&] {
             dump("hc_norm", layer_, b.xn, cfg.hc * E);
             dump("hc_lo", layer_, b.lo, cfg.hc_rank);
@@ -996,6 +1192,7 @@ struct Model::Impl {
         const Buffers& c = *ops;
         float *qkv = c.win_qkv[l], *conv = c.win_conv[l], *alpha = c.win_alpha[l], *beta = c.win_beta[l];
         products(c.mixed, {{&L.qkv, qkv}, {&L.z, c.z}, {&L.beta, beta}, {&L.alpha, alpha}}, true, columns);
+        mark(dDense);
         // q and k are L2-normalized in the convolution's launch; the gates are computed in the recurrence's
         stage(kDeltaNet, [&] {
             kernels::conv_silu_l2_window(c.conv_state[l], qkv, L.conv, conv, CC, 2 * QK, cfg.eps, columns, stream);
@@ -1005,8 +1202,10 @@ struct Model::Impl {
         });
         if (prefilling)  // the chunk is kept whole, and the next layer reuses its input buffers
             kernels::conv_commit(c.conv_state[l], qkv, CC, columns, stream);
+        mark(dDeltaNet);
         kernels::rms_norm_q8(c.o, DS, L.ssm_norm, 0, c.z, DS, c.o, DS, c.q8_x, DS, HV, cfg.eps, stream, columns);
         matvec(L.ssm_out, c.o, c.out, true, columns);
+        mark(dDense);
         each_column(columns, [&] {
             const size_t t = static_cast<size_t>(col_);
             dump("qkv", layer_, qkv + t * static_cast<size_t>(CC), CC);
@@ -1032,6 +1231,7 @@ struct Model::Impl {
         // positions. A sparse chunk stores every K/V row, raw key and pooled key first (later rows are outside a
         // column's cells), then scores, selects and attends in batches: bitwise windows of 8 (indexer_test).
         const bool batched = prefilling && sparse;
+        mark(dDense);
         stage(kAttention, [&] {
             if (batched) {
                 kernels::qk_norm_rope_store(c.q, 2 * D, L.q_norm, c.k, L.k_norm, c.v, c.k_cache[l], c.v_cache[l], H,
@@ -1079,7 +1279,9 @@ struct Model::Impl {
                 },
                 batched ? kAttentionBatch : kMaxColumns);
         });
+        mark(dAttention);
         matvec(L.wo, c.attn, c.out, false, columns);
+        mark(dDense);
         each_column(columns, [&] {
             dump("attn", layer_, b.attn, H * D);
             dump("attn_out", layer_, b.out, cfg.n_embd);
@@ -1093,6 +1295,7 @@ struct Model::Impl {
         products(c.mixed, {{&L.router, c.router}, {&L.shared_gate_inp, c.shared_gate}}, true, columns);
         each_column(columns, [&] { dump("router", layer_, b.router, cfg.n_expert); });
         kernels::router_top_k(c.router, cfg.n_expert, K, c.ids, c.weights, stream, columns);
+        mark(dRouter);
         if (prefilling && kernels::gemm_q8_experts_supports(L.gate_exps.type) &&  // a chunk of any width
             kernels::gemm_q8_experts_supports(L.up_exps.type) && kernels::gemm_q8_experts_supports(L.down_exps.type)) {
             stage(kExperts, [&] { routed_experts(L, il, columns); });
@@ -1114,13 +1317,16 @@ struct Model::Impl {
                 runtime::expert_gate(c.ids + routes, K, n, il, store->map(), cfg.n_expert, gt, store->mailbox(),
                                      store->seq(), store->counters(), store->route_counts(), store->zeros(), c.pos + g,
                                      store->last_use(), stream);
+                mark(dGate);
                 // Each unique expert's gate, up and down rows are read once for all the columns that chose it.
                 kernels::gemv_q8_experts_window(L.gate_exps.type, gt.table, gt.table + runtime::kGateSlots, gt.columns,
                                                 gt.rank, gt.count, std::min(n * K, runtime::kGateSlots), K, FF, E,
                                                 c.q8 + int64_t{g} * (E / 32), h, n, stream);  // b.mixed's Q8
+                mark(dGateUp);
                 // h is quantized by its own launch: writing it as Q8 from gate and up measured slower (+5-9 us a routed
                 // launch, +0.15-0.3 ms a token against 0.14 ms of quantize_q8; branch m3-gemv-q8-epilogues).
                 kernels::quantize_q8(h, int64_t{n} * K * FF, q8_h, stream);
+                mark(dQuantize);
                 // Q2_0's down measured faster per (column, rank) route (105 against 112 us at T = 3); both bitwise
                 // equal.
                 if (n == 1 || L.down_exps.type == Type::Q2_0)
@@ -1130,10 +1336,13 @@ struct Model::Impl {
                     kernels::gemv_q8_experts_down_window(
                         L.down_exps.type, gt.table + 2 * runtime::kGateSlots, gt.columns, gt.rank, gt.count,
                         std::min(n * K, runtime::kGateSlots), K, E, FF, q8_h, c.y + routes * E, n, stream);
+                mark(dDown);
             });
         });
         shared_expert(L, columns);
+        mark(dShared);
         kernels::moe_combine(c.y, c.weights, K, c.shared_y, c.shared_gate, c.out, E, stream, columns);
+        mark(dCombine);
         each_column(columns, [&] {
             dump("experts_h", layer_, b.h, K * cfg.n_ff_expert);
             dump("experts_y", layer_, b.y, K * E);
@@ -1161,7 +1370,10 @@ struct Model::Impl {
         kernels::q8_gather_columns(c.q8, E / 32, bk, K, xg, stream);  // b.mixed's Q8, from hc_collapse
         kernels::Q8Columns hc = kernels::q8_columns_at(c.q8_h_routes, FF / 32, bk.slots + 64);
         hc.columns = bk.slots;
-        // The layer's passes: (ticket or -1, experts read for it); the first also runs the resident experts.
+        // The layer's passes: (ticket, -1 or kResidentPass, experts read for it). Reading ahead, the resident experts
+        // run as their own pass after the passes the read-ahead's two pools hold, so the reads of the passes after it
+        // (into the pools those free) run beside its GPU work; else the first pass also runs them.
+        constexpr int kResidentPass = -2;
         std::vector<int32_t> present;
         std::vector<std::pair<int, std::vector<int32_t>>> passes;
         const bool ahead = !chunk_passes.empty();
@@ -1185,18 +1397,26 @@ struct Model::Impl {
                             missing.begin() + static_cast<std::ptrdiff_t>(std::min(
                                                   missing.size(), at + static_cast<size_t>(runtime::kGateSlots)))));
         }
-        if (passes.empty())
+        size_t resident_pass = 0;
+        if (ahead) {
+            resident_pass = std::min<size_t>(2, passes.size());
+            passes.insert(passes.begin() + static_cast<std::ptrdiff_t>(resident_pass),
+                          {kResidentPass, std::vector<int32_t>{}});
+        } else if (passes.empty()) {
             passes.emplace_back(-1, std::vector<int32_t>{});
+        }
         for (size_t p = 0; p < passes.size(); ++p) {
             const auto& [ticket, staged_ids] = passes[p];
-            const std::vector<const uint8_t*> staged =
-                ticket >= 0 ? prefill_reads->wait(ticket) : store->stage_for_prefill(il, staged_ids);
+            const std::vector<const uint8_t*> staged = ticket >= 0 ? prefill_reads->wait(ticket)
+                                                       : ticket == kResidentPass
+                                                           ? std::vector<const uint8_t*>{}
+                                                           : store->stage_for_prefill(il, staged_ids);
             prefill_reads_n += staged_ids.size();
             const int slot = table_next++ % kTableRing;  // the ring entry's last copies have run
             TORCH_CUDA_CHECK(cudaEventSynchronize(table_copied[static_cast<size_t>(slot)]));
             const uint8_t** table = chunk_tables[slot];
             int32_t* list = chunk_lists[slot];
-            std::vector<int32_t> pass = p == 0 ? present : std::vector<int32_t>{};
+            std::vector<int32_t> pass = p == resident_pass ? present : std::vector<int32_t>{};
             for (int e : pass) {
                 const std::array<const uint8_t*, 3> m = store->resident_matrices(il, e);
                 for (int kind = 0; kind < 3; ++kind)
@@ -1221,14 +1441,12 @@ struct Model::Impl {
                                      stream);
             kernels::gemm_q8_experts(L.up_exps.type, c.expert_table + NE, bk, NE, FF, E, xg, nullptr, c.up_routes,
                                      stream);
-            kernels::swiglu(c.gate_routes, c.up_routes, c.gate_routes, bk.slots * FF, stream);  // h over the gate's
-            kernels::quantize_q8(c.gate_routes, int64_t{bk.slots} * FF, c.h_routes, stream);
-            kernels::q8_to_columns(c.h_routes, hc, stream);
+            kernels::expert_h_columns(c.gate_routes, c.up_routes, bk, NE, hc, stream);  // the pass's slots only
             kernels::gemm_q8_experts(L.down_exps.type, c.expert_table + 2 * NE, bk, NE, E, FF, hc, bk.slot_route, c.y,
                                      stream);
             if (ticket >= 0)
                 prefill_reads->release(ticket, stream);  // its bytes are free once these kernels have run
-            else
+            else if (ticket != kResidentPass)
                 TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));  // the store's staging is reused by the next pass
         }
     }
@@ -1239,7 +1457,16 @@ struct Model::Impl {
         const Buffers& c = *ops;
         const Matrix &sg = L.shared_gate, &su = L.shared_up;
         const int64_t SH = cfg.n_ff_shared;
-        if (kernels::gemv_q8_groups(sg.type) && kernels::gemv_q8_groups(su.type) && sg.rows == su.rows) {
+        if (prefilling && columns > kMaxColumns && kernels::gemm_q8_supports(sg.type) &&
+            kernels::gemm_q8_supports(su.type)) {  // a chunk: gate and up on the tensor cores, then SwiGLU at once
+            stage(kDense, [&] {
+                const kernels::Q8Columns xc = kernels::q8_columns_at(c.q8_columns, E / 32, columns);
+                kernels::q8_to_columns(c.q8, xc, stream);  // b.mixed's Q8
+                kernels::gemm_q8(sg.type, sg.data, sg.rows, E, xc, c.shared_g, stream);
+                kernels::gemm_q8(su.type, su.data, su.rows, E, xc, c.shared_u, stream);
+            });
+            kernels::swiglu(c.shared_g, c.shared_u, c.shared_h, static_cast<int>(SH * columns), stream);
+        } else if (kernels::gemv_q8_groups(sg.type) && kernels::gemv_q8_groups(su.type) && sg.rows == su.rows) {
             stage(kDense, [&] {
                 groups(columns, [&](int g, int n) {
                     const kernels::Q8Part parts[2] = {{sg.type, sg.data, sg.rows, c.shared_h + g * SH},
@@ -1293,11 +1520,13 @@ struct Model::Impl {
         const int E = cfg.n_embd;
         const Buffers& c0 = cols[0];
         const size_t n = static_cast<size_t>(columns);
+        mark(dOther);  // the timeline's start
         TORCH_CUDA_CHECK(cudaMemcpyAsync(c0.pos, hb.pos, sizeof(int32_t) * n, cudaMemcpyHostToDevice, stream));
         TORCH_CUDA_CHECK(cudaMemcpyAsync(c0.embd, hb.embd, sizeof(float) * n * static_cast<size_t>(E),
                                          cudaMemcpyHostToDevice, stream));
         TORCH_CUDA_CHECK(cudaMemcpyAsync(c0.ple_embd, hb.ple, sizeof(float) * n * static_cast<size_t>(E),
                                          cudaMemcpyHostToDevice, stream));
+        mark(dCopies);
 
         layer_ = -1;
         kernels::hc_broadcast(c0.embd, c0.res, E, cfg.hc, stream, columns);
@@ -1319,14 +1548,17 @@ struct Model::Impl {
             if (L.ple) {
                 settle();
                 ple_block(L, columns);
+                mark(dPle);
             }
             const bool combine = pending;
             hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, combine, columns);
+            mark(dMixers);
             if (L.recurrent)
                 deltanet(L, il, columns);
             else
                 attention(L, il, columns);
             hc_mix(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, &L.hc_ffn_inject, true, columns);
+            mark(dMixers);
             experts(L, il, columns);
             pending = true;
             if (dumping) {
@@ -1338,7 +1570,9 @@ struct Model::Impl {
         // The head's mixer is the output norm: there is no separate one.
         const bool combine = pending;
         hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, combine, columns);
+        mark(dMixers);
         matvec(weights->output, c0.mixed, c0.logits, true, columns);
+        mark(dHead);
         each_column(columns, [&] { dump("logits", layer_, b.logits, cfg.n_vocab); });
         kernels::argmax(c0.logits, cfg.n_vocab, c0.argmax_scratch, c0.argmax, stream, columns);
         TORCH_CUDA_CHECK(
@@ -1346,6 +1580,7 @@ struct Model::Impl {
         if (want_logits)
             TORCH_CUDA_CHECK(cudaMemcpyAsync(hb.logits, c0.logits, sizeof(float) * n * static_cast<size_t>(cfg.n_vocab),
                                              cudaMemcpyDeviceToHost, stream));
+        mark(dOther);
     }
 
     // Draws columns first .. first + n - 1 of the last window (sample_columns), the later columns conditional on the
@@ -1452,6 +1687,7 @@ struct Model::Impl {
         const auto t_embed = Clock::now();
         const int E = cfg.n_embd;
         window_start = history.size();
+        window_stamp.store(static_cast<uint32_t>(window_start) + 1, std::memory_order_release);
         window = columns;
         last_logits = cols[0].logits, first_draw = window_start + 1;
 
@@ -1476,6 +1712,10 @@ struct Model::Impl {
 
         const auto t_bw = Clock::now();
         store->before_window();  // the last window's swaps have landed and its staging buffers are free
+        {
+            const std::lock_guard lock(swap_mutex);
+            swapped_in_window = 0;
+        }
         while (!lend_regions.empty() && lend_mark < context &&
                window_start + static_cast<size_t>(columns) > static_cast<size_t>(lend_mark))
             unlend();  // the window writes K/V rows at or past the lend mark
@@ -1488,9 +1728,13 @@ struct Model::Impl {
             if (graph == nullptr) {  // recorded at the first window of this width and parity; its pointers stay fixed
                 cudaGraph_t g = nullptr;
                 TORCH_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                if (dstage_times)
+                    recording = &timelines[static_cast<size_t>(parity)][static_cast<size_t>(columns)];
                 try {
                     enqueue(columns);
+                    recording = nullptr;
                 } catch (...) {
+                    recording = nullptr;
                     cudaStreamEndCapture(stream, &g);  // leave the stream usable; the half-recorded graph is dropped
                     if (g)
                         cudaGraphDestroy(g);
@@ -1507,6 +1751,8 @@ struct Model::Impl {
         const auto gpu_start = Clock::now();
         TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
         TORCH_CUDA_CHECK(cudaGetLastError());
+        if (dstage_times && !eager)
+            collect_window(timelines[static_cast<size_t>(parity)][static_cast<size_t>(columns)], columns);
         store->check();
         window_open = true;
         times.gpu += ms(Clock::now() - gpu_start);
@@ -1542,6 +1788,8 @@ struct Model::Impl {
     // the PLE ring at the end. Only the last column runs the output head; argmax(0) and logits(0) are its.
     void prefill(std::span<const int32_t> tokens) {
         const auto start = Clock::now();
+        if (dstage_times && std::any_of(dstage_windows.begin(), dstage_windows.end(), [](int w) { return w > 0; }))
+            report_windows();  // the windows of the previous request
         const int n = static_cast<int>(tokens.size());
         if (chunk_cap == 0)
             throw Error("Prefill needs a chunk size (Options::prefill_columns, torch run --prefill N).");
@@ -1569,13 +1817,12 @@ struct Model::Impl {
             chunk_pos[t] = static_cast<int32_t>(window_start) + t;
         }
         const auto ple_start = Clock::now();
-        for (int f = 0; f < n; f += kPleBatch)
-            ple->read_window(history, window_start + static_cast<size_t>(f), std::min(kPleBatch, n - f),
-                             chunk_ple + static_cast<size_t>(f) * static_cast<size_t>(E));
+        ple->read_tokens(history, window_start, n, chunk_ple);  // each distinct row once
         const double ple_ms = ms(Clock::now() - ple_start);
         times.ple += ple_ms;
         times.ple_max = std::max(times.ple_max, ple_ms);
         store->before_window();
+        reclaim_chunk();  // the chunk's buffers are written below
         while (!lend_regions.empty() && lend_mark < context &&
                window_start + static_cast<size_t>(n) > static_cast<size_t>(lend_mark))
             unlend();  // the chunk writes K/V rows at or past the lend mark
@@ -1599,6 +1846,13 @@ struct Model::Impl {
             for (int e = 0; e < cfg.n_expert && layer_grouped[static_cast<size_t>(il)]; ++e)
                 (store->resident(il, e) ? prefill_hits : prefill_misses) +=
                     static_cast<uint64_t>(layer_counts[il * cfg.n_expert + e]);
+        if (lend_chunk_on) {
+            prompt_routes.resize(static_cast<size_t>(cfg.n_layer) * static_cast<size_t>(cfg.n_expert), 0);
+            for (int il = 0; il < cfg.n_layer; ++il)
+                for (int e = 0; e < cfg.n_expert && layer_grouped[static_cast<size_t>(il)]; ++e)
+                    prompt_routes[static_cast<size_t>(il * cfg.n_expert + e)] +=
+                        static_cast<uint64_t>(layer_counts[il * cfg.n_expert + e]);
+        }
         parity ^= 1;  // every DeltaNet layer wrote its state after the chunk to state_out
         window = 1;   // logits(0) and argmax(0): the chunk's last token's
         last_logits = chunk_last.logits, first_draw = history.size();
@@ -1754,12 +2008,17 @@ struct Model::Impl {
         commit(1);
     }
 
-    // After a window: up to swaps_per_window of the experts it read from the SSD, still in the staging buffers, take
-    // the slots of their layers' least recently routed experts. The copies overlap what runs before the next window.
-    void swap_missed() {
+    // After a window: the experts it read from the SSD, still in the staging buffers, are swapped in (swap_staged).
+    void swap_missed() { swap_staged(store->staged(), false); }
+
+    // Up to the window's swap budget (swaps_per_window, less the swaps it has made) of `staged` take the slots of their
+    // layers' least recently routed experts. After the window on the main thread, or, with Options::swap_when_full,
+    // on the I/O thread when the staging fills (their layers are done for this window).
+    void swap_staged(std::span<const runtime::ExpertStore::Staged> staged, bool full) {
         const auto start = Clock::now();
-        const std::vector<runtime::ExpertStore::Staged> staged = store->staged();
-        if (staged.empty())
+        const std::lock_guard lock(swap_mutex);
+        const int cap = swaps_per_window - swapped_in_window;
+        if (staged.empty() || cap <= 0)
             return;
         std::vector<std::pair<int, int>> missed;
         for (const runtime::ExpertStore::Staged& s : staged)
@@ -1770,14 +2029,17 @@ struct Model::Impl {
         for (const auto& [layer, expert] : missed)
             std::copy_n(stamps.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(layer) * row), row,
                         stamps_cache.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(layer) * row));
-        const uint32_t now = static_cast<uint32_t>(window_start) + 1;  // the gate's stamp for this window
-        for (const Swap& w : online_swaps(residency, missed, now, swaps_per_window)) {
+        const uint32_t now = window_stamp.load(std::memory_order_acquire);  // the gate's stamp for this window
+        for (const Swap& w : online_swaps(residency, missed, now, cap)) {
             const auto it = std::find_if(staged.begin(), staged.end(),
                                          [&](const auto& s) { return s.layer == w.layer && s.expert == w.in; });
-            store->swap_in(*it, w.out);
+            store->swap_in(*it, w.out, full);
             ++times.swaps;
+            times.swaps_when_full += full ? 1 : 0;
+            ++swapped_in_window;
         }
-        store->end_swaps();
+        if (!full)
+            store->end_swaps();
         times.swap_ms += ms(Clock::now() - start);
     }
 };
@@ -1908,6 +2170,10 @@ const std::string& Model::error() const noexcept {
 
 void Model::set_swaps_per_window(int n) noexcept {
     impl_->swaps_per_window = std::max(n, 0);
+}
+
+int Model::lend_chunk(bool early) {
+    return impl_->lend_chunk(early);
 }
 
 const Weights& Model::weights() const noexcept {
