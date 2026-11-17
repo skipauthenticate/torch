@@ -2,8 +2,10 @@
 //
 // Everything lives in one arena of mapped pinned memory (cudaHostAlloc with cudaHostAllocMapped): the GPU reads it
 // as fast as device memory on the Orin (102%, measured with bench/memory_bandwidth.cu), and O_DIRECT reads land in it
-// with no bounce copy (architecture decision 8). Tensors keep the file's bytes exactly, except the one F16 vector
-// (the PLE convolution taps), which is converted to F32 at load because the kernel multiplies it with F32 activations.
+// with no bounce copy (architecture decision 8). Tensors keep the file's bytes exactly, except an F16 vector (the PLE
+// convolution taps of one file), converted to F32 at load because the kernel multiplies it with F32 activations, and
+// F32 matrices (another file's routers, hyper-connection inject rows and DeltaNet alpha and beta), narrowed to BF16 at
+// load: the load checks that every value is a BF16 value, so the BF16 kernels compute exactly what the file holds.
 //
 // The arena holds the non-expert tensors. The routed experts are placed by runtime::ExpertStore.
 #pragma once
@@ -18,6 +20,11 @@
 #include "runtime/direct_io.h"
 
 namespace torch::model {
+
+// The format a matrix has once loaded: as stored, except that an F32 matrix holding BF16 values is narrowed to BF16.
+inline Type matrix_type(const gguf::TensorInfo& t) {
+    return t.type == static_cast<uint32_t>(Type::F32) ? Type::BF16 : static_cast<Type>(t.type);
+}
 
 // `rows` rows of `cols` values in `type`, back to back, as the matrix-vector kernels read them.
 struct Matrix {

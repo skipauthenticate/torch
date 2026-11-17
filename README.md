@@ -1,7 +1,7 @@
 <h1 align="center">Torch</h1>
 
-<h3 align="center">A fast, exact inference engine for one model on one device.</h3>
-<p align="center">Qwen3.8-Flash-Next on the NVIDIA Jetson AGX Orin 64 GB.</p>
+<h3 align="center">A fast, exact local LLM engine for the NVIDIA Jetson.</h3>
+<p align="center">Qwen3.8-Flash-Next on the Jetson AGX Orin 64 GB, offline, with an OpenAI-compatible API.</p>
 
 <p align="center">
   <a href="#speed">Speed</a> · <a href="#install"><b>Install</b></a> · <a href="#use-it">Use it</a> ·
@@ -14,57 +14,41 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
-**Free, open source, and built for one board.** Torch runs Qwen3.8-Flash-Next with its full 262,144-token context
-on a Jetson AGX Orin 64 GB and serves it over the OpenAI chat API. Every kernel and default is tuned for this one
-device, and the output is exactly what the model file computes: speculative decoding changes the speed, never the
-tokens.
+**Free, open source, and built for one board.** Torch runs Qwen3.8-Flash-Next, a large mixture-of-experts LLM,
+locally on an NVIDIA Jetson AGX Orin 64 GB with its full 262,144-token context. It serves the model over an
+OpenAI-compatible chat API, so your apps, agents and coding tools get a private, offline LLM at the edge. Every CUDA
+kernel and default is tuned for this one device, and the output is exactly what the GGUF model file computes:
+speculative decoding changes the speed, never the tokens.
 
 ## Speed
 
-Measured on the Orin on 2026-11-15. Each workload is three requests with 4,096-token prompts, a 262,144-token context
-and 256 generated tokens, all nine sent to one server process. Medians, greedy.
+Jetson AGX Orin 64 GB, full 262K context, 4,096-token prompts, 256-token answers.
 
-| Workload | Answer speed | Prompt processing (default) | Prompt processing (`--fast-prefill`) |
+| Model file | Output | Prompt (4K) | Prompt (4K), `--fast-prefill` |
 | --- | ---: | ---: | ---: |
-| Code review | 37.7 tokens/s | 288 tokens/s (14.2 s) | 387 tokens/s (10.6 s) |
-| Writing | 33.8 tokens/s | 274 tokens/s (15.0 s) | 359 tokens/s (11.4 s) |
-| Repetitive text | 52.7 tokens/s | 273 tokens/s (15.0 s) | 359 tokens/s (11.4 s) |
+| IQ3_S (default) | 33.7 to 53.0 tokens/s | 273 to 289 tokens/s | 359 to 390 tokens/s |
+| UD-IQ3_XXS | 33.9 to 49.0 tokens/s | 272 to 288 tokens/s | 283 to 299 tokens/s |
 
-The times in brackets are for the whole 4,096-token prompt, which is the wait before the first answer token.
+A 4,096-token prompt is the wait before the first answer token: 14.2-15.1 s by default; with `--fast-prefill`,
+10.5-11.4 s on IQ3_S and 13.7-14.5 s on UD-IQ3_XXS.
+
+[How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
 ### Why `--fast-prefill` is off by default
 
 `--fast-prefill` reads the prompt about a quarter faster by running its BF16 matrix products on the GPU's tensor
 cores. To do that it rounds the prompt's activations to BF16 first, and that rounding has costs:
 
-- **Answers can change.** The numbers inside the model come out slightly different. In the measurement above, 7 of
-  the 9 answers differed from the default's at some token, often one where two choices were nearly tied.
+- **Answers can change.** The numbers inside the model come out slightly different. In the benchmark behind the
+  table, 7 of 9 answers differed from the default's at some token, often one where two choices were nearly tied.
 - **No exact match with the default path.** By default, reading a prompt in chunks gives bit for bit the same result
   as feeding it one token at a time, at the model file's own precision. With `--fast-prefill` it does not. Its
   results are still the same from run to run and at any chunk size.
 - **Less tested.** Prompts of 32K tokens or more, and sampled (non-greedy) answers, have not been checked with it.
 
-Quality stays inside the project's parity limit against the reference implementation either way (mean KL 0.00158 with
-the flag and 0.00211 without, against a limit of 0.0041). Answer speed is the same with or without the flag.
-
-<details>
-<summary><b>More numbers</b></summary>
-
-| Same settings | Code review | Writing | Repetitive text |
-| --- | ---: | ---: | ---: |
-| This release, answer speed | 37.7 | 33.8 | 52.7 |
-| v0.1.0, answer speed (2026-11-13) | 31.9 | 32.5 | 46.2 |
-| This release, 4,096-token prompt | 14.2 s | 15.0 s | 15.0 s |
-| This release, 4,096-token prompt with `--fast-prefill` | 10.6 s | 11.4 s | 11.4 s |
-| v0.1.0, 4,096-token prompt | about 19 s | about 19 s | about 19 s |
-
-A long context takes memory that would otherwise hold more of the model's experts, so speed depends on the context you
-ask for and on how much memory is free on the board (one request's speed moves by about 1 token/s between
-loads; the answer-speed row above came from a load that kept 19,136 experts resident). v0.1.0's prompts took
-18.6-19.8 s on 2026-11-13. A sampled request with a fixed seed gives the same tokens with speculation on or off.
-[How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
-
-</details>
+On the IQ3_S file, quality stays inside the project's parity limit against the reference implementation either way
+(mean KL 0.00179 with the flag and 0.00143 without, against a limit of 0.00328). Answer speed is the same
+with or without the flag.
 
 ## Install
 
@@ -79,6 +63,9 @@ The installer checks your system, builds Torch into `~/.local`, downloads and ve
 builds the model's draft layer on your machine. It shows the model licenses and asks you to accept them before
 anything is downloaded. A run from scratch takes about 20 minutes plus the download, and you can run it again at any
 time: it resumes where it stopped. Read the script first; don't pipe it from the network into a shell.
+
+For the UD-IQ3_XXS file instead of the default, run `scripts/install.sh --quant UD-IQ3_XXS`
+([model files](docs/model-files.md)).
 
 [Install guide](docs/install.md) · [Model files and checksums](docs/model-files.md) · [Uninstall](docs/install.md#uninstalling)
 

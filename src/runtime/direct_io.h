@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+namespace torch::gguf {
+class File;
+}
+
 namespace torch::runtime {
 
 inline constexpr uint64_t kPage = 4096;
@@ -39,28 +43,38 @@ constexpr uint64_t span_bytes(uint64_t offset, uint64_t n) {
     return page_ceil(offset + n) - page_floor(offset);
 }
 
-// A file opened for direct reads. Move-only; reads are safe from several threads at once.
+// A file opened for direct reads, or a model's files read as one (gguf::File::parts(): file i's byte j is byte
+// base_i + j). Move-only; reads are safe from several threads at once.
 class DirectFile {
 public:
     // Throws Error when the file cannot be opened.
     explicit DirectFile(const std::filesystem::path& path);
+    // The files of a model from gguf::File::open (one) or open_model (its shards), at the bases it gives them, so a
+    // tensor's data_offset() + offset is where this reads it. Throws Error when a file cannot be opened.
+    explicit DirectFile(const gguf::File& model);
     DirectFile(DirectFile&& other) noexcept;
     DirectFile& operator=(DirectFile&& other) noexcept;
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
     ~DirectFile();
 
-    uint64_t size() const noexcept { return size_; }
+    uint64_t size() const noexcept { return size_; }  // the end of the last file
 
     // Reads the pages around [offset, offset + n) into `buffer`, which is page-aligned and holds
-    // span_bytes(offset, n) bytes, and returns the address of byte `offset` in it. Throws Error when the range is
-    // outside the file or a read fails.
+    // span_bytes(offset, n) bytes, and returns the address of byte `offset` in it. Throws Error when the range is not
+    // inside one file or a read fails.
     uint8_t* read(uint64_t offset, uint64_t n, uint8_t* buffer) const;
 
 private:
-    int fd_ = -1;
+    struct Part {
+        int fd;
+        uint64_t base, size;
+        std::string path;
+    };
+    void add(const std::filesystem::path& path, uint64_t base);
+
+    std::vector<Part> parts_;  // in order of base
     uint64_t size_ = 0;
-    std::string path_;
 };
 
 // A fixed set of worker threads for blocking reads. One caller at a time.

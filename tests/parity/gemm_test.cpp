@@ -12,6 +12,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../unit/check.h"
@@ -348,6 +349,13 @@ int main() {
         for (const Type t : {Type::IQ4_NL, Type::Q8_0})  // K = 640 (the shared expert's down): a short last octet
             for (const int columns : {9, 200})
                 check_shape(t, 32, 640, columns, 201u + static_cast<uint32_t>(columns));
+        // Q8_0 at the shapes of a file that stores them so (rows x cols): a hyper-connection mixer's up (K = 320: a
+        // short last octet), the PLE block's key and value, the shared expert's down. A mixer's down (K = 10,240) does
+        // not fit gemm_q8's shared memory; the model runs it with gemv_q8 (gemv_test).
+        CHECK(kernels::gemm_q8_fits(6144) && !kernels::gemm_q8_fits(10240));
+        for (const auto& [rows, cols] : {std::pair{10240, 320}, {10240, 2560}, {2560, 2560}, {2560, 640}})
+            for (const int columns : {9, 300})
+                check_shape(Type::Q8_0, rows, cols, columns, 221u + static_cast<uint32_t>(rows / 32 + columns));
         for (const int columns : {9, 600})  // whole 128-row items: gemm_short_kernel's column ranges
             check_shape(Type::IQ4_NL, 256, 640, columns, 211u + static_cast<uint32_t>(columns));
         CHECK(!kernels::gemm_q8_supports(Type::IQ3_S));

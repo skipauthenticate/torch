@@ -1,4 +1,5 @@
-// The per-layer embedding (PLE) input of a token: one row from each of 16 hashed n-gram tables, read from shard 2.
+// The per-layer embedding (PLE) input of a token: one row from each of 16 hashed n-gram tables, read from the model's
+// table shard.
 //
 // The rows of head h hash the token and its predecessors (bigrams for heads 0-7, trigrams for 8-15) into a
 // prime-sized slice of per_layer_token_embd, 320,001,536 IQ4_NL rows of 160 values (26.8 GiB) that stay on the SSD.
@@ -22,8 +23,9 @@ namespace torch::runtime {
 
 class PleRows {
 public:
-    // Reads go through a pool of buffers for `columns` tokens at once (read_window).
-    PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file, int columns = 1);
+    // `model` (gguf::File::open_model) has the table, which `file` reads (DirectFile of the same model). Reads go
+    // through a pool of buffers for `columns` tokens at once (read_window).
+    PleRows(const model::Config& config, const gguf::File& model, const DirectFile& file, int columns = 1);
     PleRows(const PleRows&) = delete;
     PleRows& operator=(const PleRows&) = delete;
     ~PleRows();
@@ -50,7 +52,7 @@ public:
 
 private:
     const model::Config& config_;
-    uint64_t table_offset_ = 0;  // of row 0 in shard 2
+    uint64_t table_offset_ = 0;  // of row 0, where `file` reads it
     uint64_t row_bytes_ = 0;
     int columns_ = 1;
     uint8_t* buffers_ = nullptr;  // page-aligned two-page buffers: one per (column, head) and kSpareBuffers

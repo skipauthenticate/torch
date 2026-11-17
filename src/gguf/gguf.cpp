@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <system_error>
 #include <type_traits>
 
 #include "core/error.h"
@@ -247,7 +249,74 @@ File File::open(const std::filesystem::path& path, bool header_only) {
         f.data_ = static_cast<const uint8_t*>(base);
     }
     f.parse_header(/*check_bounds=*/!header_only);
+    f.parts_.push_back({path, 0, f.size_});
     return f;
+}
+
+File File::open_model(const std::filesystem::path& path, bool header_only) {
+    File m = open(path, header_only);
+    const std::optional<Split> split = m.split_;
+    if (!split || split->count == 1)
+        return m;
+    const auto suffix = [&](int k) {
+        char s[32];
+        std::snprintf(s, sizeof s, "-%05d-of-%05d.gguf", k, int{split->count});
+        return std::string(s);
+    };
+    const std::string name = path.filename().string(), count = std::to_string(split->count);
+    if (split->count > kMaxShards)
+        throw Error(path.string() + " says the model has " + count + " shards; at most " + std::to_string(kMaxShards) +
+                    " are supported.");
+    if (split->index != 0)
+        throw Error(path.string() + " is shard " + std::to_string(split->index + 1) + " of " + count +
+                    "; pass shard 1, the file whose name ends in " + suffix(1) + ".");
+    if (!name.ends_with(suffix(1)))
+        throw Error(path.string() + " is shard 1 of " + count + ", but its name does not end in " + suffix(1) +
+                    ", so the other shards cannot be found; keep the shards' original names.");
+    const std::string prefix = name.substr(0, name.size() - suffix(1).size());
+
+    // Shard 1 keeps its mapping for the metadata views and its tensors at base 0; the others are parsed and closed.
+    // A header-only parse does not check offsets against the file, so the merged offsets are checked for wrapping.
+    const auto past = [](const TensorInfo& t, const std::string& origin) {
+        return Error("Tensor " + t.name + " of " + origin + " has an offset past any file; download the model again.");
+    };
+    for (TensorInfo& t : m.tensors_) {
+        if (t.offset > UINT64_MAX - m.data_offset_)
+            throw past(t, m.origin_);
+        t.offset += m.data_offset_;
+    }
+    for (int k = 1; k < split->count; ++k) {
+        const Part& last = m.parts_.back();
+        if (last.size > UINT64_MAX - kPartAlignment - last.base)
+            throw Error("The shards of " + m.origin_ + " are impossibly large; download the model again.");
+        const uint64_t base = (last.base + last.size + kPartAlignment - 1) / kPartAlignment * kPartAlignment;
+        const std::filesystem::path at = path.parent_path() / (prefix + suffix(k + 1));  // as given: no link resolved
+        std::error_code missing;
+        if (!std::filesystem::exists(at, missing))  // an error (no permission on the folder) counts as missing
+            throw Error("Shard " + std::to_string(k + 1) + " of " + count + " of " + m.origin_ +
+                        " is missing: " + at.string() + "; download it next to shard 1.");
+        const File shard = open(at, header_only);
+        const std::optional<Split> s = shard.split_;
+        if (!s || s->index != k || s->count != split->count || s->total_tensors != split->total_tensors)
+            throw Error(shard.origin_ + " is not shard " + std::to_string(k + 1) + " of " + count + " of " + m.origin_ +
+                        " (its split.* keys differ); download it again.");
+        for (const TensorInfo& t : shard.tensors_) {
+            if (!m.names_.emplace(t.name, m.tensors_.size()).second)
+                throw Error("Tensor " + t.name + " is in two shards of " + m.origin_ + "; download the model again.");
+            if (shard.data_offset_ > UINT64_MAX - base || t.offset > UINT64_MAX - base - shard.data_offset_)
+                throw past(t, shard.origin_);
+            m.tensors_.push_back(t);
+            m.tensors_.back().offset = base + shard.data_offset_ + t.offset;
+        }
+        m.parts_.push_back({at, base, shard.size_});
+    }
+    if (m.tensors_.size() != split->total_tensors)
+        throw Error("The " + count + " shards of " + m.origin_ + " hold " + std::to_string(m.tensors_.size()) +
+                    " tensors, but split.tensors.count is " + std::to_string(split->total_tensors) +
+                    "; download the model again.");
+    m.data_offset_ = 0;
+    m.size_ = m.parts_.back().base + m.parts_.back().size;
+    return m;
 }
 
 void File::parse_header(bool check_bounds) {
@@ -409,6 +478,10 @@ template std::optional<std::vector<std::string>> File::get<std::vector<std::stri
 void File::read(const TensorInfo& t, uint64_t from, uint64_t n, void* dst) const {
     if (mapping_.fd < 0)
         throw Error(origin_ + " was parsed from memory and has no file to read; use File::open.");
+    if (parts_.size() > 1)
+        throw Error(origin_ +
+                    " was opened as a model of several shards; read a tensor's bytes from its own shard "
+                    "(File::open) or with DirectFile.");
     if (from > t.nbytes || n > t.nbytes - from || t.offset > UINT64_MAX - from || !contains(t.offset + from, n)) {
         throw Error("Bytes [" + std::to_string(from) + ", +" + std::to_string(n) + ") of tensor " + t.name +
                     " are not in " + origin_ + "; open the complete file.");
@@ -432,6 +505,9 @@ void File::read(const TensorInfo& t, uint64_t from, uint64_t n, void* dst) const
 }
 
 std::span<const uint8_t> File::mapped(const TensorInfo& t) const {
+    if (parts_.size() > 1)
+        throw Error(origin_ +
+                    " was opened as a model of several shards; map a tensor from its own shard (File::open).");
     if (!contains(t.offset, t.nbytes)) {
         throw Error("Tensor " + t.name + " is not in " + origin_ + "; open the complete file.");
     }

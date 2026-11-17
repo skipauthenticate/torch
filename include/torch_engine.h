@@ -47,7 +47,7 @@ typedef struct torch_engine torch_engine;
 
 typedef struct torch_engine_options {
     uint32_t struct_size;     /* sizeof(torch_engine_options) */
-    const char* model;        /* shard 1, MODEL-00001-of-00002.gguf; shard 2 is found next to it */
+    const char* model;        /* shard 1 (MODEL-00001-of-0000N.gguf); the others are found next to it */
     const char* draft;        /* the draft-layer file, or NULL: no speculation */
     const char* draft_vocab;  /* the draft head's token list (NULL: the full vocabulary) */
     int32_t draft_head_rows;  /* rows of the draft head taken from draft_vocab (0: all of them) */

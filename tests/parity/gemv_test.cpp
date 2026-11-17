@@ -12,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "../unit/check.h"
 #include "device.h"
@@ -673,6 +674,10 @@ int main() {
                 check_columns(t, 37, 640);
         }
         check_columns(Type::Q6_K, 37, 6144);  // eight columns of activations past 48 KB of shared memory
+        // Q8_0 at the shapes of a file that stores them so (rows x cols): a hyper-connection mixer's down and up, the
+        // PLE block's key and value, the shared expert's down
+        for (const auto& [rows, cols] : {std::pair{320, 10240}, {10240, 320}, {10240, 2560}, {2560, 2560}, {2560, 640}})
+            check_columns(Type::Q8_0, rows, cols);
         check_group_columns({{Type::IQ4_XS, 61}, {Type::Q6_K, 7}, {Type::Q5_K, 9}}, false);
         check_group_columns({{Type::Q4_K, 37}, {Type::IQ4_XS, 37}}, true);
         check_bf16_columns(37, 0, 320, 0.0f);

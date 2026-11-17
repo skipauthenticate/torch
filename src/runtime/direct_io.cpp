@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "core/error.h"
+#include "gguf/gguf.h"
 
 namespace torch::runtime {
 namespace {
@@ -29,59 +30,83 @@ int open_direct(const std::string& path) {
 
 }  // namespace
 
-DirectFile::DirectFile(const std::filesystem::path& path) : path_(path.string()) {
-    fd_ = open_direct(path_);
+DirectFile::DirectFile(const std::filesystem::path& path) {
+    add(path, 0);
+}
+
+DirectFile::DirectFile(const gguf::File& model) {
+    if (model.parts().empty())
+        throw Error("A GGUF header parsed from memory has no file to read; open the model with gguf::File.");
+    try {
+        for (const gguf::Part& p : model.parts())
+            add(p.path, p.base);
+    } catch (...) {
+        for (const Part& p : parts_)  // a constructor that throws runs no destructor
+            ::close(p.fd);
+        throw;
+    }
+}
+
+void DirectFile::add(const std::filesystem::path& path, uint64_t base) {
+    if (base % kPage != 0 || base < size_)
+        throw Error("The files of a model must start on page boundaries, in order; this is a bug in the engine.");
+    const int fd = open_direct(path.string());
     struct stat st{};
-    if (fd_ < 0 || fstat(fd_, &st) != 0) {
+    if (fd < 0 || fstat(fd, &st) != 0) {
         const int error = errno;
-        if (fd_ >= 0)
-            ::close(fd_);
-        fd_ = -1;
-        throw Error("Cannot open " + path_ + " for direct reads (" + std::strerror(error) +
+        if (fd >= 0)
+            ::close(fd);
+        throw Error("Cannot open " + path.string() + " for direct reads (" + std::strerror(error) +
                     "); check the path and that the file system supports O_DIRECT.");
     }
-    size_ = static_cast<uint64_t>(st.st_size);
+    try {
+        parts_.push_back({fd, base, static_cast<uint64_t>(st.st_size), path.string()});
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    size_ = base + parts_.back().size;
 }
 
 DirectFile::DirectFile(DirectFile&& other) noexcept
-    : fd_(std::exchange(other.fd_, -1)), size_(other.size_), path_(std::move(other.path_)) {}
+    : parts_(std::exchange(other.parts_, {})), size_(std::exchange(other.size_, 0)) {}
 
 DirectFile& DirectFile::operator=(DirectFile&& other) noexcept {
-    if (this != &other) {
-        if (fd_ >= 0)
-            ::close(fd_);
-        fd_ = std::exchange(other.fd_, -1);
-        size_ = other.size_;
-        path_ = std::move(other.path_);
-    }
+    std::swap(parts_, other.parts_);  // other's destructor closes what this held
+    std::swap(size_, other.size_);
     return *this;
 }
 
 DirectFile::~DirectFile() {
-    if (fd_ >= 0)
-        ::close(fd_);
+    for (const Part& p : parts_)
+        ::close(p.fd);
 }
 
 uint8_t* DirectFile::read(uint64_t offset, uint64_t n, uint8_t* buffer) const {
-    if (offset > size_ || n > size_ - offset)
-        throw Error("Bytes [" + std::to_string(offset) + ", +" + std::to_string(n) + ") are not in " + path_ +
-                    "; check that the file is complete.");
-    const uint64_t first = page_floor(offset);
-    const uint64_t need = offset + n - first;  // bytes from `first` that must arrive; the last page may be short
+    // The last file that starts at or before `offset`.
+    auto it =
+        std::upper_bound(parts_.begin(), parts_.end(), offset, [](uint64_t o, const Part& p) { return o < p.base; });
+    const Part* p = it == parts_.begin() ? nullptr : &*std::prev(it);
+    if (p == nullptr || offset - p->base > p->size || n > p->size - (offset - p->base))
+        throw Error("Bytes [" + std::to_string(offset) + ", +" + std::to_string(n) + ") are not in " +
+                    (p ? p->path : std::string("the model's files")) + "; check that the file is complete.");
+    const uint64_t local = offset - p->base;  // in the file; its base is page-aligned, so the pages line up
+    const uint64_t first = page_floor(local);
+    const uint64_t need = local + n - first;  // bytes from `first` that must arrive; the last page may be short
     uint64_t done = 0;
     const uint64_t total = span_bytes(offset, n);
     while (done < need) {
         const ssize_t got =
-            ::pread(fd_, buffer + done, std::min(total - done, kReadChunk), static_cast<off_t>(first + done));
+            ::pread(p->fd, buffer + done, std::min(total - done, kReadChunk), static_cast<off_t>(first + done));
         const int error = errno;
         if (got < 0 && error == EINTR)
             continue;
         if (got <= 0)
-            throw Error("Cannot read " + path_ + " at byte " + std::to_string(first + done) + " (" +
+            throw Error("Cannot read " + p->path + " at byte " + std::to_string(first + done) + " (" +
                         (got < 0 ? std::strerror(error) : "unexpected end of file") + "); check the disk.");
         done += static_cast<uint64_t>(got);
     }
-    return buffer + (offset - first);
+    return buffer + (local - first);
 }
 
 ReadPool::ReadPool(int threads) {

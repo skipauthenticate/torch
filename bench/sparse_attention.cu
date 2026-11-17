@@ -12,7 +12,7 @@
 // positions P .. P + N - 1, stage by stage and whole, with each stage's per-chunk seconds for 12 layers: q/k norm, RoPE
 // and K/V rows; the indexer's prepare and pool; and, batch by batch, scoring, selection and attention over the cells.
 //
-// usage: torch_bench_sparse MODEL-00001-of-00002.gguf [--position P] [--context N] [--similar]
+// usage: torch_bench_sparse MODEL-00001-of-0000N.gguf [--position P] [--context N] [--similar]
 //                           [--chunk N [--batch B]]
 #include <cuda_runtime.h>
 
@@ -201,11 +201,11 @@ int main(int argc, char** argv) {
     }
     if (path.empty() || position + std::max(chunk, kernels::kMaxColumns) > context || context % 4 != 0 || batch < 1) {
         std::fprintf(stderr,
-                     "usage: torch_bench_sparse MODEL-00001-of-00002.gguf [--position P] [--context N] [--similar] "
+                     "usage: torch_bench_sparse MODEL-00001-of-0000N.gguf [--position P] [--context N] [--similar] "
                      "[--chunk N [--batch B]]\n");
         return 2;
     }
-    const model::Config cfg = model::Config::read(gguf::File::open(path, /*header_only=*/true));
+    const model::Config cfg = model::Config::read(gguf::File::open_model(path, /*header_only=*/true));
     if (chunk > 0) {
         cudaStream_t s;
         TORCH_CUDA_CHECK(cudaStreamCreate(&s));

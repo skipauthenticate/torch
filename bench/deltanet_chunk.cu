@@ -2,7 +2,7 @@
 // model's 36 DeltaNet layers, each with its own state, timed with CUDA events over one CUDA graph. Inputs are random
 // in conv_silu_l2_window's output layout; seconds per chunk of N tokens and per 4,096 tokens.
 //
-// usage: torch_bench_deltanet MODEL-00001-of-00002.gguf [--columns N, default 4096]
+// usage: torch_bench_deltanet MODEL-00001-of-0000N.gguf [--columns N, default 4096]
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -45,10 +45,10 @@ int main(int argc, char** argv) {
             path = a;
     }
     if (path.empty() || n < 1) {
-        std::fprintf(stderr, "usage: torch_bench_deltanet MODEL-00001-of-00002.gguf [--columns N]\n");
+        std::fprintf(stderr, "usage: torch_bench_deltanet MODEL-00001-of-0000N.gguf [--columns N]\n");
         return 2;
     }
-    const model::Config cfg = model::Config::read(gguf::File::open(path, /*header_only=*/true));
+    const model::Config cfg = model::Config::read(gguf::File::open_model(path, /*header_only=*/true));
     int layers = 0;
     for (int il = 0; il < cfg.n_layer; ++il)
         layers += cfg.recurrent(il);

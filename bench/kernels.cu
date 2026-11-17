@@ -27,7 +27,7 @@
 // the token and PLE row reads, the routing wait, expert reads on a miss, the copies, and the gaps between launches
 // in the real forward pass.
 //
-// usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s, default 180] [--columns 1-8]
+// usage: torch_bench_kernels MODEL-00001-of-0000N.gguf [--json FILE] [--ceiling GB/s, default 180] [--columns 1-8]
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -60,6 +60,7 @@
 #include "kernels/norm/norm.h"
 #include "kernels/ple/ple.h"
 #include "model/config.h"
+#include "model/weights.h"
 #include "torch/version.h"
 
 namespace torch::bench {
@@ -351,7 +352,7 @@ std::string short_name(const std::string& tensor) {
 }
 
 // The deduplicated matrix-vector products of one token with their counts, from the tensor table.
-std::vector<Matvec> matvec_cases(const gguf::File& shard1, const model::Config& cfg, int& swiglu_launches,
+std::vector<Matvec> matvec_cases(const gguf::File& file, const model::Config& cfg, int& swiglu_launches,
                                  int& silu_launches) {
     static const char* const kMatrices[] = {"attn_qkv",
                                             "attn_gate",
@@ -404,8 +405,8 @@ std::vector<Matvec> matvec_cases(const gguf::File& shard1, const model::Config& 
         for (const std::vector<std::string>& names : kShared) {
             std::vector<const gguf::TensorInfo*> bf16, q8;
             for (const std::string& n : names)
-                if (const gguf::TensorInfo* t = shard1.tensor("blk." + std::to_string(il) + "." + n + ".weight"))
-                    (t->type == static_cast<uint32_t>(Type::BF16) ? bf16 : q8).push_back(t);
+                if (const gguf::TensorInfo* t = file.tensor("blk." + std::to_string(il) + "." + n + ".weight"))
+                    (model::matrix_type(*t) == Type::BF16 ? bf16 : q8).push_back(t);
             const bool swiglu = names[0] == "ffn_gate_shexp";
             const bool grouped = q8.size() > 1 && std::all_of(q8.begin(), q8.end(), [](const gguf::TensorInfo* t) {
                                      return kernels::gemv_q8_groups(static_cast<Type>(t->type));
@@ -456,21 +457,23 @@ std::vector<Matvec> matvec_cases(const gguf::File& shard1, const model::Config& 
     auto inject_of = [&](const gguf::TensorInfo& down) -> const gguf::TensorInfo* {
         const size_t at = down.name.find("hc_");
         const size_t end = down.name.rfind("_down.weight");
-        if (at == std::string::npos || end == std::string::npos || down.type != static_cast<uint32_t>(Type::BF16))
+        if (at == std::string::npos || end == std::string::npos || model::matrix_type(down) != Type::BF16)
             return nullptr;
-        const gguf::TensorInfo* inject = shard1.tensor(down.name.substr(0, end) + "_inject.weight");
-        return inject != nullptr && inject->type == down.type && inject->shape[0] == down.shape[0] ? inject : nullptr;
+        const gguf::TensorInfo* inject = file.tensor(down.name.substr(0, end) + "_inject.weight");
+        return inject != nullptr && model::matrix_type(*inject) == Type::BF16 && inject->shape[0] == down.shape[0]
+                   ? inject
+                   : nullptr;
     };
-    for (const gguf::TensorInfo& t : shard1.tensors()) {
+    for (const gguf::TensorInfo& t : file.tensors()) {
         const std::string name = short_name(t.name);
-        const Type type = static_cast<Type>(t.type);
+        const Type type = model::matrix_type(t);
         const int rows = static_cast<int>(t.shape[1]), cols = static_cast<int>(t.shape[0]);
         if (t.name.rfind("blk.", 0) == 0 && shared_input(name))
             continue;  // above
         if (std::find(std::begin(kMatrices), std::end(kMatrices), name) != std::end(kMatrices)) {
             const size_t inject_at = t.name.rfind("_inject.weight");
             if (inject_at != std::string::npos) {
-                const gguf::TensorInfo* down = shard1.tensor(t.name.substr(0, inject_at) + "_down.weight");
+                const gguf::TensorInfo* down = file.tensor(t.name.substr(0, inject_at) + "_down.weight");
                 if (down != nullptr && inject_of(*down) == &t)
                     continue;  // timed with its down projection
             }
@@ -503,7 +506,7 @@ std::vector<Matvec> matvec_cases(const gguf::File& shard1, const model::Config& 
                 throw Error("Tensor " + t.name + " is " + format_name(type) + ", which no matrix-vector kernel reads.");
         } else if (name == "ffn_gate_exps") {
             const std::string up = t.name.substr(0, t.name.find("ffn_gate_exps")) + "ffn_up_exps.weight";
-            const gguf::TensorInfo* u = shard1.tensor(up);
+            const gguf::TensorInfo* u = file.tensor(up);
             if (u == nullptr || u->type != t.type || !kernels::gemv_q8_supports(type))
                 throw Error("Layer tensors " + t.name + " and " + up + " must exist in one supported format.");
             add("gemv_q8_experts", "gate+up exps", type, rows, cols, true);
@@ -1075,11 +1078,11 @@ void write_json(const char* path, const std::vector<Row>& rows, const Totals& t,
 }
 
 int run(const std::string& model, const char* json_path, double ceiling) {
-    const gguf::File shard1 = gguf::File::open(model, /*header_only=*/true);
-    const model::Config cfg = model::Config::read(shard1);
+    const gguf::File file = gguf::File::open_model(model, /*header_only=*/true);
+    const model::Config cfg = model::Config::read(file);
     int swiglu_launches = 0;  // the shared experts' SwiGLU, where their gate and up are not one group launch
     int silu_launches = 0;    // silu_scale, where a mixer's down projection is not BF16
-    const std::vector<Matvec> cases = matvec_cases(shard1, cfg, swiglu_launches, silu_launches);
+    const std::vector<Matvec> cases = matvec_cases(file, cfg, swiglu_launches, silu_launches);
 
     cudaStream_t stream = nullptr;
     TORCH_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -1149,7 +1152,7 @@ int main(int argc, char** argv) {
     }
     if (model.empty() || ceiling <= 0 || torch::bench::g_columns < 1 || torch::bench::g_columns > 8) {
         std::fprintf(stderr,
-                     "usage: torch_bench_kernels MODEL-00001-of-00002.gguf [--json FILE] [--ceiling GB/s] "
+                     "usage: torch_bench_kernels MODEL-00001-of-0000N.gguf [--json FILE] [--ceiling GB/s] "
                      "[--columns 1-8]\n");
         return 2;
     }

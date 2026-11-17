@@ -429,9 +429,13 @@ asks for.
 
 ## Numerics and determinism
 
-- Weights exactly as stored. Activations are quantized to 8 bits per 32 values for the integer dot products. F32 for
-  accumulators, norms, softmax, RoPE, the router, the DeltaNet state and the hyper-connection mixers. F16 for the KV
-  cache and indexer keys.
+- Weights exactly as stored (an F32 matrix holding BF16 values is narrowed to BF16 at load, which changes no value).
+  A matrix's input follows its format, as in the reference implementation: a quantized matrix takes it quantized to 8
+  bits per 32 values for the integer dot products, a BF16 matrix takes it in F32. So the precision of a product
+  depends on the file: the IQ3_S file stores the hyper-connection mixers, the head mixer and the PLE key and value in
+  BF16 (F32 inputs), the UD-IQ3_XXS file in Q8_0 (8-bit inputs) ([model-files.md](model-files.md)). F32 for
+  accumulators, norms, softmax, RoPE, the router, the DeltaNet state and every BF16 product. F16 for the KV cache and
+  indexer keys.
 - No fast-math, no flush-to-zero; `__fmaf_rn` and `__fmul_rn` where the order of operations matters; no
   floating-point atomics. One canonical reduction order per format (decision 2). A token's accumulation order never
   depends on the window width, on which tokens share its expert group, or on which block ran a work item.
@@ -453,8 +457,9 @@ asks for.
   goal 4).
 - **Model parity**: next-token log-probabilities on fixed prompts against the committed reference log-probabilities
   (a second implementation of the model on the same file): greedy top-1 agreement at every position with a near-tie
-  rule, and a mean per-position KL divergence within twice the reference's own spread between two runs with
-  different numerics. M2 fixed the values (development.md, "Model parity").
+  rule, and a mean per-position KL divergence within twice the reference's largest spread against itself under three
+  changes of numerics (more layers' experts on its CPU, smaller prompt batches, flash attention off). M2 fixed the
+  first values; they were set again on 2026-11-16 (development.md, "Model parity").
 - **Speculation is invisible**: greedy output with speculation on equals greedy output with it off, token for token,
   on every benchmark prompt, with and without swaps (M4: the nine prompts, 256 tokens). The draft layer's K/V after
   N windows equals a fresh pass over the accepted history, bit for bit (`--check-draft-kv`). The sampler passes a

@@ -1227,6 +1227,13 @@ bool gemm_q8_supports(Type type) {
            type == Type::IQ4_NL || type == Type::Q8_0;
 }
 
+bool gemm_q8_fits(int cols) {
+    static int optin = 0;
+    if (optin == 0)
+        TORCH_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    return size_t{640} * static_cast<size_t>(cols / 32) + kRing <= static_cast<size_t>(optin);  // launch_gemm's largest
+}
+
 bool gemm_q8_experts_supports(Type type) {
     return type == Type::IQ2_S || type == Type::IQ3_XXS || type == Type::IQ3_S || type == Type::IQ4_XS ||
            type == Type::IQ4_NL || type == Type::Q2_0;
@@ -1262,10 +1269,10 @@ void gemm_q8_experts(Type type, const uint8_t* const* table, const ExpertBuckets
 void gemm_q8(Type type, const uint8_t* w, int rows, int cols, const Q8Columns& x, float* y, cudaStream_t stream) {
     const TypeInfo& info = *type_info(static_cast<uint32_t>(type));
     if (!gemm_q8_supports(type) || rows % 16 != 0 || cols % static_cast<int>(info.block_elements) != 0 ||
-        x.units != cols / 32 || x.columns < 1)
+        !gemm_q8_fits(cols) || x.units != cols / 32 || x.columns < 1)
         throw Error(
             "gemm_q8 takes Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL or Q8_0 rows (a multiple of 16 rows of whole "
-            "blocks) and their columns.");
+            "blocks, short enough for gemm_q8_fits) and their columns.");
     // Items of one column range run on every SM at once, so the range's activations stay in the 4 MB L2: 256
     // columns at K = 6,144 (1.8 MB), 512 below.
     const int range = cols > 4096 ? 256 : 512;

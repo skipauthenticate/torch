@@ -53,9 +53,12 @@ void q8_to_columns(const BlockQ8* x, const Q8Columns& out, cudaStream_t stream);
 
 // True for the formats gemm_q8 multiplies: Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL and Q8_0.
 bool gemm_q8_supports(Type type);
+// True when rows of `cols` values fit gemm_q8's shared memory (640 bytes a 32-value unit, plus the rings): up to about
+// 8,000 values on the Orin. Wider rows (a Q8_0 hyper-connection mixer's 10,240) take gemv_q8 a window at a time.
+bool gemm_q8_fits(int cols);
 
 // y[c * rows + r] = W[r] . x_c for every column c < x.columns, bitwise gemv_q8 on that column. rows % 16 == 0, cols a
-// whole number of the format's blocks, and x.units == cols / 32.
+// whole number of the format's blocks that gemm_q8_fits, and x.units == cols / 32.
 void gemm_q8(Type type, const uint8_t* w, int rows, int cols, const Q8Columns& x, float* y, cudaStream_t stream);
 
 // ---- Routed experts over a chunk --------------------------------------------------------------------------------

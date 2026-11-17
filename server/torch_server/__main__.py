@@ -13,15 +13,24 @@ from .chat import Chat
 from .engine import Engine, EngineError
 from .http import Server
 
-# The calibration shipped for the pinned model files (calibration/ed59f920/README.md), next to the package both in the
-# source tree and where scripts/install.sh puts it.
-CALIBRATION = Path(__file__).resolve().parents[2] / "calibration" / "ed59f920"
-PINNED_SHARD1 = "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+# The calibration shipped for each pinned model file, by the name of its shard 1 (calibration/*/README.md), next to the
+# package both in the source tree and where scripts/install.sh puts it.
+CALIBRATIONS = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": "ed59f920",
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf": "f5d175de-UD-IQ3_XXS",
+}
+
+
+def calibration_for(model):
+    """The shipped calibration folder for a pinned model's shard 1, or None for any other file."""
+    folder = CALIBRATIONS.get(Path(model).name)
+    path = Path(__file__).resolve().parents[2] / "calibration" / folder if folder else None
+    return path if path and path.is_dir() else None
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m torch_server", description=__doc__)
-    p.add_argument("--model", required=True, help="shard 1 of the model (MODEL-00001-of-00002.gguf)")
+    p.add_argument("--model", required=True, help="shard 1 of the model (MODEL-00001-of-0000N.gguf)")
     p.add_argument("--library", default=os.environ.get("TORCH_ENGINE_LIBRARY", "libtorch_engine.so"),
                    help="the engine's shared library (default: $TORCH_ENGINE_LIBRARY or libtorch_engine.so)")
     p.add_argument("--tokenizer", type=Path, help="a folder from `torch inspect --export-tokenizer` (default: export "
@@ -51,11 +60,12 @@ def main(argv=None):
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
-    if Path(a.model).name == PINNED_SHARD1 and CALIBRATION.is_dir():  # the published configuration
+    calibration = calibration_for(a.model)
+    if calibration:  # the published configuration
         if a.placement is None:
-            a.placement = str(CALIBRATION / ("calib-g-spec.txt" if a.draft else "calib-g.txt"))
+            a.placement = str(calibration / ("calib-g-spec.txt" if a.draft else "calib-g.txt"))
         if a.draft and a.draft_vocab is None:
-            a.draft_vocab, a.draft_head_rows = str(CALIBRATION / "draft-vocab.txt"), a.draft_head_rows or 81920
+            a.draft_vocab, a.draft_head_rows = str(calibration / "draft-vocab.txt"), a.draft_head_rows or 81920
     if a.placement == "none":
         a.placement = None
     loopback = a.host == "localhost" or ipaddress.ip_address(a.host).is_loopback

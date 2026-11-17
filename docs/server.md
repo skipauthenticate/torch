@@ -14,10 +14,11 @@ PYTHONPATH=server ~/.local/torch-server/bin/python -m torch_server \
 
 (`scripts/install.sh` installs `torch-server`, which passes the installed paths.) It exports the tokenizer and chat
 template from the model file at start (`torch inspect --export-tokenizer`, or `--tokenizer DIR` for files exported
-before), loads the model and listens on `http://127.0.0.1:8080/v1`. For the pinned model files it uses the shipped
-calibration in `calibration/ed59f920/` unless told otherwise: the placement for speculative decoding (or for one token
-at a time without a draft file) and the draft head's 81,920-row vocabulary; `--placement none` turns the placement
-off. `--swaps` (experts made resident after each window) defaults to 128 and `--prefill` to 4,096. A window whose
+before), loads the model and listens on `http://127.0.0.1:8080/v1`. For each supported model file it uses that file's
+shipped calibration unless told otherwise (`calibration/ed59f920/` for the IQ3_S file, `calibration/f5d175de-UD-IQ3_XXS/`
+for the UD-IQ3_XXS file, chosen by the name of `--model`): the placement for speculative decoding (or for one token at
+a time without a draft file) and the draft head's 81,920-row vocabulary; `--placement none` turns the placement off.
+The UD-IQ3_XXS file takes the same draft file. `--swaps` (experts made resident after each window) defaults to 128 and `--prefill` to 4,096. A window whose
 misses fill the expert staging swaps the ones it holds in at that point; `TORCH_SWAP_WHEN_FULL=0` in the environment
 turns that off (and `--lend-kv` does).
 `python -m torch_server --help` lists every option.
@@ -27,8 +28,10 @@ rounded to BF16, instead of the default exact kernels. On the nine 4,096-token b
 to the first token falls from 16.9 to 13.0 s on code review and from 18.4 to 14.4 s on prose and repetition. What it
 trades: the prompt is then not computed bitwise as the one-token path computes it, so a greedy answer can differ from
 the default's (7 of the 9 benchmark answers did, from a near-tie onwards). It stays deterministic and gives the same
-result at any `--prefill` chunk size, and it stays within the model parity gate against the reference implementation
-(mean KL 0.00158 against the default's 0.00211; gate 0.0041). Decoding is unchanged. `TORCH_FAST_PREFILL=1` in the
+result at any `--prefill` chunk size. On the IQ3_S file it stays within the model parity gate against the reference
+implementation (mean KL 0.00179 against the default's 0.00143; gate 0.00328). On the UD-IQ3_XXS file it fails that
+gate at one token: Torch ends the turn where the reference writes a newline (development.md, "Model parity").
+Decoding is unchanged. `TORCH_FAST_PREFILL=1` in the
 environment turns it on where no option reaches (C API callers set `fast_prefill`, ABI 2).
 
 ## Endpoints

@@ -490,9 +490,9 @@ struct Draft::Impl {
     }
 };
 
-Reservation Draft::reservation(const std::filesystem::path& shard1, const std::filesystem::path& file,
+Reservation Draft::reservation(const std::filesystem::path& model, const std::filesystem::path& file,
                                const std::vector<DraftVariant>& variants, int context) {
-    const gguf::File main = gguf::File::open(shard1, true), draft = gguf::File::open(file);
+    const gguf::File main = gguf::File::open_model(model, true), draft = gguf::File::open(file);
     const Config c = Config::read(main);
     const gguf::TensorInfo* out = main.tensor("output.weight");
     const uint64_t row = out ? torch::row_bytes(*type_info(out->type), static_cast<uint64_t>(c.n_embd)) : 0;

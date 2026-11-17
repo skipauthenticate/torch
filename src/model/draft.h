@@ -51,7 +51,7 @@ class Draft {
 public:
     // The memory a Draft of these variants takes, as a budget line: pass it in Options::reserve so the trunk's top-up
     // leaves room for it. Throws Error when a file cannot be read or is not the supported one.
-    static Reservation reservation(const std::filesystem::path& shard1, const std::filesystem::path& file,
+    static Reservation reservation(const std::filesystem::path& model, const std::filesystem::path& file,
                                    const std::vector<DraftVariant>& variants, int context);
 
     // Loads the draft file for `trunk`, whose sequence it drafts from. vocab: token ids, most frequent first, at least

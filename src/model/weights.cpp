@@ -25,7 +25,7 @@ public:
 
     struct Read {
         uint64_t file_offset;  // page-aligned
-        uint64_t bytes;        // whole pages, except that the file may end inside the last one
+        uint64_t bytes;        // from file_offset to the tensor's last byte (DirectFile reads the whole pages)
         uint8_t* dst;          // page-aligned
     };
     std::vector<Read> reads;
@@ -37,13 +37,25 @@ public:
     };
     std::vector<Convert> converts;
 
+    // An F32 matrix narrowed to BF16 in place after the reads: the values must be BF16 values, so nothing changes.
+    struct Narrow {
+        std::string name;
+        uint8_t* data;  // n F32 values, then n BF16 values from the same address
+        int64_t n;
+    };
+    std::vector<Narrow> narrows;
+
+    // A BF16 or quantized matrix as stored, or an F32 one as BF16 (narrowed after the reads).
     Matrix matrix(const std::string& name, int64_t cols, int64_t rows) {
         const gguf::TensorInfo& t = tensor(name, {cols, rows});
-        const Type type = static_cast<Type>(t.type);
+        const Type type = matrix_type(t);
         if (type == Type::BF16 ? cols % 8 != 0 : !kernels::gemv_q8_supports(type))
             throw Error("Tensor " + name + " is stored as " + std::string(type_info(t.type)->name) +
                         ", which the matrix-vector kernels do not read; use the supported model file.");
-        return {type, static_cast<int>(rows), static_cast<int>(cols), place(t, t.nbytes)};
+        const uint8_t* data = place(t, t.nbytes);
+        if (t.type == static_cast<uint32_t>(Type::F32) && arena_)
+            narrows.push_back({name, const_cast<uint8_t*>(data), t.elements()});
+        return {type, static_cast<int>(rows), static_cast<int>(cols), data};
     }
 
     const float* vector(const std::string& name, std::initializer_list<int64_t> shape) {
@@ -104,7 +116,7 @@ private:
         uint8_t* page = room(span);
         if (arena_ == nullptr)
             return nullptr;
-        reads.push_back({runtime::page_floor(offset), span, page});
+        reads.push_back({runtime::page_floor(offset), offset + n - runtime::page_floor(offset), page});
         return page + (offset - runtime::page_floor(offset));
     }
 
@@ -201,16 +213,28 @@ uint8_t* load_arena(const gguf::File& f, const runtime::DirectFile& file, runtim
     try {
         pool.run(static_cast<int>(chunks.size()), [&](int i) {
             const WeightLoader::Read& r = chunks[static_cast<size_t>(i)];
-            // Pages past the end of the file stay unread; read() returns once the file's own bytes have arrived.
-            file.read(r.file_offset, std::min(r.bytes, file.size() - r.file_offset), r.dst);
+            file.read(r.file_offset, r.bytes, r.dst);
         });
+        for (const WeightLoader::Convert& c : loader.converts) {
+            for (int64_t i = 0; i < c.n; ++i)
+                c.f32[i] = fp16_to_f32(load_u16(c.f16 + 2 * i));
+        }
+        // Forward in place: BF16 value i (bytes 2i, 2i + 1) never overwrites an F32 value not yet read.
+        for (const WeightLoader::Narrow& m : loader.narrows) {
+            for (int64_t i = 0; i < m.n; ++i) {
+                uint32_t v;
+                std::memcpy(&v, m.data + 4 * i, 4);
+                if ((v & 0xffffu) != 0)
+                    throw Error("Tensor " + m.name +
+                                " is stored as F32 with values BF16 cannot hold exactly; this engine reads such "
+                                "tensors only as BF16, so use a supported model file (docs/model-files.md).");
+                const auto top = static_cast<uint16_t>(v >> 16);
+                std::memcpy(m.data + 2 * i, &top, 2);
+            }
+        }
     } catch (...) {
         cudaFreeHost(arena);
         throw;
-    }
-    for (const WeightLoader::Convert& c : loader.converts) {
-        for (int64_t i = 0; i < c.n; ++i)
-            c.f32[i] = fp16_to_f32(load_u16(c.f16 + 2 * i));
     }
     return static_cast<uint8_t*>(arena);
 }
