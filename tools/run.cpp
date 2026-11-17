@@ -30,10 +30,10 @@ namespace torch {
 namespace {
 
 constexpr const char* kUsage =
-    "usage: torch run [options] MODEL-00001-of-00002.gguf --tokens ID,ID,...\n"
+    "usage: torch run [options] MODEL-00001-of-0000N.gguf --tokens ID,ID,...\n"
     "\n"
     "Feeds the tokens one at a time, then generates greedily, printing each step's top log-probabilities.\n"
-    "Shard 2 (the n-gram table) is found next to shard 1 by its split name.\n"
+    "The model's other shards are found next to shard 1 by their split names.\n"
     "\n"
     "  --tokens LIST   comma-separated prompt token ids, or @FILE to read them from FILE\n"
     "  -n N            tokens to generate after the prompt (default 16)\n"
@@ -147,15 +147,6 @@ int parse_count(const char* text, const char* option, int lo) {
     if (*end != '\0' || v < lo || v > INT32_MAX)
         throw Error(std::string(option) + " takes a whole number of at least " + std::to_string(lo) + ".");
     return static_cast<int>(v);
-}
-
-std::filesystem::path second_shard(const std::filesystem::path& first) {
-    std::string name = first.filename().string();
-    const size_t at = name.rfind("-00001-of-00002.gguf");
-    if (at == std::string::npos)
-        throw Error("Pass shard 1 of the model, the file whose name ends in -00001-of-00002.gguf.");
-    name.replace(at, 6, "-00002");
-    return first.parent_path() / name;
 }
 
 std::vector<model::DraftVariant> parse_variants(std::string_view list) {
@@ -426,8 +417,7 @@ int run(int argc, char** argv) {
             std::fputs(kUsage, stderr);
             return 2;
         }
-        options.shard1 = *shard1;
-        options.shard2 = second_shard(*shard1);
+        options.model = *shard1;
         if (quiet && (logits_file || json_file))
             throw Error("--quiet copies no logits, so it cannot be combined with --logits or --json.");
         options.logits = !quiet;
@@ -451,7 +441,7 @@ int run(int argc, char** argv) {
             check_kv ? std::vector{variants[0], variants[0]} : variants;
         if (drafting)
             options.reserve.push_back(
-                model::Draft::reservation(options.shard1, draft_path, draft_variants, options.context));
+                model::Draft::reservation(options.model, draft_path, draft_variants, options.context));
 
         const auto load_start = Clock::now();
         model::Model m(options);

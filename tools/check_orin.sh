@@ -7,13 +7,17 @@
 #   - the kernel harness against the decode gates (bench/kernel_gates.py).
 # It prints each result and exits non-zero if any check fails.
 #
-# usage, on the Orin:          TORCH_MODEL=/path/MODEL-00001-of-00002.gguf tools/check_orin.sh
+# usage, on the Orin:          TORCH_MODEL=/path/MODEL-00001-of-0000N.gguf tools/check_orin.sh
 #        from another machine: TORCH_ORIN=user@host TORCH_MODEL=/path/on/board/... tools/check_orin.sh
 #   TORCH_ORIN       copy this tree to the board first (rsync), into TORCH_ORIN_DIR under its home folder
 #                    (default torch-check), and run the checks there
 #   TORCH_GPU_LOCK   a lock file the board's GPU users share; when set, the GPU checks run under flock on it, and are
 #                    stopped after TORCH_GPU_MINUTES (default 19) so a hung run cannot keep the lock
 #   TORCH_CUDA_BIN   the CUDA toolkit's bin folder (default /usr/local/cuda/bin)
+#   TORCH_REF        the model parity reference for TORCH_MODEL (default tests/model/reference.json, the IQ3_S file's);
+#                    TORCH_TIE and TORCH_MAX_KL set its thresholds (default parity.py's, set from that file's spread)
+#   TORCH_KERNEL_GATES=report  print the kernel gates without failing on them (a model file whose kernels are not
+#                    tuned yet)
 set -eu
 : "${TORCH_MODEL:?set TORCH_MODEL to the path of shard 1 (on the board)}"
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,7 +30,8 @@ if [ -n "${TORCH_ORIN:-}" ]; then
     # -n: no stdin; with it the session could stay open after the checks ended.
     exec ssh -n "$TORCH_ORIN" "cd \"\$HOME/$dir\" && TORCH_MODEL='$TORCH_MODEL' TORCH_GIT_SHA='$sha' \
         TORCH_GPU_LOCK='${TORCH_GPU_LOCK:-}' TORCH_GPU_MINUTES='${TORCH_GPU_MINUTES:-19}' \
-        TORCH_CUDA_BIN='${TORCH_CUDA_BIN:-}' sh tools/check_orin.sh"
+        TORCH_CUDA_BIN='${TORCH_CUDA_BIN:-}' TORCH_REF='${TORCH_REF:-}' TORCH_TIE='${TORCH_TIE:-}' \
+        TORCH_MAX_KL='${TORCH_MAX_KL:-}' TORCH_KERNEL_GATES='${TORCH_KERNEL_GATES:-}' sh tools/check_orin.sh"
 fi
 
 cd "$root"
@@ -55,8 +60,13 @@ if ctest --test-dir build -L unit --output-on-failure > "$out/unit.log" 2>&1; th
     echo "FAIL unit tests"; tail -30 "$out/unit.log"; failed=1; fi
 if ctest --test-dir build -L parity --output-on-failure > "$out/parity.log" 2>&1; then echo "ok   kernel parity tests"
 else echo "FAIL kernel parity tests"; tail -30 "$out/parity.log"; failed=1; fi
-if python3 tests/model/parity.py compare --torch build/torch --model "$TORCH_MODEL" --ref tests/model/reference.json \
-    --work "$out/model" > "$out/model-parity.log" 2>&1; then echo "ok   model parity: $(tail -1 "$out/model-parity.log")"
+thresholds=""
+[ -n "${TORCH_TIE:-}" ] && thresholds="--tie $TORCH_TIE"
+[ -n "${TORCH_MAX_KL:-}" ] && thresholds="$thresholds --max-mean-kl $TORCH_MAX_KL"
+# shellcheck disable=SC2086 # thresholds is a list of options
+if python3 tests/model/parity.py compare --torch build/torch --model "$TORCH_MODEL" \
+    --ref "${TORCH_REF:-tests/model/reference.json}" $thresholds --work "$out/model" > "$out/model-parity.log" 2>&1
+then echo "ok   model parity: $(tail -1 "$out/model-parity.log")"
 else echo "FAIL model parity"; tail -12 "$out/model-parity.log"; failed=1; fi
 
 if run --logits "$out/graph.bin" && TORCH_EAGER=1 run --logits "$out/eager.bin" &&
@@ -86,6 +96,7 @@ PY
 else echo "FAIL a --fast-prefill run"; failed=1; fi
 
 if ./build/torch_bench_kernels "$TORCH_MODEL" --json "$out/kernels.json" > "$out/kernels.txt" 2>&1; then
-    python3 bench/kernel_gates.py "$out/kernels.json" || failed=1
+    if [ "${TORCH_KERNEL_GATES:-}" = report ]; then python3 bench/kernel_gates.py "$out/kernels.json" || true
+    else python3 bench/kernel_gates.py "$out/kernels.json" || failed=1; fi
 else echo "FAIL kernel harness"; tail -20 "$out/kernels.txt"; failed=1; fi
 exit $failed

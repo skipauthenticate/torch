@@ -5,6 +5,38 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-16
+
+### Added
+
+- The UD-IQ3_XXS model file (docs/model-files.md): four shards, read as one; its calibration folder; its parity
+  reference; `scripts/install.sh --quant UD-IQ3_XXS`.
+- `HF_ENDPOINT`, when set, replaces `https://huggingface.co` for the installer's shard downloads (a mirror).
+- The installer's smoke test prints the model file it ran, and `smoke.log` starts with it.
+
+### Changed
+
+- Model parity has new references and thresholds (docs/development.md, "Model parity"). Each file's short-prompt
+  reference puts the experts of 2 layers on the reference's CPU instead of 4, and the threshold is twice the largest of
+  three spreads of the reference against itself: 2 vs 4 CPU layers, prompt batches of 512 vs 8, flash attention on vs
+  off. IQ3_S: 0.0041 -> 0.00328 (Torch 0.00143); UD-IQ3_XXS: 0.00312 -> 0.00596 (Torch 0.00249). Long prompts get
+  their own thresholds: 0.00292 and 0.00542 (Torch 0.00193 and 0.00345). The rule was set after Torch's numbers
+  against the old references were known. The reason: the reference's CPU experts round their inputs per 256 values,
+  its GPU kernels and Torch per 32, and the old spread mostly measured that difference. `--fast-prefill` passes on the
+  IQ3_S file (0.00179) and fails the top-1 rule at one token on the UD-IQ3_XXS file.
+
+### Fixed
+
+- The installer remembers the model file it installed last (`PREFIX/share/torch/quant`) and uses it without
+  `--quant`. Before, a plain rerun after `--quant UD-IQ3_XXS` started an 83.6 GB IQ3_S download. The models step
+  also writes the server launcher, so the launcher names that file.
+- The installer checks the disk once for all missing shards, less what their `.part` files hold, before the first
+  download. Before, each shard was checked alone, so a disk with room for the first shards ran out partway.
+- A `.part` that is already complete (a run stopped while verifying it) is verified without a new request.
+- When a later shard of a split model fails to open, the shard files already opened are closed.
+- A model whose F32 matrix holds values BF16 cannot store now gets an error that says to use a supported model file
+  (docs/model-files.md).
+
 ## [0.3.1] - 2026-11-15
 
 ### Fixed

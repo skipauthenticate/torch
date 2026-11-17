@@ -35,15 +35,6 @@ namespace {
 
 constexpr int kSpecDrafts = 5;
 
-std::filesystem::path second_shard(const std::filesystem::path& first) {
-    std::string name = first.filename().string();
-    const size_t at = name.rfind("-00001-of-00002.gguf");
-    if (at == std::string::npos)
-        throw Error("Pass shard 1 of the model, the file whose name ends in -00001-of-00002.gguf.");
-    name.replace(at, 6, "-00002");
-    return first.parent_path() / name;
-}
-
 void copy_error(const std::string& message, char* out, size_t size) {
     if (out && size > 0) {
         const size_t n = std::min(message.size(), size - 1);
@@ -74,8 +65,7 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
     try {
         auto e = std::make_unique<torch_engine>();
         model::Options& opt = e->options;
-        opt.shard1 = o->model;
-        opt.shard2 = second_shard(opt.shard1);
+        opt.model = o->model;
         opt.context = o->context;
         opt.prefill_columns = o->prefill_columns;
         if (opt.prefill_columns < 1)
@@ -98,7 +88,7 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
                 for (long id; in >> id;)
                     vocab.push_back(static_cast<int32_t>(id));
             }
-            opt.reserve.push_back(model::Draft::reservation(opt.shard1, o->draft, variants, opt.context));
+            opt.reserve.push_back(model::Draft::reservation(opt.model, o->draft, variants, opt.context));
         }
         e->model = std::make_unique<model::Model>(opt);
         if (o->draft)

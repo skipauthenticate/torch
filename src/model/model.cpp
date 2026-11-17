@@ -334,8 +334,8 @@ struct HostBuffers {
 }  // namespace
 
 struct Model::Impl {
-    gguf::File shard1, shard2;
-    runtime::DirectFile file1, file2;
+    gguf::File file;             // every shard's tensors (gguf::File::open_model)
+    runtime::DirectFile direct;  // reads them where file's offsets say
     Config cfg;
     int context;
     runtime::ReadPool pool{kReadThreads};
@@ -560,12 +560,7 @@ struct Model::Impl {
     std::atomic<uint32_t> window_stamp{0};  // the gate's stamp for the running window (window_start + 1)
 
     explicit Impl(const Options& o)
-        : shard1(gguf::File::open(o.shard1)),
-          shard2(gguf::File::open(o.shard2)),
-          file1(o.shard1),
-          file2(o.shard2),
-          cfg(Config::read(shard1)),
-          context(o.context) {
+        : file(gguf::File::open_model(o.model)), direct(file), cfg(Config::read(file)), context(o.context) {
         want_logits = o.logits;
         if (context < 1 || context > kMaxContext)
             throw Error("The context must be between 1 and " + std::to_string(kMaxContext) + " tokens.");
@@ -579,11 +574,11 @@ struct Model::Impl {
         for (int il = 0; il < cfg.n_layer; ++il)
             kv_bytes += cfg.recurrent(il) ? 0 : 2 * (2 * N * KV + pooled * kernels::kIndexDim);
         std::vector<Reservation> reservations = {
-            {"weights other than routed experts", Weights::base_bytes(cfg, shard1)},
+            {"weights other than routed experts", Weights::base_bytes(cfg, file)},
             {"KV cache and indexer keys (" + std::to_string(context) + " tokens)", kv_bytes},
             {"DeltaNet state and its window copy, activations", dry.used() + HostBuffers::bytes(cfg) - kv_bytes},
             {"expert staging (" + std::to_string(runtime::kGateSlots) + " slots), map and tables",
-             runtime::ExpertStore::fixed_bytes(cfg, shard1)},
+             runtime::ExpertStore::fixed_bytes(cfg, file)},
             {"CUDA context and allocator slack", kCudaContext},
         };
         chunk_cap = o.prefill_columns;
@@ -596,7 +591,7 @@ struct Model::Impl {
                                     chunk_dry.used() + chunk_host_bytes()});
             if (chunk_cap >= kReadAheadColumns && o.prefill_staging > 0)
                 reservations.push_back({"prefill expert reads ahead (2 x " + std::to_string(o.prefill_staging) + ")",
-                                        runtime::PrefillReads::bytes(cfg, shard1, o.prefill_staging)});
+                                        runtime::PrefillReads::bytes(cfg, file, o.prefill_staging)});
             reservations.push_back({"session state after a prefill (sessions)", snapshot_bytes()});
         }
         for (const Reservation& r : o.reserve) {
@@ -665,12 +660,12 @@ struct Model::Impl {
             layer_grouped.assign(static_cast<size_t>(cfg.n_layer), 0);
         }
 
-        weights = std::make_unique<Weights>(cfg, shard1, file1, pool);
-        store = std::make_unique<runtime::ExpertStore>(cfg, weights->layers, file1, placement.resident);
-        ple = std::make_unique<runtime::PleRows>(cfg, shard2, file2,
+        weights = std::make_unique<Weights>(cfg, file, direct, pool);
+        store = std::make_unique<runtime::ExpertStore>(cfg, weights->layers, direct, placement.resident);
+        ple = std::make_unique<runtime::PleRows>(cfg, file, direct,
                                                  std::max(kMaxColumns, std::min(chunk_cap, kPleBatch)));
         if (chunk_cap >= kReadAheadColumns && o.prefill_staging > 0)
-            prefill_reads = std::make_unique<runtime::PrefillReads>(weights->layers, file1, o.prefill_staging);
+            prefill_reads = std::make_unique<runtime::PrefillReads>(weights->layers, direct, o.prefill_staging);
         if (!o.resident)
             top_up(placement, o.resident_total);
         if (o.lend_from > 0)
@@ -706,7 +701,7 @@ struct Model::Impl {
         const int want = total ? *total - placement.count() : INT_MAX;
         if (budget.available_after_load > keep && want > 0) {
             const Placement more =
-                extend_ranked(ranking, runtime::ExpertStore::layer_expert_bytes(cfg, shard1), placement,
+                extend_ranked(ranking, runtime::ExpertStore::layer_expert_bytes(cfg, file), placement,
                               budget.available_after_load - keep, static_cast<size_t>(want));
             store->add(more.resident);
             budget.added = more.count();
@@ -758,7 +753,7 @@ struct Model::Impl {
         uint64_t room = 0;
         for (const LendRegion& r : lend_regions)
             room += static_cast<uint64_t>(to - from) * r.per_position;
-        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
+        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, file);
         const RouteCounts order = ranking.counts.empty() ? uniform_ranking(cfg.n_layer, cfg.n_expert) : ranking;
         const Placement next = extend_ranked(order, bytes, have, room);
         std::vector<runtime::ExpertStore::Tenant> tenants;
@@ -827,7 +822,7 @@ struct Model::Impl {
             for (int e = 0; e < cfg.n_expert; ++e)
                 if (store->resident(l, e))
                     have.resident[static_cast<size_t>(l)].push_back(e);
-        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
+        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, file);
         RouteCounts order = ranking.counts.empty() ? uniform_ranking(cfg.n_layer, cfg.n_expert) : ranking;
         if (prompt_routes.size() == order.counts.size())
             for (size_t i = 0; i < order.counts.size(); ++i)  // calibration counts stay far below 2^32
@@ -863,7 +858,7 @@ struct Model::Impl {
     // Which experts are resident: exactly --resident per layer, the most-routed in Options::placement, or as many of
     // every layer's first experts as fit. Fills in the budget's placement lines and the ranking top_up() continues.
     Placement place(const Options& o) {
-        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, shard1);
+        const std::vector<uint64_t> bytes = runtime::ExpertStore::layer_expert_bytes(cfg, file);
         Placement p;
         if (o.resident_total && (o.resident || o.placement.empty() || *o.resident_total < 0))
             throw Error(
@@ -1035,7 +1030,7 @@ struct Model::Impl {
             kernels::Q8Columns xc{};
             for (int i = 0; i < nq; ++i) {
                 const Matrix& m = *q8[i].m;
-                if (wide && kernels::gemm_q8_supports(m.type)) {
+                if (wide && kernels::gemm_q8_supports(m.type) && kernels::gemm_q8_fits(m.cols)) {
                     if (xc.q == nullptr) {
                         xc = kernels::q8_columns_at(ops->q8_columns, m.cols / 32, columns);
                         kernels::q8_to_columns(xq, xc, stream);
@@ -1460,7 +1455,7 @@ struct Model::Impl {
         const Matrix &sg = L.shared_gate, &su = L.shared_up;
         const int64_t SH = cfg.n_ff_shared;
         if (prefilling && columns > kMaxColumns && kernels::gemm_q8_supports(sg.type) &&
-            kernels::gemm_q8_supports(su.type)) {  // a chunk: gate and up on the tensor cores, then SwiGLU at once
+            kernels::gemm_q8_supports(su.type) && kernels::gemm_q8_fits(E)) {  // a chunk: tensor cores, SwiGLU at once
             stage(kDense, [&] {
                 const kernels::Q8Columns xc = kernels::q8_columns_at(c.q8_columns, E / 32, columns);
                 kernels::q8_to_columns(c.q8, xc, stream);  // b.mixed's Q8

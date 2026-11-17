@@ -145,19 +145,84 @@ Torch), on the reference's top-5 tokens plus the remaining mass, is at most `--m
 gap on tokens both top-5 lists share is printed but not gated: it falls on improbable tokens and varies as much between
 two runs of the reference itself.
 
-`spread` measures the same numbers between two reference runs with different numerics. The reference was run with the
-experts of 4, 8, 32 and 40 of the 48 layers computed on the CPU (its other kernels round activations differently); the
-committed file is the 4-layer run, the closest to an all-GPU computation. Measured on 2026-11-04:
+`spread` measures the same numbers between two runs of the reference with different numerics. Each file's committed
+reference is that implementation with the experts of the first 2 of 48 layers on the CPU. That is the fewest that
+leave 8 GiB free on the Orin: with every expert on the GPU, the weights alone would leave about 6.3 GiB (projected
+from the server's memory breakdown at 2 layers). Three pairs
+measure the reference's own spread, each against the committed run:
+
+- the experts of 4 layers on the CPU instead of 2;
+- the prompt in batches of 8 tokens instead of 512, which uses other GPU kernels;
+- flash attention off instead of on.
+
+`--max-mean-kl` is twice the largest of the three, and `--tie` stays 0.38. Measured on the Jetson AGX Orin 64 GB on
+2026-11-16, IQ3_S file (`tests/model/reference.json`):
 
 | Pair | Greedy tokens agreeing | Mean KL | Largest top-5 gap |
 | --- | ---: | ---: | ---: |
-| Reference, 4 vs 8 CPU layers | 155 of 160 | 0.00204 | 1.13 |
-| Reference, 8 vs 32 CPU layers | 155 of 160 | 0.00196 | 1.43 |
-| Reference, 32 vs 40 CPU layers | 160 of 160 | 0.00029 | 0.38 |
-| Torch vs the committed reference | 160 of 160 | 0.00196 | 1.51 |
+| Reference, 2 vs 4 CPU layers | 155 of 160 | 0.00146 | 0.98 |
+| Reference, prompt batches of 512 vs 8 | 160 of 160 | 0.00087 | 0.97 |
+| Reference, flash attention on vs off | 122 of 160 | 0.00164 | 0.95 |
+| Torch vs the committed reference | 160 of 160 | 0.00143 | 1.27 |
+| Torch with `--fast-prefill` | 160 of 160 | 0.00179 | 1.05 |
 
-The thresholds are the defaults: `--tie 0.38` and `--max-mean-kl 0.0041`, twice the largest mean KL between two
-reference runs.
+The thresholds are the defaults: `--tie 0.38` and `--max-mean-kl 0.00328`.
+
+The UD-IQ3_XXS file has its own reference, `tests/model/reference-ud-iq3_xxs.json`: the same five prompts computed
+the same way on that file. Never compare one file's logits with the other file's reference.
+
+| Pair | Greedy tokens agreeing | Mean KL | Largest top-5 gap |
+| --- | ---: | ---: | ---: |
+| Reference, 2 vs 4 CPU layers | 110 of 160 | 0.00258 | 0.88 |
+| Reference, prompt batches of 512 vs 8 | 129 of 160 | 0.00094 | 0.76 |
+| Reference, flash attention on vs off | 160 of 160 | 0.00298 | 1.10 |
+| Torch vs the committed reference | 158 of 160 (2 near-ties) | 0.00249 | 1.16 |
+| Torch with `--fast-prefill` | 157 of 160 (2 near-ties, 1 miss) | 0.00430 | 1.73 |
+
+```sh
+python3 tests/model/parity.py compare --torch build/torch --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf \
+  --ref tests/model/reference-ud-iq3_xxs.json --max-mean-kl 0.00596
+TORCH_REF=tests/model/reference-ud-iq3_xxs.json TORCH_MAX_KL=0.00596 tools/check_orin.sh   # the same in the checks
+```
+
+Its threshold is 0.00596. The file stores the hyper-connection mixers as Q8_0, so both implementations round those
+mixers' inputs to 8 bits per 32 values, where the IQ3_S file's BF16 mixers take F32 inputs. Those 8-bit inputs amplify
+any change in rounding upstream, so the reference also spreads more against itself: flash attention on vs off moves
+it by 0.00298 on this file, against 0.00164 on the IQ3_S file.
+
+With `--fast-prefill` (every position its own prefill chunk, so the prompt's products run on the tensor cores), the
+UD-IQ3_XXS file fails the top-1 rule at one position. In "Q: What is 17 times 23?", at the 19th generated token, the
+reference's greedy token is a newline (log-probability -0.52; Torch -1.09) and Torch's is the end of the turn (Torch
+-0.62; the reference -1.43). The reference ranks them 0.91 apart, above the 0.38 near-tie rule. So UD-IQ3_XXS with
+`--fast-prefill` fails model parity, although its mean KL (0.00430) is under the threshold. The default path passes
+both conditions on both files, and so does `--fast-prefill` on the IQ3_S file.
+
+**Long prompts.** The three prompts of 4,046, 4,028 and 32,700 tokens use a reference with the experts of 4 layers on
+the CPU: with 2, its 33,000-token context would leave about 7.1 GiB. Torch reads each prompt in prefill chunks of 4,096
+and then generates 32 greedy tokens; `spread` compares the two runs up to the first token where they differ. The pairs
+are the same three, with two limits:
+
+- prompt batches of 8 for the first two prompts only: at the first prompt's 28.3 tokens/s, the third would take over
+  19 minutes, the board's limit for one job;
+- flash attention on vs off with both runs in batches of 128: off in batches of 512 needs a compute buffer 1.1 GiB
+  larger, which does not fit.
+
+| File | 4 vs 8 CPU layers | Batches of 512 vs 8 | Flash attention | Threshold | Torch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IQ3_S | 0.00086 | 0.00127 | 0.00146 | 0.00292 | 0.00193 over 73 positions, 1 near-tie |
+| UD-IQ3_XXS | 0.00098 | 0.00271 | 0.00199 | 0.00542 | 0.00345 over 80 positions, 3 near-ties |
+
+**Why these references and thresholds changed (2026-11-16).** Until then the committed references put the experts of
+4 layers on the CPU, and the spread came from more CPU layers (4 vs 8, 8 vs 32, 32 vs 40), with thresholds 0.0041
+(IQ3_S) and 0.00312 (UD-IQ3_XXS). An op-by-op comparison on 2026-11-15 showed that the reference's CPU experts compute
+a different function: they round their inputs to 8 bits per 256 values, where its GPU kernels and Torch round per 32.
+On layer 0, that rounding alone accounts for the whole difference between the two implementations on both files
+(the first prompt, 36 positions). Each of Torch's operations checked in layers 0 to 2 matched a numpy computation of
+its own definition to within 1e-7 (relative). So the old spread mostly measured
+the reference's CPU path, which the committed reference used in its first 4 layers. The new rule moves the reference as
+close to all-GPU as memory allows and adds two spreads that stay on the GPU. **The rule was set after Torch's numbers
+against the old references were known**: short prompts 0.00196 (IQ3_S) and 0.00272 (UD-IQ3_XXS), long prompts 0.00192
+and 0.00345, both above the thresholds the old rule gives long prompts (0.00172 and 0.00196).
 
 ### Residency independence
 

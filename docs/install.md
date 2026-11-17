@@ -8,10 +8,14 @@ writes.
 git clone https://github.com/skipauthenticate/torch.git && cd torch
 scripts/install.sh --check                    # the system checks only
 scripts/install.sh                            # prints the model licenses and asks you to accept them
+scripts/install.sh --quant UD-IQ3_XXS         # the other supported model file instead (model-files.md)
 ~/.local/bin/torch-server --context 16384     # then http://127.0.0.1:8080/v1 (docs/server.md)
 ```
 
 Read the script before you run it; do not pipe it from the network into a shell.
+
+Without `--quant`, the installer uses the model file it installed last (it writes the name to
+`PREFIX/share/torch/quant`), else IQ3_S. So after `--quant UD-IQ3_XXS`, a plain `scripts/install.sh` keeps that file.
 
 ## What it does
 
@@ -25,24 +29,28 @@ Read the script before you run it; do not pipe it from the network into a shell.
 4. **server**: a virtual environment in `PREFIX/share/torch/venv` with `server/requirements.txt` (`--no-deps
    --require-hashes`), the `torch_server` package in `PREFIX/share/torch/server`, the shipped calibration in
    `PREFIX/share/torch/calibration` (the placement and draft vocabulary the server uses by default,
-   [calibration/ed59f920/README.md](../calibration/ed59f920/README.md)) and the launcher `PREFIX/bin/torch-server`,
-   which passes the installed library, model and draft file.
-5. **models**: the two shards in `--models DIR` (default `PREFIX/share/torch/models`). A shard already there is
-   verified in place; a missing one is downloaded from
-   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-   at revision `ed59f920` with `curl --fail --location --continue-at -` into `NAME.part`, which a later run resumes.
+   [calibration/](../calibration/), one folder per model file) and the launcher `PREFIX/bin/torch-server`, which
+   passes the installed library, model and draft file. The models step writes the launcher again, so it always names
+   the model file installed last.
+5. **models**: the shards of the model `--quant` names (IQ3_S, the default: 2 shards; UD-IQ3_XXS: 4) in `--models
+   DIR` (default `PREFIX/share/torch/models`). A shard already there is verified in place; a missing one is
+   downloaded from the repository and revision [model-files.md](model-files.md) gives for it with `curl --fail
+   --location --continue-at -` into `NAME.part`, which a later run resumes. Before the first download, one check
+   makes sure the disk has room for every missing shard (less what their `.part` files hold). A `.part` that is
+   already complete (a run stopped while verifying it) is verified without asking the server again.
    Every file is checked against `scripts/models.sha256` (the source of the hashes in
    [model-files.md](model-files.md); CI checks they agree), once: `PREFIX/share/torch/verified/` records each
    checked file's hash, size and time, and the server never hashes the 83.6 GB again. `HF_TOKEN`, when set, goes to
    Hugging Face as a bearer token through a file descriptor; it is never printed or put on a command line.
+   `HF_ENDPOINT`, when set, replaces `https://huggingface.co` for the shards (a mirror).
 6. **draft**: builds the draft-layer file on this machine with `tools/make_draft.py` (numpy pinned with hashes in
    `scripts/draft-requirements.txt`, its own environment in `PREFIX/share/torch/draft-venv`): it reads the 31 `mtp.*`
    tensors of `Qwen/Qwen3.8-Flash-Next` by range requests (5.2 GB), checks that BF16 intermediate's sha256 before
    quantizing, writes `PREFIX/share/torch/draft/draft-iq4.gguf`, checks its sha256 and deletes the intermediate. The
    file is never uploaded. A different final sha256 (another machine's floating point) is a warning, not a failure:
    the draft layer changes speed, never output.
-7. **smoke**: 16 greedy tokens of a fixed prompt must equal the ids recorded in the script
-   (`PREFIX/share/torch/smoke.log`).
+7. **smoke**: 16 greedy tokens of a fixed prompt must equal the ids recorded in the script for that model. It prints
+   the model file it ran, and `PREFIX/share/torch/smoke.log` starts with it.
 
 `--steps build,server,models,draft,smoke` runs some of these; `--wrap CMD` runs the build and the smoke test through
 CMD (a shared machine's GPU lock).
@@ -50,7 +58,8 @@ CMD (a shared machine's GPU lock).
 ## Disk space
 
 About 92 GB at the peak: 83.6 GB of shards, 6.7 GB while the draft layer is built (5.2 GB of it freed after), and
-about 2 GB of build files. The script checks free space before each download and before the draft build.
+about 2 GB of build files. The script checks free space for all the missing shards before the first download, and
+before the draft build.
 
 ## Prerequisites
 

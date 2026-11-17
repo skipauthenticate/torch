@@ -1,4 +1,5 @@
-// GGUF reader: parses one file's header (metadata and tensor table) and reads tensor bytes with pread.
+// GGUF reader: parses one file's header (metadata and tensor table) and reads tensor bytes with pread. A model stored
+// as several shard files opens as one File (File::open_model).
 //
 // Every count, length, dimension and offset in a header is checked before use; a malformed file throws torch::Error
 // and is never read out of bounds. The whole file is mapped read-only so the header can be parsed in place, but the
@@ -40,7 +41,7 @@ struct TensorInfo {
     uint32_t type;                 // tensor type id; type_info(type) is never nullptr
     uint32_t n_dims;               // 1 to 4
     std::array<int64_t, 4> shape;  // shape[0] is the contiguous dimension; unused dimensions are 1
-    uint64_t offset;               // from the start of the data section
+    uint64_t offset;               // from the start of the data section (open_model: the position in its parts)
     uint64_t nbytes;
 
     int64_t elements() const noexcept;
@@ -58,6 +59,18 @@ struct Split {
     uint64_t total_tensors;  // split.tensors.count, over all shards
 };
 
+// One file of a model as File::open_model lays them out: the file's byte i is the model's byte base + i.
+struct Part {
+    std::filesystem::path path;
+    uint64_t base;  // a multiple of kPartAlignment
+    uint64_t size;  // bytes of the file
+};
+
+// Parts start on 4 KiB boundaries, so a direct read of any part stays page-aligned.
+inline constexpr uint64_t kPartAlignment = 4096;
+// The most shards File::open_model accepts.
+inline constexpr int kMaxShards = 64;
+
 class File {
 public:
     // Parses a header held in memory (tests, fuzzing). Tensors may extend past the end of the buffer; read() is not
@@ -67,12 +80,21 @@ public:
     // then the file may stop anywhere after the tensor table, e.g. the first 11 MiB of shard 1 fetched with an HTTP
     // range request. Throws Error.
     static File open(const std::filesystem::path& path, bool header_only = false);
+    // Opens a model: a single file, or shard 1 of a split one (NAME-00001-of-0000N.gguf, N <= kMaxShards), whose other
+    // shards must be next to it under the same name (the path as given; links are not resolved). The shards' split.*
+    // keys must agree, and together they must hold split.tensors.count tensors with distinct names. A split model
+    // reads like one file: the metadata of shard 1, every shard's tensors in shard order, data_offset() 0 and each
+    // tensor's offset its position in the shards laid end to end (parts(), the layout DirectFile reads); read() and
+    // mapped() refuse it, since its bytes are in other files. header_only applies to every shard. Throws Error.
+    static File open_model(const std::filesystem::path& path, bool header_only = false);
 
     uint32_t version() const noexcept { return version_; }          // always 3
     uint64_t alignment() const noexcept { return alignment_; }      // general.alignment, 32 when absent
     uint64_t data_offset() const noexcept { return data_offset_; }  // where the data section starts
     uint64_t file_size() const noexcept { return size_; }           // bytes of the file, or of parse()'s buffer
     std::optional<Split> split() const noexcept { return split_; }
+    // The files behind this one: itself at base 0, or a model's shards; none for parse().
+    std::span<const Part> parts() const noexcept { return parts_; }
 
     const Value* find(std::string_view key) const noexcept;
     // Typed access; nullopt when the key is missing or its type does not match. An integral T accepts any integer
@@ -123,6 +145,7 @@ private:
     std::map<std::string, size_t, std::less<>> keys_;  // metadata_ index by key
     std::vector<TensorInfo> tensors_;
     std::map<std::string, size_t, std::less<>> names_;  // tensors_ index by name
+    std::vector<Part> parts_;  // open(): this file; open_model(): every shard, this one's mapping being shard 1's
 };
 
 }  // namespace torch::gguf

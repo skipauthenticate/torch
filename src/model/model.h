@@ -35,8 +35,7 @@ inline constexpr int kMaxColumns = 8;
 inline constexpr int kMaxPrefillColumns = 4096;
 
 struct Options {
-    std::filesystem::path shard1;  // the weights
-    std::filesystem::path shard2;  // the PLE n-gram table
+    std::filesystem::path model;  // shard 1 of the model; the others are found next to it (gguf::File::open_model)
     // Tokens the KV cache holds, up to 262,144, allocated at start; above indexer_top_k attention is sparse.
     int context = 2048;
     std::optional<int> resident;  // experts 0 to resident - 1 of every layer resident, exactly, with no top-up (tests)

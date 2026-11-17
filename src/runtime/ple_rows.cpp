@@ -15,18 +15,18 @@ constexpr int kSpareBuffers = 4;  // for reads that lost to their hedge and are 
 
 }  // namespace
 
-PleRows::PleRows(const model::Config& config, const gguf::File& shard2, const DirectFile& file, int columns)
+PleRows::PleRows(const model::Config& config, const gguf::File& model, const DirectFile& file, int columns)
     : config_(config), columns_(columns) {
-    const gguf::TensorInfo* t = shard2.tensor("per_layer_token_embd.weight");
+    const gguf::TensorInfo* t = model.tensor("per_layer_token_embd.weight");
     if (t == nullptr || t->n_dims != 2 || t->shape[0] != config.ple_dim ||
         t->type != static_cast<uint32_t>(Type::IQ4_NL))
-        throw Error("Shard 2 has no IQ4_NL per_layer_token_embd.weight of width " + std::to_string(config.ple_dim) +
-                    "; pass the n-gram table shard of the supported model.");
+        throw Error("The model has no IQ4_NL per_layer_token_embd.weight of width " + std::to_string(config.ple_dim) +
+                    "; use a supported model file with its n-gram table shard.");
     for (int h = 0; h < config.ple_heads(); ++h) {
         if (config.ple_head_offsets[h] + config.ple_head_vocab[h] > static_cast<uint64_t>(t->shape[1]))
             throw Error("The PLE head ranges in the metadata exceed the n-gram table; use matching shards.");
     }
-    table_offset_ = shard2.data_offset() + t->offset;
+    table_offset_ = model.data_offset() + t->offset;
     row_bytes_ = t->row_bytes();
     const int count = columns * config.ple_heads() + kSpareBuffers;
     buffers_ = static_cast<uint8_t*>(std::aligned_alloc(kPage, static_cast<size_t>(count) * 2 * kPage));
@@ -81,7 +81,7 @@ void PleRows::read_window(std::span<const int32_t> history, size_t first, int co
     for (size_t r = 0; r < n; ++r) {
         if (data[r] == nullptr) {
             reads_->release();
-            throw Error("A read of the PLE rows from shard 2 failed; check the SSD and the file.");
+            throw Error("A read of the PLE rows from the n-gram table failed; check the SSD and the file.");
         }
         dequant_row(Type::IQ4_NL, data[r], config_.ple_dim, out + r * static_cast<size_t>(config_.ple_dim));
     }
@@ -117,7 +117,7 @@ void PleRows::read_tokens(std::span<const int32_t> history, size_t first, int co
         for (size_t i = 0; i < m; ++i) {
             if (data[i] == nullptr) {
                 reads_->release();
-                throw Error("A read of the PLE rows from shard 2 failed; check the SSD and the file.");
+                throw Error("A read of the PLE rows from the n-gram table failed; check the SSD and the file.");
             }
             dequant_row(Type::IQ4_NL, data[i], config_.ple_dim, values.data() + (b + i) * D);
         }

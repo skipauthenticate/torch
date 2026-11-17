@@ -1,7 +1,9 @@
 # Model files
 
-The engine reads three files. Sizes are exact byte counts; "verified" means the value was read from the Hugging Face
-repository's LFS metadata or from the file's GGUF header on 2026-11-03.
+The engine reads a quantized model, stored as several shard files, and the draft layer. Two quantized models are
+supported: the IQ3_S file (the default) and the UD-IQ3_XXS file. Sizes are exact byte counts; "verified" means the
+value was read from the Hugging Face repository's LFS metadata or from the file's GGUF header (the IQ3_S file on
+2026-11-03, the UD-IQ3_XXS file on 2026-11-14).
 
 ## The quantized model
 
@@ -30,6 +32,48 @@ What the headers say (verified):
 
 `torch inspect --header-only` reads a file that stops before its tensor data, so the first 11 MiB of shard 1
 (for example, fetched with an HTTP range request) shows the full tensor table without downloading the file.
+
+## The UD-IQ3_XXS model
+
+Repository [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), revision
+`f5d175de` (`f5d175de2cf7f720d45d6064019a81fcf056e986`), folder `UD-IQ3_XXS/`. Repository license: "other" (card
+metadata), as the base model's.
+
+| File | Bytes | sha256 (verified) |
+| --- | ---: | --- |
+| `Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf` | 10,946,618 | `9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915` |
+| `Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf` | 49,946,027,488 | `aacaff3bdb9032c2c3be428167930809735f65d3cfb204eba07d85e421e7ddf4` |
+| `Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf` | 4,869,325,888 | `ef8f14e790ab471b363f146d5e8664eefbaf03e5776f317a1fb96a2bc7707b07` |
+| `Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf` | 28,800,138,432 | `5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36` |
+
+Together 83.6 GB (77.9 GiB) on disk. Shard 4 is the n-gram table, the IQ3_S file's shard 2 with two header bytes
+changed: `split.no` 1 -> 3 (byte 44) and `split.count` 2 -> 4 (byte 69). Hashing the IQ3_S shard 2 with those two
+bytes set gives shard 4's sha256 (checked on the Orin on 2026-11-15).
+
+What the headers say (verified):
+
+| | Shard 1 | Shard 2 | Shard 3 | Shard 4 |
+| --- | --- | --- | --- | --- |
+| `split.no` / `split.count` / `split.tensors.count` | 0 / 4 / 1,224 | 1 / 4 / 1,224 | 2 / 4 / 1,224 | 3 / 4 / 1,224 |
+| Tensors | 0: metadata only (67 keys, the whole file) | 1,210: every tensor but the table and part of the experts of layers 43-47 | 13: block 43's routed up, blocks 44-47's routed experts | 1 (`per_layer_token_embd.weight`) |
+| Formats (GiB) | | IQ4_NL 18.02, IQ2_S 12.26, IQ3_XXS 11.36, Q6_K 3.10, Q8_0 0.78, Q2_0 0.66, F32 0.29, BF16 0.04; 46.52 | IQ4_NL 1.76, IQ3_XXS 1.20, IQ4_XS 0.83, IQ2_S 0.75; 4.53 | IQ4_NL 26.82 |
+
+The tensor names and shapes are the IQ3_S file's, and so are 58 of the 67 metadata keys: the architecture, every
+model hyperparameter, the tokenizer, the chat template and the sampling defaults. The other nine name the file's
+origin, its imatrix and its split. The routed experts take the same bytes, 2,046,400 per expert on average and 46.84
+GiB in all, in a different mix (gate and up IQ2_S in 26 layers, IQ3_XXS in 21, IQ4_XS in 1; down IQ4_NL in 45,
+Q2_0 in 3). The other tensors differ in format:
+
+| Tensors | IQ3_S file | UD-IQ3_XXS file |
+| --- | --- | --- |
+| Hyper-connection mixers (down, up), head mixer, PLE key and value | BF16 | Q8_0 |
+| Routers, the shared expert's gate, mixer inject rows, DeltaNet alpha and beta | BF16 | F32 holding BF16 values |
+| Attention, DeltaNet, shared experts | Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL | Q6_K, Q8_0 |
+| Token embeddings | IQ4_XS | Q6_K |
+
+The engine narrows the 264 F32 matrices to BF16 at load and checks that every value is a BF16 value (all 75,816,960
+are), so it computes what the file holds. A Q8_0 matrix takes its input quantized to 8 bits per 32 values, as every
+quantized matrix does ([architecture.md](architecture.md), numerics).
 
 ## The tokenizer
 

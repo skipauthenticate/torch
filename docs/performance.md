@@ -373,7 +373,8 @@ Per layer, us, the same runs:
   those of `--context 4096` at all 4,096 positions, and window 8 is bitwise window 1.
 - Parity with the reference runtime (F16 KV, teacher forcing, 32 greedy steps each): 4,046 tokens 32/32 top-1 and mean
   KL 0.00255, 4,028 tokens 32/32 and 0.00115, 32,700 tokens 31/32 plus one near-tie (Torch's choice 0.10 nats
-  below the reference's own in the reference's ranking) and 0.00210 (gate 0.0041).
+  below the reference's own in the reference's ranking) and 0.00210 (the gate then, 0.0041). On 2026-11-16 the long
+  prompts got their own threshold, 0.00292; Torch measured 0.00193 against it (development.md, "Model parity").
 - The draft layer attends to the last 16,384 positions from a K/V ring (`src/model/draft.h`): its budget line is
   1.49 GiB at `--context 262144` (2.00 GiB with a full cache). On the three race review prompts (4,096 tokens, 256
   greedy tokens, `--context 262144`, placement `calib-g-spec.txt`) the ids with speculation equal the one-token run's:
@@ -668,7 +669,9 @@ prompt 16.7 -> 12.7 s. Through the server in the benchmark's order (2026-11-14, 
 Its error against the exact prefill on the nine benchmark prompts (chunks of 1,024, 16 tokens one at a time): logits at
 the 36 chunk ends within 2.73 (mean |difference| 0.118, KL median 1.6e-3, max 0.23); generated steps while both runs saw
 the same tokens within 4.70 (mean 0.096, KL median 1.3e-4, max 0.023). Model parity against the reference: mean KL
-0.00158 (the default 0.00211; gate 0.0041). The answers that change diverge at a near-tie in three of the four checked
+0.00158 (the default 0.00211; gate 0.0041). Against the references of 2026-11-16: 0.00179 (the default 0.00143;
+gate 0.00328) on the IQ3_S file; on the UD-IQ3_XXS file 0.00430 (gate 0.00596) with one top-1 miss that is not a
+near-tie, so it fails there. The answers that change diverge at a near-tie in three of the four checked
 (top-2 logit margin 0.002 to 0.09) and at a 0.50 margin in one. Deterministic, and the same at chunks of 4,096, 2,048
 and 1,024 (`tools/check_orin.sh` checks 1,100, 550 and 275); `gemm_test` checks each product against the exact sum
 within 2^-8 x sum |w x|. Decode is unchanged.

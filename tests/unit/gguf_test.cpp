@@ -1,6 +1,8 @@
-// Checks the GGUF reader on tests/fixtures/tiny.gguf (written by gguf_writer.py) and on corrupt headers built here.
+// Checks the GGUF reader on tests/fixtures/tiny.gguf (written by gguf_writer.py), on corrupt headers built here, and
+// on a model split into three shard files (gguf_writer.h).
 #include "gguf/gguf.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -12,10 +14,12 @@
 #include "check.h"
 #include "core/error.h"
 #include "formats/types.h"
+#include "gguf_writer.h"
 
 using namespace torch;
 using gguf::File;
 using gguf::ValueType;
+using test::Writer;
 
 namespace {
 
@@ -53,34 +57,6 @@ template <class T>
 void patch(std::vector<uint8_t>& bytes, size_t at, T value) {
     std::memcpy(bytes.data() + at, &value, sizeof value);
 }
-
-// Builds headers field by field, for the malformed files gguf_writer.py cannot write.
-struct Writer {
-    std::vector<uint8_t> bytes;
-
-    template <class T>
-    Writer& put(T value) {
-        const auto* p = reinterpret_cast<const uint8_t*>(&value);
-        bytes.insert(bytes.end(), p, p + sizeof value);
-        return *this;
-    }
-    Writer& string(std::string_view s) {
-        put<uint64_t>(s.size());
-        bytes.insert(bytes.end(), s.begin(), s.end());
-        return *this;
-    }
-    Writer& header(uint64_t n_tensors, uint64_t n_keys) {
-        bytes.insert(bytes.end(), {'G', 'G', 'U', 'F'});
-        return put<uint32_t>(3).put(n_tensors).put(n_keys);
-    }
-    Writer& key_u32(std::string_view key, uint32_t value) { return string(key).put(ValueType::U32).put(value); }
-    Writer& tensor(std::string_view name, std::initializer_list<int64_t> shape, uint32_t type, uint64_t offset) {
-        string(name).put(static_cast<uint32_t>(shape.size()));
-        for (int64_t d : shape)
-            put(d);
-        return put(type).put(offset);
-    }
-};
 
 std::vector<uint8_t> one_tensor(std::initializer_list<int64_t> shape, uint32_t type, uint64_t offset = 0) {
     return Writer().header(1, 0).tensor("t", shape, type, offset).bytes;
@@ -250,6 +226,113 @@ void check_corruptions(const std::vector<uint8_t>& tiny) {
                       .bytes));  // index out of range
 }
 
+bool opens_model(const std::filesystem::path& path) {
+    try {
+        File::open_model(path);
+        return true;
+    } catch (const Error&) {
+        return false;
+    }
+}
+
+// A split model opens as one tensor table whose offsets address the shards laid end to end, in both layouts (weights
+// in shard 1 too, or shard 1 metadata only); inconsistent or incomplete sets do not open.
+void check_split_layout(const std::filesystem::path& dir, const test::SplitLayout& layout) {
+    const std::filesystem::path first = test::split_model(dir, "m", layout);
+    const File m = File::open_model(first);
+    const size_t n = static_cast<size_t>(layout.shards());
+    CHECK(m.get<std::string>("general.architecture") == "qwen4exp");
+    CHECK(m.split() && m.split()->count == n && m.split()->total_tensors == 3);
+    CHECK(m.data_offset() == 0 && m.tensors().size() == 3);
+    CHECK(m.parts().size() == n && m.parts()[0].path == first && m.parts()[0].base == 0);
+    for (size_t i = 1; i < m.parts().size(); ++i) {
+        const gguf::Part &before = m.parts()[i - 1], &p = m.parts()[i];
+        const uint64_t end = before.base + before.size;
+        CHECK(p.base % gguf::kPartAlignment == 0 && p.base >= end && p.base - end < gguf::kPartAlignment);
+    }
+    CHECK(m.file_size() == m.parts().back().base + m.parts().back().size);
+    for (const test::SplitTensor& want : test::split_tensors(layout)) {
+        const gguf::TensorInfo* t = m.tensor(want.name);
+        CHECK(t != nullptr);
+        if (t == nullptr)
+            continue;
+        // The offset is the shard's base plus the tensor's place in the shard opened alone.
+        const gguf::Part& part = m.parts()[static_cast<size_t>(want.shard - 1)];
+        const File shard = File::open(part.path);
+        const gguf::TensorInfo* alone = shard.tensor(want.name);
+        CHECK(alone && t->offset == part.base + shard.data_offset() + alone->offset);
+        CHECK(t->nbytes == want.values.size() * sizeof(float) && t->offset + t->nbytes <= part.base + part.size);
+        std::vector<float> got(want.values.size());
+        if (alone)
+            shard.read(*alone, 0, alone->nbytes, got.data());
+        CHECK(got == want.values);
+        // The merged file has no bytes of its own to read or map.
+        bool read_threw = false, map_threw = false;
+        try {
+            m.read(*t, 0, 4, got.data());
+        } catch (const Error&) {
+            read_threw = true;
+        }
+        try {
+            (void)m.mapped(*t);
+        } catch (const Error&) {
+            map_threw = true;
+        }
+        CHECK(read_threw && map_threw);
+    }
+    CHECK(File::open_model(first, /*header_only=*/true).tensors().size() == 3);
+}
+
+void check_split_model(const std::filesystem::path& tiny) {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "torch-gguf-test-split";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    check_split_layout(dir, {});                           // shard 1 metadata only
+    check_split_layout(dir, {.weights_in_shard1 = true});  // weights in shard 1, the rest in shard 2
+    CHECK(!opens_model(dir / "m-00002-of-00002.gguf"));    // shard 2 passed instead of shard 1
+    const std::filesystem::path first = dir / "m-00001-of-00003.gguf";
+    std::filesystem::copy_file(first, dir / "renamed.gguf");
+    CHECK(!opens_model(dir / "renamed.gguf"));  // shard 1 renamed: the others cannot be found
+    CHECK(!opens_model(tiny));                  // the same: tiny.gguf says it is shard 1 of 2
+    const std::filesystem::path missing = test::split_model(dir, "missing");
+    std::filesystem::remove(dir / "missing-00003-of-00003.gguf");
+    CHECK(!opens_model(missing));
+    CHECK(!opens_model(test::split_model(dir, "restamped", {.last_index = 1})));  // shard 3 says it is shard 2
+    CHECK(!opens_model(test::split_model(dir, "total", {.total = 4})));           // 3 tensors, split.tensors.count 4
+    CHECK(!opens_model(test::split_model(dir, "many", {.count1 = gguf::kMaxShards + 1})));  // too many shards
+    // Header-only parsing does not check offsets against the file, so the merged offsets must not wrap: a tensor
+    // offset just under 2^64 (aligned), in shard 1 (its data offset added) and in the last shard (base added too).
+    const auto header_opens = [](const std::filesystem::path& p) {
+        try {
+            (void)File::open_model(p, /*header_only=*/true);
+            return true;
+        } catch (const Error&) {
+            return false;
+        }
+    };
+    constexpr uint64_t kHuge = UINT64_MAX / 32 * 32;
+    CHECK(header_opens(test::split_model(dir, "whole")));
+    CHECK(!header_opens(test::split_model(dir, "wrap1", {.weights_in_shard1 = true, .a_offset = kHuge})));
+    CHECK(!header_opens(test::split_model(dir, "wrap3", {.c_offset = kHuge})));
+    // Shard 3's tensor renamed from c to a, a name shard 2 already has.
+    const std::filesystem::path twice = test::split_model(dir, "twice");
+    std::vector<uint8_t> three = read_file(dir / "twice-00003-of-00003.gguf");
+    const uint8_t name_c[] = {1, 0, 0, 0, 0, 0, 0, 0, 'c'};
+    const auto at = std::search(three.begin(), three.end(), std::begin(name_c), std::end(name_c));
+    CHECK(at != three.end());
+    if (at != three.end())
+        *(at + 8) = 'a';
+    std::ofstream(dir / "twice-00003-of-00003.gguf", std::ios::binary)
+        .write(reinterpret_cast<const char*>(three.data()), std::ssize(three));
+    CHECK(!opens_model(twice));
+    // A file without split keys opens as itself, one part at base 0.
+    const std::filesystem::path plain = dir / "plain.gguf";
+    Writer().header(0, 1).key_u32("qwen4exp.block_count", 48).save(plain);
+    const File p = File::open_model(plain);
+    CHECK(p.parts().size() == 1 && p.parts()[0].base == 0 && p.get<uint32_t>("qwen4exp.block_count") == 48u);
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -266,5 +349,6 @@ int main(int argc, char** argv) {
     check_header_only(tiny);
     check_truncation(tiny);
     check_corruptions(tiny);
+    check_split_model(argv[1]);
     return test::test_exit_code();
 }

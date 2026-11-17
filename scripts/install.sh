@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
 # Installs the engine, the server and the model files on a Jetson AGX Orin (docs/install.md): checks the system,
-# builds into a prefix, makes the server's virtual environment, downloads or verifies the two model shards, builds
+# builds into a prefix, makes the server's virtual environment, downloads or verifies the model's shards, builds
 # the draft-layer file on this machine and runs a smoke test. Never uses sudo. Safe to run again: each step keeps what
 # is already done (a download resumes). Prints every path it writes.
 set -euo pipefail
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-GGUF_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
-GGUF_REVISION=ed59f92082b1e93c0e96d60a8b11aab089b52f09
 BASE_REPO=Qwen/Qwen3.8-Flash-Next
 BASE_REVISION=de4b8e4d43b917e7706784d8bb445c9af86a3540
-SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
-SHARD2=Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
-# The smoke test: a one-question chat prompt (thinking off) and its 16 greedy tokens, recorded on the Orin.
+# The smoke test: a one-question chat prompt (thinking off) and its 16 greedy tokens per model, recorded on the Orin.
 SMOKE_PROMPT=248045,846,198,3710,369,279,6511,314,9338,30,21134,303,799,11316,13,248046,198,248045,74455,198,248068,271,248069,271
-SMOKE_IDS=760,6511,314,9338,369,11751,13,248046,198,248044,248045,846,198,248046,198,248045
 
 usage() {
     cat <<'EOF'
 usage: scripts/install.sh [options]
 
+  --quant NAME             the quantized model: IQ3_S or UD-IQ3_XXS (docs/model-files.md); default: the one
+                           installed last (PREFIX/share/torch/quant), else IQ3_S
   --accept-model-licenses  accept the two model repositories' licenses (printed first) without a prompt
   --prefix DIR             where to install (default ~/.local): bin/, lib/, include/ and share/torch/
-  --models DIR             where the two model shards are or go (default PREFIX/share/torch/models); shards
+  --models DIR             where the model's shards are or go (default PREFIX/share/torch/models); shards
                            already there are verified in place, missing ones downloaded, partial ones resumed
   --steps LIST             some of build,server,models,draft,smoke (default all, in that order)
   --jobs N                 parallel compile jobs (default 4)
@@ -30,13 +27,16 @@ usage: scripts/install.sh [options]
   --check                  only check the system; change nothing
   --no-gpu-check           skip the Jetson, JetPack, CUDA and memory checks (CI)
 
-HF_TOKEN, when set, is sent to Hugging Face as a bearer token (never printed).
+HF_TOKEN, when set, is sent to Hugging Face as a bearer token (never printed). HF_ENDPOINT, when set, replaces
+https://huggingface.co for the model's shards (a mirror).
 EOF
 }
 
 PREFIX="$HOME/.local" MODELS="" ACCEPT=0 CHECK_ONLY=0 GPU_CHECK=1 JOBS=4 STEPS="build,server,models,draft,smoke" WRAP=""
+QUANT=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --quant) QUANT=$2; shift ;;
         --accept-model-licenses) ACCEPT=1 ;;
         --prefix) PREFIX=$2; shift ;;
         --models) MODELS=$2; shift ;;
@@ -50,6 +50,28 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# Without --quant, the model file installed last (recorded in SHARE/quant once the licenses are accepted).
+SHARE="$PREFIX/share/torch"
+REMEMBERED=$(cat "$SHARE/quant" 2>/dev/null || true)
+QUANT_FROM=--quant
+if [ -z "$QUANT" ]; then
+    QUANT=${REMEMBERED:-IQ3_S}
+    QUANT_FROM=$([ -n "$REMEMBERED" ] && echo "$SHARE/quant" || echo "the default")
+fi
+case "$QUANT" in
+    IQ3_S)
+        GGUF_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF GGUF_LICENSE=Apache-2.0
+        GGUF_REVISION=ed59f92082b1e93c0e96d60a8b11aab089b52f09
+        SHARDS=(Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000{1,2}-of-00002.gguf)
+        SMOKE_IDS=760,6511,314,9338,369,11751,13,248046,198,248044,248045,846,198,248046,198,248045 ;;
+    UD-IQ3_XXS)
+        GGUF_REPO=unsloth/Qwen3.8-Flash-Next-GGUF GGUF_LICENSE='"other" on its model card'
+        GGUF_REVISION=f5d175de2cf7f720d45d6064019a81fcf056e986
+        SHARDS=(Qwen3.8-Flash-Next-UD-IQ3_XXS-0000{1,2,3,4}-of-00004.gguf)
+        SMOKE_IDS=760,6511,314,9338,369,11751,13,248046,198,248044,248045,846,198,248046,198,248045 ;;
+    *) echo "install.sh: --quant takes IQ3_S or UD-IQ3_XXS, not $QUANT (from $QUANT_FROM)." >&2; exit 2 ;;
+esac
+SHARD1=${SHARDS[0]}
 mkdir_p() { [ -d "$1" ] || { mkdir -p "$1"; echo "wrote $1/"; }; }
 die() { echo "install.sh: $*" >&2; exit 1; }
 step() { case ",$STEPS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
@@ -126,7 +148,7 @@ cat <<EOF
 
 This project's code is MIT. The model files are not part of it: the installer downloads them, and builds the draft
 layer from another model, under the repositories' own licenses:
-  $GGUF_REPO (revision ${GGUF_REVISION:0:8}): Apache-2.0
+  $GGUF_REPO (revision ${GGUF_REVISION:0:8}, $QUANT): $GGUF_LICENSE
     https://huggingface.co/$GGUF_REPO
   $BASE_REPO (revision ${BASE_REVISION:0:8}): "other" on its model card (qwen-community-1.0); the
     quantized model is derived from it, and the draft layer is built from it on this machine
@@ -142,9 +164,25 @@ if [ "$ACCEPT" != 1 ]; then
     fi
 fi
 
-SHARE="$PREFIX/share/torch"
 MODELS="${MODELS:-$SHARE/models}"
 mkdir_p "$SHARE"
+echo "model file: $QUANT (from $QUANT_FROM)"
+if [ "$REMEMBERED" != "$QUANT" ]; then  # a later run without --quant keeps this model file
+    echo "$QUANT" >"$SHARE/quant"
+    echo "wrote $SHARE/quant"
+fi
+# The server launcher for this model file: written by the server step, and again whenever the models step runs.
+write_launcher() {
+    mkdir_p "$PREFIX/bin"
+    cat >"$PREFIX/bin/torch-server" <<EOF
+#!/bin/sh
+# torch_server with the files scripts/install.sh installed (docs/server.md); more options after these are passed on.
+PYTHONPATH="$SHARE/server" exec "$SHARE/venv/bin/python" -m torch_server --library "$PREFIX/lib/libtorch_engine.so" \\
+  --torch-bin "$PREFIX/bin/torch" --model "$MODELS/$SHARD1" --draft "$SHARE/draft/draft-iq4.gguf" "\$@"
+EOF
+    chmod 755 "$PREFIX/bin/torch-server"
+    echo "wrote $PREFIX/bin/torch-server ($SHARD1)"
+}
 
 # ---- build ----------------------------------------------------------------------------------------------------------
 if step build; then
@@ -174,14 +212,7 @@ if step server; then
     rm -rf "$SHARE/calibration"  # the placement and draft vocabulary the server uses by default
     cp -R "$SRC/calibration" "$SHARE/calibration"
     echo "wrote $SHARE/calibration/"
-    cat >"$PREFIX/bin/torch-server" <<EOF
-#!/bin/sh
-# torch_server with the files scripts/install.sh installed (docs/server.md); more options after these are passed on.
-PYTHONPATH="$SHARE/server" exec "$SHARE/venv/bin/python" -m torch_server --library "$PREFIX/lib/libtorch_engine.so" \\
-  --torch-bin "$PREFIX/bin/torch" --model "$MODELS/$SHARD1" --draft "$SHARE/draft/draft-iq4.gguf" "\$@"
-EOF
-    chmod 755 "$PREFIX/bin/torch-server"
-    echo "wrote $PREFIX/bin/torch-server"
+    write_launcher
 fi
 
 # ---- models ---------------------------------------------------------------------------------------------------------
@@ -205,26 +236,47 @@ curl_auth() {  # the token reaches curl through a file descriptor, never the com
         curl "$@"
     fi
 }
+shard_url() { echo "${HF_ENDPOINT:-https://huggingface.co}/$GGUF_REPO/resolve/$GGUF_REVISION/$QUANT/$1"; }
+part_bytes() { if [ -f "$1" ]; then stat -c %s "$1"; else echo 0; fi; }
 if step models; then
     mkdir_p "$MODELS"
-    for f in "$SHARD1" "$SHARD2"; do
+    # Every missing shard's size first, so one disk check covers them all: the bytes their .part files still lack.
+    sizes=() missing=0
+    for i in "${!SHARDS[@]}"; do
+        f=${SHARDS[$i]}
+        path="$MODELS/$f"
+        [ -e "$path" ] && continue
+        url=$(shard_url "$f")
+        size=$(curl_auth --silent --fail --location --head "$url" | tr -d '\r' | awk 'tolower($1) == "content-length:" { n = $2 } END { print n }')
+        [ -n "$size" ] || die "could not reach $url (set HF_TOKEN if the repository needs one)."
+        have=$(part_bytes "$path.part")
+        [ "$have" -le "$size" ] || die "$path.part is larger than the file ($size bytes): delete it and run again."
+        sizes[i]=$size
+        missing=$((missing + size - have))
+    done
+    [ "$missing" = 0 ] || need_space "$MODELS" "$missing" "downloading the missing shards of $QUANT"
+    for i in "${!SHARDS[@]}"; do
+        f=${SHARDS[$i]}
         path="$MODELS/$f"
         if [ -e "$path" ]; then
             verified "$path" "$f" || die "$path is not the expected file: move it away and run again to download it."
             continue
         fi
-        url="https://huggingface.co/$GGUF_REPO/resolve/$GGUF_REVISION/IQ3_S/$f"
-        size=$(curl_auth --silent --fail --location --head "$url" | tr -d '\r' | awk 'tolower($1) == "content-length:" { n = $2 } END { print n }')
-        [ -n "$size" ] || die "could not reach $url (set HF_TOKEN if the repository needs one)."
-        have=$([ -f "$path.part" ] && stat -c %s "$path.part" || echo 0)
-        need_space "$MODELS" $((size - have)) "$f"
-        echo "downloading $url to $path.part ($((size / 1000000000)) GB, resuming from $((have / 1000000)) MB)"
-        curl_auth --fail --location --continue-at - --retry 5 --retry-delay 10 --progress-bar --output "$path.part" "$url"
-        echo "wrote $path.part"
+        url=$(shard_url "$f")
+        size=${sizes[$i]}
+        have=$(part_bytes "$path.part")
+        if [ "$have" = "$size" ]; then  # complete (stopped while it was verified): nothing left to download
+            echo "$path.part is complete ($((size / 1000000)) MB)"
+        else
+            echo "downloading $url to $path.part ($((size / 1000000000)) GB, resuming from $((have / 1000000)) MB)"
+            curl_auth --fail --location --continue-at - --retry 5 --retry-delay 10 --progress-bar --output "$path.part" "$url"
+            echo "wrote $path.part"
+        fi
         verified "$path.part" "$f" || die "$path.part does not have the expected sha256: delete it and run again."
         mv "$path.part" "$path"  # same size and time: the stamp still matches
         echo "wrote $path"
     done
+    write_launcher  # the server uses this model file from now on
 fi
 
 # ---- draft layer ----------------------------------------------------------------------------------------------------
@@ -260,13 +312,14 @@ fi
 
 # ---- smoke test -----------------------------------------------------------------------------------------------------
 if step smoke; then
-    echo "smoke test: 16 greedy tokens"
-    wrapped "$PREFIX/bin/torch" run "$MODELS/$SHARD1" --tokens "$SMOKE_PROMPT" -n 16 --quiet >"$SHARE/smoke.log" 2>&1 ||
+    echo "smoke test: 16 greedy tokens from $MODELS/$SHARD1"
+    echo "model: $MODELS/$SHARD1" >"$SHARE/smoke.log"
+    wrapped "$PREFIX/bin/torch" run "$MODELS/$SHARD1" --tokens "$SMOKE_PROMPT" -n 16 --quiet >>"$SHARE/smoke.log" 2>&1 ||
         die "the smoke test failed: see $SHARE/smoke.log"
     echo "wrote $SHARE/smoke.log"
     got=$(sed -n 's/^generated tokens: //p' "$SHARE/smoke.log")
     [ "$got" = "$SMOKE_IDS" ] || die "the smoke test generated $got, expected $SMOKE_IDS ($SHARE/smoke.log)."
-    echo "smoke test: the expected tokens"
+    echo "smoke test: the expected tokens from $SHARD1 ($QUANT)"
 fi
 
 cat <<EOF
