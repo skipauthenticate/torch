@@ -6,8 +6,8 @@
  *     handle, greedy and seeded; cancel from another thread mid-prefill and mid-decode, then the same request equals an
  *     uncancelled run. PROMPT is a chat prompt ending in the 7-token generation prompt (bench/workloads/).
  *   torch_engine_test MODEL DRAFT VOCAB PROMPT.tokens --bench SPEC PLACEMENT
- *     one request of 256 greedy tokens at the benchmark's settings (context 262,144, prefill 4,096, swaps 128): decode tok/s
- *     and resident experts, for A/B runs against torch run. */
+ *     one request of 256 greedy tokens at the benchmark's settings (context 262,144, prefill 4,096, swaps 128): decode
+ * tok/s and resident experts, for A/B runs against torch run. */
 #include "torch_engine.h"
 
 #include <pthread.h>
@@ -134,10 +134,10 @@ static int same(const Run* a, const Run* b) {
 }
 
 static torch_engine* open_engine(const char** argv, int32_t context, int32_t prefill, const char* placement,
-                                 int32_t swaps) {
+                                 int32_t swaps, uint32_t options_size) {
     torch_engine_options o;
     memset(&o, 0, sizeof o);
-    o.struct_size = sizeof o;
+    o.struct_size = options_size;
     o.model = argv[1], o.draft = argv[2], o.draft_vocab = argv[3], o.draft_head_rows = 81920;
     o.placement = placement, o.context = context, o.prefill_columns = prefill, o.swaps_per_window = swaps;
     char error[512];
@@ -181,7 +181,7 @@ int main(int argc, const char** argv) {
     torch_engine_stats s;
 
     if (argc >= 8 && strcmp(argv[5], "--bench") == 0) {
-        torch_engine* e = open_engine(argv, 262144, 4096, argv[7], 128);
+        torch_engine* e = open_engine(argv, 262144, 4096, argv[7], 128, sizeof(torch_engine_options));
         torch_engine_params p = params(0, 0, atoi(argv[6]));
         p.max_tokens = 256, p.n_stop_ids = 0;
         if (run(e, p1, n1, n1 - 7, &p, &a, &s, 0, 0) != TORCH_ENGINE_OK)
@@ -203,7 +203,7 @@ int main(int argc, const char** argv) {
     static Run g1, g2, s1, s2;
 
     /* Handle A: two greedy turns, then two sampled turns (speculative). */
-    torch_engine* e = open_engine(argv, 16384, 512, NULL, 0);
+    torch_engine* e = open_engine(argv, 16384, 512, NULL, 0, offsetof(torch_engine_options, fast_prefill));
     torch_engine_params greedy = params(0, 0, 1), sampled1 = params(1, 5, 1), sampled2 = params(1, 6, 1);
     check(run(e, p1, n1, stable1, &greedy, &g1, &s, 0, 0) == TORCH_ENGINE_OK && g1.count > 0, "turn 1, greedy");
     const int32_t n2 = turn2(p1, stable1, &g1, p2);
@@ -219,7 +219,7 @@ int main(int argc, const char** argv) {
     torch_engine_close(e);
 
     /* Handle B, fresh: the same turn 2 requests, then cancels. */
-    e = open_engine(argv, 16384, 512, NULL, 0);
+    e = open_engine(argv, 16384, 512, NULL, 0, offsetof(torch_engine_options, prefix_memory_bytes));
     check(run(e, p2, n2, n2 - 7, &greedy, &a, &s, 0, 0) == TORCH_ENGINE_OK && s.cached_tokens == 0 && same(&a, &g2),
           "turn 2 greedy on a fresh handle = through the session");
     torch_engine_reset(e);
@@ -240,6 +240,23 @@ int main(int argc, const char** argv) {
           "cancel from another thread mid-decode (seeded)");
     check(run(e, p1, n1, stable1, &sampled1, &b, &s, 0, 0) == TORCH_ENGINE_OK && same(&b, &s1),
           "then the same request = an uncancelled run");
+    check(torch_engine_forget(e) == TORCH_ENGINE_OK, "forget all checkpoints");
+    const uint32_t old_stats = offsetof(torch_engine_stats, restored_tier);
+    torch_engine_params old = greedy;
+    old.struct_size = offsetof(torch_engine_params, checkpoints);
+    old.n_checkpoints = -1; /* An older caller ends before this field. */
+    old.max_tokens = 1;
+    memset(&s, 0xa5, sizeof s);
+    s.struct_size = old_stats;
+    check(torch_engine_generate(e, p1, 1, 1, &old, NULL, NULL, NULL, &s) == TORCH_ENGINE_OK && s.cached_tokens == 0 &&
+              s.generated_tokens == 1,
+          "generate with the previous parameter and result sizes");
+    check(torch_engine_last_stats(e, &s) == TORCH_ENGINE_OK && s.struct_size == old_stats,
+          "read the previous result size");
+    int intact = 1;
+    for (size_t i = old_stats; i < sizeof s; ++i)
+        intact &= ((const unsigned char*)&s)[i] == 0xa5;
+    check(intact, "the previous result size leaves the caller's next bytes intact");
     torch_engine_close(e);
     free(p1), free(p2), free(q2);
     printf("%s\n", failed ? "FAILED" : "all ok");

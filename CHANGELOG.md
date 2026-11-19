@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The server can reuse a shared system prompt and resume a conversation after a title request. It reserves 2 GiB
+  for saved prefixes by default. Disk storage requires an explicit directory. On 2026-11-19, a Jetson AGX Orin
+  64 GB running IQ3_S showed the first output for a new conversation in 2.28 seconds with 2,073 shared tokens.
+  The release took 8.73 seconds. All nine benchmark answers matched version 0.4.0. Both builds missed the kernel
+  bandwidth requirements. [Measurements](docs/performance.md#saved-prompts)
+
 ## [0.4.0] - 2026-11-16
 
 ### Added

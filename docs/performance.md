@@ -95,6 +95,44 @@ Memory: the chunk's activations are 1.55 GiB at 4,096 columns, the read-ahead po
 session snapshot 0.11 GiB, each its own budget line. Long prompts run at about the same rate: 131,001 tokens took
 854.7 s (153 tok/s) and 262,040 took 1,763.6 s (149 tok/s) on 2026-11-11, before the BF16 tuning (the needles below).
 
+## Saved prompts
+
+On 2026-11-19, a Jetson AGX Orin 64 GB ran two conversations on IQ3_S with the same system message and tools.
+A title request used a different system message between turns. Each server ran seven requests at each prefix length.
+The client timed the first visible output. The times include the work to save or restore a prefix.
+
+| Shared tokens | Request | Release first output | Cache first output | Tokens restored |
+| ---: | --- | ---: | ---: | ---: |
+| 2,073 | First conversation | 8.83 s | 10.47 s | 0 |
+| 2,073 | New conversation | 8.73 s | 2.28 s | 2,073 |
+| 2,073 | Return after a title | 8.77 s | 1.40 s | 2,183 |
+| 2,073 | Third turn | 8.82 s | 1.41 s | 2,211 |
+| 10,000 | First conversation | 38.34 s | 39.91 s | 0 |
+| 10,000 | New conversation | 38.35 s | 2.07 s | 10,000 |
+| 10,000 | Return after a title | 38.40 s | 1.33 s | 10,110 |
+| 10,000 | Third turn | 38.50 s | 1.38 s | 10,138 |
+
+The 2 GiB default restored the complete previous turn on all six returns. All 14 requests matched their own
+fresh release process. The 1 GiB trial kept the shared 10,000 tokens and sometimes discarded the rest of the turn.
+The 1.25 and 1.5 GiB trials also lost the last turn in the longer series. The first conversation took longer because
+the engine split its prompt at the system boundary. Disk storage requires an explicit directory.
+
+In a separate test, each server ran nine fresh requests. The release held 17,548 experts in memory.
+The cache build held 16,508. Both processes kept a 9 GiB free-memory floor. The following times and rates are medians
+of three requests per workload. All 2,304 generated token IDs matched the release and greedy decoding.
+
+| Workload | Release tokens/s | Cache tokens/s | Release prompt | Cache prompt | Release total | Cache total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Code review | 36.94 | 36.50 | 14.158 s | 14.241 s | 21.100 s | 21.266 s |
+| Prose | 33.50 | 32.70 | 15.023 s | 15.127 s | 22.703 s | 22.971 s |
+| Repetition | 51.08 | 50.22 | 14.991 s | 15.099 s | 20.081 s | 20.219 s |
+
+At five prefix lengths from 300 to 70,000 tokens, all three cache sources matched five full output score vectors
+from a fresh release run in both prompt modes. The model reference checks passed for both supported files. Both the
+release and the cache build missed the kernel bandwidth requirements. The benchmark file includes the per-request
+times, responses, token hashes, expert counts, cache-size comparisons and bandwidth results.
+[Benchmark results](../bench/results/2026-11-19-9dc2360-prefix-cache.json)
+
 ## Measured so far
 
 On the development Orin (JetPack 7, MAXN, GPU at 1.3 GHz), 2026-11-03 and 2026-11-04 [M2]:

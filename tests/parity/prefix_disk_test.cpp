@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "core/cuda_check.h"
+#include "core/error.h"
 #include "runtime/prefix_storage.h"
 
 int main() {
@@ -15,10 +17,25 @@ int main() {
     char dir[] = "prefix-disk-XXXXXX";
     if (!mkdtemp(dir))
         return 1;
+    const auto alias = std::filesystem::path(dir) / "alias";
     uint8_t* device = nullptr;
     void* aligned = nullptr;
     int result = 1;
     try {
+        const auto refused = [](const std::filesystem::path& path) {
+            try {
+                PrefixDisk disk(path, nullptr);
+            } catch (const torch::Error&) {
+                return true;
+            }
+            return false;
+        };
+        if (::chmod(dir, 0750) || !refused(dir) || ::chmod(dir, 0700))
+            throw std::runtime_error("disk cache accepted group access");
+        std::filesystem::create_directory_symlink(".", alias);
+        if (!refused(alias))
+            throw std::runtime_error("disk cache followed a directory symlink");
+        std::filesystem::remove(alias);
         constexpr size_t count = 10003;
         std::vector<uint8_t> input(count), output(count);
         for (size_t i = 0; i < count; ++i)
@@ -29,7 +46,9 @@ int main() {
         PrefixDisk disk(dir, nullptr);
         DeviceRanges parts{{device + 2, 7011}, {device + 7100, 2900}};
         auto file = disk.write(parts);
-        if (!file || !std::filesystem::is_empty(dir))
+        struct stat st{};
+        if (!file || ::fstat(file->fd, &st) || (st.st_mode & 0777) != 0600 || st.st_nlink ||
+            !std::filesystem::is_empty(dir))
             throw std::runtime_error("disk file is missing or visible");
         TORCH_CUDA_CHECK(cudaMemset(device, 0, count));
         if (!disk.read(*file, parts))
@@ -51,6 +70,7 @@ int main() {
         cudaFreeHost(aligned);
     if (device)
         cudaFree(device);
+    ::unlink(alias.c_str());
     ::rmdir(dir);
     return result;
 }
