@@ -101,6 +101,8 @@ if(TORCH_CUDA)
     src/runtime/expert_gate.cu
     src/runtime/expert_store.cpp
     src/runtime/prefill_reads.cpp
+    src/runtime/prefix_storage.cpp
+    src/runtime/prefix_cache.cpp
     src/runtime/generator.cpp)
   target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
   # One build of the engine for the static command line and the shared library (the C API): position-independent

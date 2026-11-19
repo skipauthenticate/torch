@@ -2213,6 +2213,43 @@ void Model::rewind() {
     impl_->rewind();
 }
 
+int Model::checkpoint_limit() const noexcept {
+    return impl_->lend_step > 0 ? impl_->lend_step : impl_->context;
+}
+
+std::span<uint8_t> Model::checkpoint_state() const noexcept {
+    return {impl_->snapshot, impl_->snapshot_bytes()};
+}
+
+std::span<uint8_t> Model::checkpoint_residual() const noexcept {
+    return {reinterpret_cast<uint8_t*>(impl_->cols[0].res), sizeof(float) * impl_->cfg.hc * impl_->cfg.n_embd};
+}
+
+void Model::checkpoint_rows(int first, int end, std::vector<std::span<uint8_t>>& out) const {
+    if (first < 0 || end < first || end > checkpoint_limit())
+        throw Error("The checkpoint exceeds the active cache rows.");
+    const auto& b = impl_->cols[0];
+    const size_t row = static_cast<size_t>(impl_->cfg.n_head_kv) * impl_->cfg.head_dim;
+    const auto add = [&](uint16_t* data, int a, int z, size_t width) {
+        if (data && z > a)
+            out.emplace_back(reinterpret_cast<uint8_t*>(data + a * width), (z - a) * width * sizeof(uint16_t));
+    };
+    for (size_t l = 0; l < b.k_cache.size(); ++l) {
+        add(b.k_cache[l], first, end, row);
+        add(b.v_cache[l], first, end, row);
+        if (!b.idx_pool.empty())
+            add(b.idx_pool[l], first / kernels::kIndexPool, end / kernels::kIndexPool, kernels::kIndexDim);
+    }
+}
+
+void Model::restore_checkpoint(std::span<const int32_t> ids) {
+    if (ids.empty() || ids.size() > static_cast<size_t>(checkpoint_limit()))
+        throw Error("The checkpoint position exceeds the active cache rows.");
+    impl_->history.assign(ids.begin(), ids.end());
+    impl_->snapshot_at = static_cast<int>(ids.size());
+    impl_->rewind();
+}
+
 void Model::cancel() noexcept {
     impl_->cancel_requested = true;
 }

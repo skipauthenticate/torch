@@ -277,6 +277,25 @@ python3 -m venv .venv
 .venv/bin/python tests/fixtures/make_fixtures.py
 ```
 
+### Prefix checkpoint checks
+
+`tests/model/checkpoints.py` compares five full output vectors and four generated ids with a fresh run. It also
+checks every active draft key and value against a separate one-row draft pass. Supply a comma-separated token file.
+Use an empty results directory for each model or change of options. For example, with `MODEL`, `DRAFT`, `TOKENS`
+and `RELEASE` set to local paths, run the following on the board.
+
+```sh
+for tier in fresh arena memory disk; do
+  exe=build/torch
+  if [ "$tier" = fresh ]; then exe="$RELEASE"; fi
+  python3 tests/model/checkpoints.py "$exe" "$MODEL" "$TOKENS" 2073 "$tier" results -- \
+    --context 262144 --prefill 4096 --draft "$DRAFT"
+done
+```
+
+Use positions 300, 2,073, 4,113, 16,500 and 70,000. Repeat with `--fast-prefill` to compare each mode with its
+own reference. The 70,000-token memory test reserves 3 GiB so the complete parked state fits.
+
 ## Formatting
 
 C++ is formatted with clang-format 19.1.7 and the repository's `.clang-format`; CI checks every file. Install it in

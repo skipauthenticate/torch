@@ -89,7 +89,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 Streaming, thinking (returned as `reasoning_content`), stop strings, seeds, multi-turn conversations that don't
 read the earlier turns again, and tool calls for agent clients (the server runs no tool; your client does) are all
-supported. The server answers one request at a time and listens only on your
+supported. Conversations can share a system prompt and resume after a title request. The server answers one request at a time and listens only on your
 machine unless you give it an API key. [Server guide](docs/server.md)
 
 `--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.2 -> 10.6 s on code

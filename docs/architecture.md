@@ -377,6 +377,17 @@ that is not indexed by position (each DeltaNet state, the convolution and PLE ro
 was after the last chunk: 0.11 GiB, its own budget line, outside the lent tail. An extending request rewinds to that
 point (`Model::rewind()`) and prefills the tokens generated since together with its new ones. Its state is then what
 a fresh prefill of the whole prompt gives, even once prefill and windows stop being bitwise equal.
+The server can also mark several prompt boundaries. For each retained boundary, the engine saves the recurrent
+state, the convolution histories, the raw indexer rings and the token ids. With a draft layer it saves the recent
+draft rows and the last trunk residual. On restore it recomputes the last draft row with the next request token.
+This also works when the two requests differ immediately after the boundary.
+
+Before another request overwrites attention rows, the engine copies the keys, values and completed pooled index
+blocks into the reserved memory pool or an optional disk file. A turn stores only its rows after its system
+block. Restoring a turn first restores any missing block rows. All transfers preserve the stored bytes.
+The disk path uses two 32 MiB pinned buffers and checks a CRC32 for each transfer block. Both buffers appear
+in the memory budget when disk caching is enabled.
+
 `Model::cancel()` stops a request between windows or chunks from any thread and leaves the sequence intact; the C API
 (M7) exposes it.
 

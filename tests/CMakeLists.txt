@@ -8,7 +8,7 @@ add_executable(gguf_test unit/gguf_test.cpp)
 target_link_libraries(gguf_test PRIVATE torch_core)
 add_test(NAME gguf COMMAND gguf_test ${fixtures}/tiny.gguf)
 
-foreach(name budget ple_rows window_policy swaps tokenizer_export)
+foreach(name budget ple_rows window_policy swaps tokenizer_export prefix_index)
   add_executable(${name}_test unit/${name}_test.cpp)
   target_link_libraries(${name}_test PRIVATE torch_core)
   add_test(NAME ${name} COMMAND ${name}_test)
@@ -35,7 +35,7 @@ add_test(NAME inspect_header_only
          COMMAND sh -c "head -c 600 \"$0\" > \"$1\" && \"$2\" inspect --header-only \"$1\" && ! \"$2\" inspect \"$1\""
                  ${fixtures}/tiny.gguf ${cut} $<TARGET_FILE:torch>)
 
-set_tests_properties(dequant gguf budget placement ple_rows window_policy swaps tokenizer_export direct_io hedged_reads inspect_json inspect_header_only PROPERTIES LABELS unit)
+set_tests_properties(prefix_index dequant gguf budget placement ple_rows window_policy swaps tokenizer_export direct_io hedged_reads inspect_json inspect_header_only PROPERTIES LABELS unit)
 
 if(TORCH_FUZZ)
   add_executable(gguf_fuzz fuzz/gguf_fuzz.cpp)
@@ -62,6 +62,11 @@ if(TORCH_CUDA)
   # include/torch_engine.h and libtorch_engine.so.
   enable_language(C)
   find_package(Threads REQUIRED)
+  add_executable(prefix_disk_test parity/prefix_disk_test.cpp)
+  target_link_libraries(prefix_disk_test PRIVATE torch_engine)
+  add_test(NAME prefix_disk COMMAND prefix_disk_test)
+  set_tests_properties(prefix_disk PROPERTIES LABELS parity)
+
   add_executable(torch_engine_test api/torch_engine_test.c)
   set_target_properties(torch_engine_test PROPERTIES C_STANDARD 11)
   target_compile_options(torch_engine_test PRIVATE -Wall -Wextra $<$<BOOL:${TORCH_WERROR}>:-Werror>)

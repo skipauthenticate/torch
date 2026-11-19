@@ -184,6 +184,12 @@ public:
     // prefills the generated tokens again with its new ones, as a fresh prefill of the whole prompt would. Throws
     // Error when there is no prefill to go back to.
     void rewind();
+    // Checkpoint data on the model stream. Only complete index blocks have a pooled key.
+    int checkpoint_limit() const noexcept;
+    std::span<uint8_t> checkpoint_state() const noexcept;
+    std::span<uint8_t> checkpoint_residual() const noexcept;
+    void checkpoint_rows(int first, int end, std::vector<std::span<uint8_t>>& out) const;
+    void restore_checkpoint(std::span<const int32_t> ids);
     // From any thread: the next verify() or decode() returns false without running a window, error() says the request
     // was cancelled and cancelled() is true. The sequence is unchanged, so a later request can extend it.
     void cancel() noexcept;

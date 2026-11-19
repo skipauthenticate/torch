@@ -2,6 +2,7 @@
 import argparse
 import ipaddress
 import logging
+import math
 import os
 import re
 import subprocess
@@ -47,6 +48,10 @@ def main(argv=None):
     p.add_argument("--fast-prefill", action="store_true",
                    help="prompts' BF16 products on the tensor cores, the activations rounded to BF16: a shorter time to "
                         "the first token, but a greedy answer can differ from the default's")
+    p.add_argument("--prefix-memory-gib", type=float, default=1.0,
+                   help="extra memory for reusable prompt boundaries in GiB (default 1, zero disables the extra memory pool)")
+    p.add_argument("--prefix-disk", type=Path, help="enable disk checkpoints in this private directory (mode 0700)")
+    p.add_argument("--prefix-disk-gib", type=float, help="disk checkpoint limit in GiB (default 8 with --prefix-disk)")
     p.add_argument("--swaps", type=int, default=128, help="experts made resident after each generated window")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
@@ -58,6 +63,12 @@ def main(argv=None):
                    help="the most tokens a request that gives no max_tokens may generate (default: what the context "
                         "has left)")
     a = p.parse_args(argv)
+    if not math.isfinite(a.prefix_memory_gib) or not 0 <= a.prefix_memory_gib < 2**32:
+        p.error("--prefix-memory-gib must be a finite nonnegative size.")
+    if a.prefix_disk_gib is not None and (a.prefix_disk is None or not math.isfinite(a.prefix_disk_gib)
+                                          or not 0 < a.prefix_disk_gib < 2**32):
+        p.error("--prefix-disk-gib needs --prefix-disk and a positive finite size.")
+    disk_bytes = int((a.prefix_disk_gib or 8) * 2**30) if a.prefix_disk else 0
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     calibration = calibration_for(a.model)
@@ -83,7 +94,8 @@ def main(argv=None):
         name = a.model_name or re.sub(r"-0+1-of-0+\d+\.gguf$|\.gguf$", "", Path(a.model).name)
         try:
             engine = Engine(a.library, a.model, a.draft, a.draft_vocab, a.draft_head_rows, a.placement, a.context,
-                            a.prefill, a.lend_kv, a.swaps, a.fast_prefill)
+                            a.prefill, a.lend_kv, a.swaps, a.fast_prefill, int(a.prefix_memory_gib * 2**30),
+                            a.prefix_disk, disk_bytes)
         except (EngineError, OSError) as e:
             sys.exit(f"torch_server: {e}")
         server = Server((a.host, a.port), chat, engine, name, a.api_key, a.queue, a.max_tokens_default)
