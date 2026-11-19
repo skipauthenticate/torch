@@ -5,13 +5,29 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - In preparation
+
 ### Added
 
-- The server can reuse a shared system prompt and resume a conversation after a title request. It reserves 2 GiB
-  for saved prefixes by default. Disk storage requires an explicit directory. On 2026-11-19, a Jetson AGX Orin
-  64 GB running IQ3_S showed the first output for a new conversation in 2.28 seconds with 2,073 shared tokens.
-  The release took 8.73 seconds. All nine benchmark answers matched version 0.4.0. Both builds missed the kernel
-  bandwidth requirements. [Measurements](docs/performance.md#saved-prompts)
+- Conversations can reuse a shared system prompt and tool definitions. A conversation can also resume its previous
+  turn after a title request. The server reserves 2 GiB for saved prompts by default. Disk caching requires an
+  explicit directory. [Server settings](docs/server.md#sessions)
+- Version 3 of the C interface accepts checkpoint positions, reports which storage tier the engine used, and
+  lets callers clear saved prompts. The engine also accepts the smaller structures from versions 1 and 2.
+
+### Performance
+
+- On 2026-11-19, a Jetson AGX Orin 64 GB running IQ3_S showed the first output for a new conversation in
+  2.28 seconds with 2,073 shared tokens, down from 8.73 seconds on v0.4.0. With 10,000 shared tokens, the time
+  fell from 38.35 to 2.07 seconds. On fresh prompts, generation was 0.44–0.86 tokens per second slower.
+  [Measurements](docs/performance.md#saved-prompts)
+
+### Verification
+
+- All 2,304 generated token IDs from nine fresh requests matched v0.4.0. All 30 cache restore checks passed
+  at lengths up to 70,000 tokens. Both supported model files passed their output reference checks.
+- The required GPU bandwidth check is still open. In a paired test, each build missed the target in 32 of 61
+  large cases on IQ3_S and 17 of 32 on UD-IQ3_XXS.
 
 ## [0.4.0] - 2026-11-16
 
