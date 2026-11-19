@@ -22,29 +22,46 @@ speculative decoding changes the speed, never the tokens.
 
 ## Speed
 
-Jetson AGX Orin 64 GB, full 262K context, 4,096-token prompts, 256-token answers.
+On 2026-11-19, a Jetson AGX Orin 64 GB ran IQ3_S with a 262,144-token context. Prompt processing (PP) measures
+how fast the server reads input tokens. Generation measures how fast it produces output tokens. All rates below are
+in tokens per second. Each value is the median of three fresh 4,096-token prompts with 256 output tokens each.
 
-| Model file | Output | Prompt (4K) | Prompt (4K), `--fast-prefill` |
+| Workload | v0.4.0 PP | 2 GiB cache PP | v0.4.0 generation | 2 GiB cache generation |
+| --- | ---: | ---: | ---: | ---: |
+| Code review | 289.32 | 287.63 | 36.94 | 36.50 |
+| Prose | 272.65 | 270.78 | 33.50 | 32.70 |
+| Repetition | 273.23 | 271.27 | 51.08 | 50.22 |
+
+All 2,304 generated token IDs matched v0.4.0. The cache held 16,508 experts in memory. The release held 17,548.
+
+When a new conversation reused a 2,073-token system prompt and tool definitions, time to first visible output
+fell from 8.73 to 2.28 seconds. With 10,000 shared tokens, it fell from 38.35 to 2.07 seconds. The first conversation
+with the 2,073-token prompt took 1.64 seconds longer to start with the cache. Disk caching requires an explicit
+directory. [Paired measurements](docs/performance.md#saved-prompts)
+
+Earlier v0.4.0 tests measured both model files with the same context and request lengths.
+
+| Model file | Generation | PP | PP with `--fast-prefill` |
 | --- | ---: | ---: | ---: |
-| IQ3_S (default) | 33.7 to 53.0 tokens/s | 273 to 289 tokens/s | 359 to 390 tokens/s |
-| UD-IQ3_XXS | 33.9 to 49.0 tokens/s | 272 to 288 tokens/s | 283 to 299 tokens/s |
+| IQ3_S (default) | 33.7–53.0 tokens/s | 273–289 tokens/s | 359–390 tokens/s |
+| UD-IQ3_XXS | 33.9–49.0 tokens/s | 272–288 tokens/s | 283–299 tokens/s |
 
-A 4,096-token prompt is the wait before the first answer token: 14.2-15.1 s by default; with `--fast-prefill`,
-10.5-11.4 s on IQ3_S and 13.7-14.5 s on UD-IQ3_XXS.
-
-[How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
+In those tests, fresh 4,096-token prompts took 14.2–15.1 seconds in the default mode. With `--fast-prefill`,
+they took 10.5–11.4 seconds on IQ3_S and 13.7–14.5 seconds on UD-IQ3_XXS.
+[Benchmark method](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
 ### Why `--fast-prefill` is off by default
 
 `--fast-prefill` reads the prompt about a quarter faster by running its BF16 matrix products on the GPU's tensor
 cores. To do that it rounds the prompt's activations to BF16 first, and that rounding has costs:
 
-- **Answers can change.** The numbers inside the model come out slightly different. In the benchmark behind the
-  table, 7 of 9 answers differed from the default's at some token, often one where two choices were nearly tied.
+- **Answers can change.** The numbers inside the model come out slightly different. In the earlier v0.4.0
+  benchmark, 7 of 9 answers differed from the default's at some token, often one where two choices were nearly tied.
 - **No exact match with the default path.** By default, reading a prompt in chunks gives bit for bit the same result
   as feeding it one token at a time, at the model file's own precision. With `--fast-prefill` it does not. Its
   results are still the same from run to run and at any chunk size.
-- **Less tested.** Prompts of 32K tokens or more, and sampled (non-greedy) answers, have not been checked with it.
+- **Long prompts.** On IQ3_S, fast-mode cache restores matched fresh fast-mode runs through 70,000 tokens.
+  Those checks used greedy decoding. Sampled answers in fast mode remain unverified.
 
 On the IQ3_S file, quality stays inside the project's parity limit against the reference implementation either way
 (mean KL 0.00179 with the flag and 0.00143 without, against a limit of 0.00328). Answer speed is the same
