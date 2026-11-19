@@ -154,7 +154,7 @@ Send the whole conversation with each request. The server marks the end of the s
 of the stable conversation history. A checkpoint saves the model state at one of these token positions. The engine
 uses the longest saved prefix that exactly matches the request's token ids. It feeds the remaining tokens.
 
-The server reserves 1 GiB for checkpoints by default. A new conversation can reuse a system block. A title request
+The server reserves 2 GiB for checkpoints by default. A new conversation can reuse a system block. A title request
 can use a different prompt, then the next conversation turn can restore its saved history. The engine keeps the
 current and previous turn while space permits. It gives shared blocks priority when it needs to free space.
 `--prefix-memory-gib 0` with disk caching off keeps only the immediately preceding stable turn.
