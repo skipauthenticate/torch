@@ -124,8 +124,10 @@ void upload_gemm_tables();
 inline bool gemm_bf16_wins(int cols) {
     return cols >= 256;
 }
+// For long prompts an optional 16-byte-aligned scratch buffer holds a reordered copy of the weight bits.
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
-               cudaStream_t stream, const uint8_t* w2 = nullptr, int rows2 = 0, float* y2 = nullptr);
+               cudaStream_t stream, const uint8_t* w2 = nullptr, int rows2 = 0, float* y2 = nullptr,
+               void* workspace = nullptr, size_t workspace_bytes = 0);
 
 // gemm_bf16's products on the tensor cores, for --fast-prefill (gemm_bf16_tc.cu): the same outputs and epilogues, but
 // the activations are rounded to BF16 before the products, which accumulate in F32 in a tensor-core order. Not bitwise

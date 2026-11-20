@@ -253,7 +253,9 @@ void check_bf16(int rows, int cols, int columns, float silu_scale, uint32_t seed
                                 want.get() + static_cast<size_t>(c) * rows,
                                 want2.get() + static_cast<size_t>(c) * static_cast<size_t>(rows2), nullptr, silu_scale,
                                 1);
-    kernels::gemm_bf16(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2, got2.get());
+    DeviceBuffer<uint8_t> packed(columns >= 256 ? static_cast<size_t>((total + 63) / 64) * 64 * cols * 2 : 1);
+    kernels::gemm_bf16(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2, got2.get(),
+                       packed.get(), packed.bytes());
     std::vector<float> a = want.download(), b = got.download();
     if (rows2 > 0) {
         const std::vector<float> a2 = want2.download(), b2 = got2.download();
@@ -369,6 +371,7 @@ int main() {
         check_bf16(10240, 320, 9, 0.0f, 502u);            // up (the short-row kernel's shape)
         check_bf16(512, 2560, 130, 0.0f, 503u);           // the router
         check_bf16(512, 2560, 70, 0.0f, 505u, 1);         // with the shared expert's gate row: one row past the tiles
+        check_bf16(78, 264, 257, 0.25f, 506u, 3);         // packed weights with incomplete tiles and a second matrix
         check_bf16(48, 264, 5, 0.0f, 504u);               // 33 chunks: lane 0's pass has two; rows short of a tile
         check_expert_h();
         check_bf16_tc(320, 10240, 37, 0.25f, 600u);     // --fast-prefill: a mixer's down projection, its SiLU

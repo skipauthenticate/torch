@@ -907,7 +907,26 @@ struct BfArgs {
     float *y, *y2;
     int columns;
     float silu_scale;  // non-zero: w's rows store silu(silu_scale * sum)
+    const uint4* packed = nullptr;
 };
+
+// Store consecutive rows of a weight tile together. A warp of the product then reads one contiguous set of chunks.
+__global__ void pack_bf16_kernel(BfArgs a, uint4* out) {
+    constexpr int tile = 16;
+    __shared__ uint4 values[tile][tile + 1];
+    const int x = threadIdx.x % tile, y = threadIdx.x / tile;
+    const int chunk0 = blockIdx.x * tile, row0 = blockIdx.y * tile;
+    const int row = min(row0 + y, a.total - 1);
+    const auto* w = reinterpret_cast<const uint4*>(row < a.rows ? a.w : a.w2);
+    const int source = row < a.rows ? row : row - a.rows;
+    if (chunk0 + x < a.chunks)
+        values[y][x] = w[int64_t{source} * a.chunks + chunk0 + x];
+    __syncthreads();
+    if (chunk0 + y < a.chunks) {
+        const int64_t base = (int64_t{row0 / kBfRows} * a.chunks + chunk0 + y) * kBfRows;
+        out[base + row0 % kBfRows + x] = values[x][y];
+    }
+}
 
 __device__ __forceinline__ float bf16_value(uint32_t v) {
     return __uint_as_float(v << 16);
@@ -958,6 +977,7 @@ __device__ __forceinline__ void bf_fold(float (&node)[5][4][4], float (&acc)[4][
 // a pass's last chunk its sums join the tree: a binary counter over the passes, level t combining when 2^(t + 1) passes
 // are done, which with the bit-reversed order pairs lanes l and l ^ 16 first, then ^ 8, ^ 4, ^ 2, ^ 1, as warp_sum
 // does. Every lane has a chunk (chunks >= 32), so no pass is empty.
+template <bool kPacked>
 __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
     extern __shared__ uint4 bf_shared[];
     BfStage* stage = reinterpret_cast<BfStage*>(bf_shared);
@@ -987,7 +1007,13 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int j = (static_cast<int>(threadIdx.x) + k * kBfThreads) / kBfRows;
-            l.w[k] = j < n ? wrow[k][order[f0 + j] & ~kBfLast] : make_uint4(0, 0, 0, 0);
+            const int chunk = j < n ? order[f0 + j] & ~kBfLast : 0;
+            if constexpr (kPacked) {
+                const int row = (threadIdx.x + k * kBfThreads) % kBfRows;
+                l.w[k] =
+                    j < n ? a.packed[(int64_t{blockIdx.y} * a.chunks + chunk) * kBfRows + row] : make_uint4(0, 0, 0, 0);
+            } else
+                l.w[k] = j < n ? wrow[k][chunk] : make_uint4(0, 0, 0, 0);
         }
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
@@ -1134,7 +1160,7 @@ __global__ void __launch_bounds__(kBfThreads) gemm_bf16_few_kernel(BfArgs a) {
 }  // namespace
 
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
-               cudaStream_t stream, const uint8_t* w2, int rows2, float* y2) {
+               cudaStream_t stream, const uint8_t* w2, int rows2, float* y2, void* workspace, size_t workspace_bytes) {
     if (cols % 8 != 0 || cols < 256 || cols / 8 > kBfLast || rows < 1 || columns < 1 || rows2 < 0)
         throw Error("gemm_bf16 takes rows of 256 to 262,144 values (a multiple of 8) and at least one column.");
     BfArgs a{w, w2, rows, rows + rows2, cols / 8, rows + rows2, x, y, y2, columns, silu_scale};
@@ -1148,15 +1174,24 @@ void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, i
                                    kBfThreads, 0, stream>>>(a);
     }
     const size_t shared = 2 * sizeof(BfStage) + sizeof(uint16_t) * static_cast<size_t>(a.chunks);
-    static size_t allowed = 0;
-    if (shared > allowed) {
-        TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              static_cast<int>(shared)));
-        allowed = shared;
-    }
     const dim3 grid(static_cast<unsigned>((columns + kBfCols - 1) / kBfCols),
                     static_cast<unsigned>((a.end + kBfRows - 1) / kBfRows));
-    gemm_bf16_kernel<<<grid, kBfThreads, shared, stream>>>(a);
+    const auto run = [&]<bool packed>() {
+        static size_t allowed = 0;
+        if (shared > allowed) {
+            TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel<packed>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  static_cast<int>(shared)));
+            allowed = shared;
+        }
+        gemm_bf16_kernel<packed><<<grid, kBfThreads, shared, stream>>>(a);
+    };
+    if (columns >= 256 && workspace && size_t{grid.y} * kBfRows * cols * 2 <= workspace_bytes) {
+        auto* weights = static_cast<uint4*>(workspace);
+        pack_bf16_kernel<<<dim3((a.chunks + 15) / 16, grid.y * (kBfRows / 16)), 256, 0, stream>>>(a, weights);
+        a.packed = weights;
+        run.template operator()<true>();
+    } else
+        run.template operator()<false>();
 }
 
 int expert_slots(int n_expert, int routes) {

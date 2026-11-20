@@ -1097,7 +1097,8 @@ struct Model::Impl {
     void bf16_chunk(const uint8_t* w, int rows, int width, const float* x, float* y, int columns, float silu_scale,
                     const uint8_t* w2, int rows2, float* y2) {
         if (!fast_prefill || !kernels::gemm_bf16_tc(w, rows, width, x, y, columns, silu_scale, stream, w2, rows2, y2))
-            kernels::gemm_bf16(w, rows, width, x, y, columns, silu_scale, stream, w2, rows2, y2);
+            kernels::gemm_bf16(w, rows, width, x, y, columns, silu_scale, stream, w2, rows2, y2, ops->q8_columns,
+                               kernels::q8_columns_bytes(cfg.hc * cfg.n_embd / 32, chunk_cap));
     }
 
     // A hyper-connection mixer over the window's columns: the hc streams of each column's residual, normalized, mixed
