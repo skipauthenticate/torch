@@ -275,20 +275,28 @@ Result Generator::generate(const Request& r, const Observer& o) {
             return policy.more(drafted, prob);
         };
         std::vector<model::Drafted> d = out.variants[0].drafts.back();
-        out.depth_tried.assign(static_cast<size_t>(r.spec), 0),
-            out.depth_accepted.assign(static_cast<size_t>(r.spec), 0);
-        std::vector<int32_t> win, a(static_cast<size_t>(r.spec) + 1);
+        const int limit = adaptive && !r.sample ? std::max(r.spec, r.copy_depth) : r.spec;
+        out.depth_tried.assign(static_cast<size_t>(limit), 0), out.depth_accepted.assign(static_cast<size_t>(limit), 0);
+        std::vector<int32_t> win, a(static_cast<size_t>(limit) + 1);
+        std::span<const int32_t> copy;
         while (sequence.size() < total && !(out.cancelled = cancel_now)) {
             const int p = m_.position();           // the window's first position, that of sequence.back()
             int use = static_cast<int>(d.size());  // drafts to verify
-            if (adaptive) {
+            const bool used_copy = !copy.empty();
+            if (used_copy)
+                use = static_cast<int>(copy.size());
+            else if (adaptive) {
                 for (size_t j = 0; j < d.size(); ++j)
                     policy.more(static_cast<int>(j) + 1, d[j].prob);  // records the probabilities
                 use = policy.width();
             }
             win.assign(1, sequence.back());
-            for (int j = 0; j < use; ++j)
-                win.push_back(d[static_cast<size_t>(j)].token);
+            if (used_copy)
+                win.insert(win.end(), copy.begin(), copy.end());
+            else
+                for (int j = 0; j < use; ++j)
+                    win.push_back(d[static_cast<size_t>(j)].token);
+            copy = {};
             const auto verify_start = Clock::now();
             if (!m_.verify(win)) {
                 if (!m_.cancelled())
@@ -304,7 +312,7 @@ Result Generator::generate(const Request& r, const Observer& o) {
             } else {
                 for (int t = 0; t <= use; ++t)
                     a[static_cast<size_t>(t)] = m_.argmax(t);
-                while (n <= use && d[static_cast<size_t>(n - 1)].token == a[static_cast<size_t>(n - 1)] &&
+                while (n <= use && win[static_cast<size_t>(n)] == a[static_cast<size_t>(n - 1)] &&
                        a[static_cast<size_t>(n - 1)] != static_cast<int32_t>(m_.config().eos_token))
                     ++n;
             }
@@ -327,7 +335,10 @@ Result Generator::generate(const Request& r, const Observer& o) {
                 out.stop_column = static_cast<int>(stop) - 1;
             const auto extend_start = Clock::now();
             if (sequence.size() < total) {
-                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), r.spec, d,
+                if (adaptive && !r.sample)
+                    copy = model::matching_continuation(
+                        sequence, static_cast<int>(std::min<size_t>(limit, total - sequence.size() - 1)));
+                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), copy.empty() ? r.spec : 0, d,
                             stop_early ? more : std::function<bool(int, float)>());
                 out.extended = p + n - 1;
             } else {  // the request's end: the K/V-only pass over its last window, for the drafts of a request that
@@ -336,7 +347,7 @@ Result Generator::generate(const Request& r, const Observer& o) {
             }
             const double this_extend_ms = ms_since(extend_start);
             out.extend_ms += this_extend_ms;
-            if (adaptive)
+            if (adaptive && !used_copy && copy.empty())
                 policy.observe(use, n - 1, this_verify_ms + this_extend_ms);
         }
         sequence.resize(std::min(sequence.size(), total));

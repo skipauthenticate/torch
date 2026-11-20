@@ -21,9 +21,14 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
+#include <span>
 #include <vector>
 
 namespace torch::model {
+
+// Propose a continuation only when every complete earlier match of the last eight tokens agrees.
+std::span<const int32_t> matching_continuation(std::span<const int32_t> history, int depth);
 
 class WindowPolicy {
 public:

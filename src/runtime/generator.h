@@ -37,6 +37,7 @@ struct Request {
     // Speculation: up to `spec` drafts per verify window (0: one token at a time; needs the draft layer) and how many a
     // window verifies: "fixed" (all), "adaptive", "adaptive-stop" or "adaptive-tight" (model/window_policy.h).
     int spec = 0;
+    int copy_depth = 0;  // A greedy server request can verify more copied tokens than the draft layer predicts.
     std::string policy = "adaptive-stop";
     // The adaptive policy keeps what it learned (acceptance by draft probability, window costs) from the last request
     // with the same spec on this generator, instead of starting from its seeds.

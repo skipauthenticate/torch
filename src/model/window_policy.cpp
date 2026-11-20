@@ -17,6 +17,29 @@ constexpr int kProbeEvery = 32;  // windows of no drafts after which one draft i
 
 }  // namespace
 
+std::span<const int32_t> matching_continuation(std::span<const int32_t> history, int depth) {
+    constexpr size_t suffix = 8;
+    history = history.last(std::min<size_t>(history.size(), 16384));
+    if (depth <= 0 || history.size() < suffix + static_cast<size_t>(depth))
+        return {};
+    const auto key = history.last(suffix);
+    const auto past = history.first(history.size() - static_cast<size_t>(depth));
+    std::span<const int32_t> result;
+    auto start = past.begin();
+    while (start != past.end()) {
+        const auto match = std::search(start, past.end(), key.begin(), key.end());
+        if (match == past.end())
+            break;
+        const auto next =
+            history.subspan(static_cast<size_t>(match - past.begin()) + suffix, static_cast<size_t>(depth));
+        if (!result.empty() && !std::equal(result.begin(), result.end(), next.begin()))
+            return {};
+        result = next;
+        start = match + 1;
+    }
+    return result;
+}
+
 WindowPolicy::WindowPolicy(int max_drafts, std::vector<double> seed_costs, bool tight)
     : max_drafts_(max_drafts), tight_(tight), cost_(std::move(seed_costs)) {
     if (max_drafts < 0 || max_drafts > 7)

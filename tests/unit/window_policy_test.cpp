@@ -160,6 +160,15 @@ void check_deterministic() {
 }  // namespace
 
 int main() {
+    const std::vector<int32_t> same = {1, 2, 3, 4, 5,  6,  7, 8, 31, 32, 1, 2, 3, 4,
+                                       5, 6, 7, 8, 31, 32, 1, 2, 3,  4,  5, 6, 7, 8};
+    const auto next = model::matching_continuation(same, 2);
+    CHECK(next.size() == 2 && next[0] == 31 && next[1] == 32);
+    auto ambiguous = same;
+    ambiguous[9] = 33;
+    CHECK(model::matching_continuation(ambiguous, 2).empty());
+    CHECK(model::matching_continuation(std::span(same).first(8), 2).empty());
+    CHECK(model::matching_continuation(same, 0).empty());
     check_validation();
     check_shapes();
     check_learning();
