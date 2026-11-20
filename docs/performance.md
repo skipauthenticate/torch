@@ -95,6 +95,41 @@ Memory: the chunk's activations are 1.55 GiB at 4,096 columns, the read-ahead po
 session snapshot 0.11 GiB, each its own budget line. Long prompts run at about the same rate: 131,001 tokens took
 854.7 s (153 tok/s) and 262,040 took 1,763.6 s (149 tok/s) on 2026-11-11, before the BF16 tuning (the needles below).
 
+## Fresh prompt and generation tests
+
+On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 and an experimental build at `c4abe94`.
+The experimental server reserved 2 GiB for shared prompts and could check 256 copied positions together.
+Both servers had a 262,144-token context and a 9 GiB free-memory floor.
+Each process ran one warm-up and then nine requests with the supplied placement and draft vocabulary.
+Every timed request read 4,096 uncached input tokens and produced 256 output tokens.
+Prompt processing (PP) and generation rates are tokens per second. Each row gives the median of three requests.
+
+| Model file | Workload | v0.4.0 PP | Trial PP | v0.4.0 generation | Trial generation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| IQ3_S | Code review | 285.28 | 299.96 | 36.18 | 33.84 |
+| IQ3_S | Prose | 268.66 | 281.41 | 32.50 | 32.19 |
+| IQ3_S | Repetition | 269.45 | 282.20 | 49.43 | 99.07 |
+| UD-IQ3_XXS | Code review | 286.86 | 289.70 | 33.53 | 32.88 |
+| UD-IQ3_XXS | Prose | 270.46 | 271.59 | 31.39 | 31.91 |
+| UD-IQ3_XXS | Repetition | 270.60 | 272.16 | 46.78 | 103.69 |
+
+All 4,608 output token IDs and answers matched v0.4.0 and single-token greedy generation.
+Code review generation slowed on both model files. A separate test kept long checks enabled and set the extra
+cache to zero. IQ3_S repetition rose from 49.15 to 105.56 tokens/s. Its median longest pause between output groups
+rose from 0.138 to 2.129 seconds. The release candidate now uses short checks and zero extra cache memory by default.
+
+Both files passed 13 unit tests and 13 GPU output tests. Each model reference test checked 160 positions.
+Mean divergence was 0.00143 on IQ3_S against a limit of 0.00328. On UD-IQ3_XXS it was 0.00249 against 0.00596.
+The required 153 GB/s bandwidth check failed for 35 of 61 large operations on IQ3_S and 18 of 33 on UD-IQ3_XXS.
+The small-operation tests passed for both files. The release stays in draft.
+
+The eight-token attention check at position 1,800 counts 4.29 MB. Its two dense products use about 355 million
+32-bit floating-point operations. Meeting the bandwidth limit with this calculation would require 12.65 trillion
+operations per second. A device test measured 5.10 trillion. A separate memory read test measured 180 GB/s.
+At the target of 2,000 uncached input tokens/s, a 4,096-token prompt must finish in 2.048 seconds.
+The results file includes the times for each part of a real prompt.
+[Per-request rates, output hashes, and GPU checks](../bench/results/2026-11-19-c4abe94-verification.json)
+
 ## Saved prompts
 
 On 2026-11-19, a Jetson AGX Orin 64 GB ran two conversations on IQ3_S with the same system message and tools.

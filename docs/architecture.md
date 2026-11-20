@@ -239,8 +239,12 @@ ms. The host's work per token is the embedding row, the PLE rows, one graph laun
   - With `adaptive-stop`, drafting stops once one or two more drafts could not beat the best window so far.
   - It is deterministic and changes only how many drafts are verified. The benchmarks use `--spec 5 --spec-policy
     adaptive-stop`: at most 5 drafts, 2.0-2.8 verified on average [M4].
-- **Prompt-lookup copies** (M5): when the recent output matches an earlier span of the context, the continuation of
-  that span is proposed directly, up to T tokens per window [est].
+- **Copied passages.** When the last eight tokens match an earlier passage, Torch can propose the next seven
+  tokens from that passage. Each match must have the same continuation. The target checks each proposed token.
+  A buffered greedy request can set `torch.long_copy` to check up to 256 positions together. The engine saves the
+  state in unused prompt memory before the check. A wrong token restores that state and triggers a short check.
+  An edit inside a previously matching passage also selects short checks. Streaming, sampling, tool calls, and custom
+  stop strings use the short checks.
 - **Draft precision**: the draft layer's routed experts are 4-bit. On the review prompts they took the same number
   of windows as the 8-bit file on two prompts, and one more (81 against 80) on the third [M4]. Drafts are verified
   exactly, so draft precision affects speed only, never the output.

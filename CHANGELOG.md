@@ -17,6 +17,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- A Jetson AGX Orin 64 GB ran both model files on 2026-11-19. With long checks and a 2 GiB prompt cache,
+  repeated text reached 99.07 tokens/s on IQ3_S and 103.69 on UD-IQ3_XXS. Code review generation slowed on
+  both files. Long checks now require `torch.long_copy` on a buffered greedy request.
+  [Fresh prompt and generation tests](docs/performance.md#fresh-prompt-and-generation-tests)
 - On 2026-11-19, a Jetson AGX Orin 64 GB running IQ3_S showed the first output for a new conversation in
   2.28 seconds with 2,073 shared tokens, down from 8.73 seconds on v0.4.0. With 10,000 shared tokens, the time
   fell from 38.35 to 2.07 seconds. On fresh prompts, generation was 0.44–0.86 tokens per second slower.
@@ -26,8 +30,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 - All 2,304 generated token IDs from nine fresh requests matched v0.4.0. All 30 cache restore checks passed
   at lengths up to 70,000 tokens. Both supported model files passed their output reference checks.
-- The required GPU bandwidth check is still open. In a paired test, each build missed the target in 32 of 61
-  large cases on IQ3_S and 17 of 32 on UD-IQ3_XXS.
+- The 153 GB/s GPU bandwidth check remains open. The build tested on 2026-11-19 fell below the limit in 35 of 61
+  large cases on IQ3_S and 18 of 33 on UD-IQ3_XXS. The release stays in draft.
 
 ## [0.4.0] - 2026-11-16
 

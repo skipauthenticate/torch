@@ -22,19 +22,32 @@ speculative decoding changes the speed, never the tokens.
 
 ## Speed
 
-On 2026-11-19, a Jetson AGX Orin 64 GB ran IQ3_S with a 262,144-token context. Prompt processing (PP) measures
-how fast the server reads input tokens. Generation measures how fast it produces output tokens. All rates below are
-in tokens per second. Each value is the median of three fresh 4,096-token prompts with 256 output tokens each.
+**v0.4.0 is the current release. The v0.5.0 draft is on hold.**
+On 2026-11-19, one Jetson AGX Orin 64 GB ran v0.4.0 and an experimental build with a 2 GiB prompt cache.
+The build checked up to 256 positions at once when an answer copied an earlier passage.
+Prompt processing (PP) measures input tokens per second. Generation measures output tokens per second.
+Each value is the median of three fresh requests. Each request had 4,096 input tokens and 256 output tokens.
+The server used the full 262,144-token context and reported zero cached input tokens for each timed request.
 
-| Workload | v0.4.0 PP | 2 GiB cache PP | v0.4.0 generation | 2 GiB cache generation |
-| --- | ---: | ---: | ---: | ---: |
-| Code review | 289.32 | 287.63 | 36.94 | 36.50 |
-| Prose | 272.65 | 270.78 | 33.50 | 32.70 |
-| Repetition | 273.23 | 271.27 | 51.08 | 50.22 |
+| Model file | Workload | v0.4.0 PP | Trial PP | v0.4.0 generation | Trial generation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| IQ3_S | Code review | 285.28 | 299.96 | 36.18 | 33.84 |
+| IQ3_S | Prose | 268.66 | 281.41 | 32.50 | 32.19 |
+| IQ3_S | Repetition | 269.45 | 282.20 | 49.43 | 99.07 |
+| UD-IQ3_XXS | Code review | 286.86 | 289.70 | 33.53 | 32.88 |
+| UD-IQ3_XXS | Prose | 270.46 | 271.59 | 31.39 | 31.91 |
+| UD-IQ3_XXS | Repetition | 270.60 | 272.16 | 46.78 | 103.69 |
 
-All 2,304 generated token IDs matched v0.4.0. The cache held 16,508 experts in memory. The release held 17,548.
+On repetition, generation speed increased by 100% on IQ3_S and 122% on UD-IQ3_XXS.
+All 4,608 benchmark output token IDs matched v0.4.0. Large GPU operations on both model files still miss
+the release bandwidth requirement.
 
-When a new conversation reused a 2,073-token system prompt and tool definitions, time to first visible output
+With the extra cache off, a second IQ3_S test measured 35.52 generated tokens/s for code review, 32.45 for prose,
+and 105.56 for repetition. The paired v0.4.0 rates were 34.11, 32.22, and 49.15. During repetition, the median
+longest interval between output groups rose from 0.14 to 2.13 seconds. The draft now uses short checks by default.
+[Rates, output checks, and GPU measurements](docs/performance.md#fresh-prompt-and-generation-tests)
+
+In an earlier cache test, a new conversation reused a 2,073-token system prompt and tool definitions. Time to first visible output
 fell from 8.73 to 2.28 seconds. With 10,000 shared tokens, it fell from 38.35 to 2.07 seconds. The first conversation
 with the 2,073-token prompt took 1.64 seconds longer to start with the cache. Disk caching requires an explicit
 directory. [Paired measurements](docs/performance.md#saved-prompts)
