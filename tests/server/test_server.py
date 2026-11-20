@@ -289,12 +289,18 @@ class Basic(unittest.TestCase):
 
     def test_long_copy_for_buffered_greedy_text(self):
         answer("x")
-        for fields, expected in [({}, 2), ({"stream": True}, 1), ({"stop": ["END"]}, 1), ({"temperature": 0.7}, 1),
-                                 ({"torch": {"speculative": False}}, 0)]:
+        use = {"torch": {"long_copy": True}}
+        tool = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+        for fields, expected in [({}, 1), (use, 2), (use | {"stream": True}, 1), (use | {"stop": ["END"]}, 1),
+                                 (use | {"temperature": 0.7}, 1), (use | {"tools": [tool]}, 1),
+                                 ({"torch": {"long_copy": True, "speculative": False}}, 0)]:
             with self.subTest(fields=fields):
                 status, _ = self.s.chat({"reasoning_effort": "none", "temperature": 0} | fields)
                 self.assertEqual(status, 200)
                 self.assertEqual(last_params().speculative, expected)
+        status, response = self.s.chat({"torch": {"long_copy": "false"}})
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["param"], "torch")
 
     def test_session(self):
         answer("Paris.")

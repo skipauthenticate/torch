@@ -48,7 +48,7 @@ def main(argv=None):
     p.add_argument("--fast-prefill", action="store_true",
                    help="prompts' BF16 products on the tensor cores, the activations rounded to BF16: a shorter time to "
                         "the first token, but a greedy answer can differ from the default's")
-    p.add_argument("--prefix-memory-gib", type=float, default=2.0,
+    p.add_argument("--prefix-memory-gib", type=float, default=0.0,
                    help="extra memory for reusable prompt boundaries in GiB (default %(default)g, zero disables the extra memory pool)")
     p.add_argument("--prefix-disk", type=Path, help="enable disk checkpoints in this private directory (mode 0700)")
     p.add_argument("--prefix-disk-gib", type=float, help="disk checkpoint limit in GiB (default 8 with --prefix-disk)")

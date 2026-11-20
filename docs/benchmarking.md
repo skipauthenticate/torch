@@ -50,3 +50,6 @@ Report each workload separately. Averages hide the difference between predictabl
 - Fresh prompts (the generator adds a nonce), so prefix caching cannot help.
 - One run is a screening result; confirm a gain with a repeat run before claiming it.
 - Report outliers (a request much slower than the others) instead of dropping them.
+- For v0.5.0, each reported metric must meet the v0.4.0 result. Compare each model file and workload separately.
+  Repeat lower results with the run order reversed. Keep the release in draft while a regression or a required check
+  remains open.

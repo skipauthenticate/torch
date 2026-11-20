@@ -64,6 +64,7 @@ There is no `/v1/completions`.
 | `reasoning.enabled`, `reasoning.effort` | Another spelling some clients send: `enabled: false` or `effort: "none"` turns thinking off, and an effort maps as `reasoning_effort`'s does; `reasoning_effort` wins when both are given |
 | `chat_template_kwargs.enable_thinking` | true or false; wins over `reasoning_effort` and `reasoning` |
 | `torch.speculative` (extension) | false: decode one token at a time for this request (default: speculative when the server has a draft file; the tokens are the same either way) |
+| `torch.long_copy` (extension) | Set to `true` to check up to 256 positions at once when the answer copies an earlier passage. The default is `false`. This option applies to buffered greedy text with speculation enabled. Streaming, tools, custom stops, and sampling use short checks. |
 | `torch.token_ids` (extension) | true: the answer's token ids in `torch.token_ids` |
 
 The defaults are the model file's recommended sampling (temperature 1.0, top_k 20, top_p 0.95). Thinking is on unless
@@ -154,10 +155,10 @@ Send the whole conversation with each request. The server marks the end of the s
 of the stable conversation history. A checkpoint saves the model state at one of these token positions. The engine
 uses the longest saved prefix that exactly matches the request's token ids. It feeds the remaining tokens.
 
-The server reserves 2 GiB for checkpoints by default. A new conversation can reuse a system block. A title request
-can use a different prompt, then the next conversation turn can restore its saved history. The engine keeps the
-current and previous turn while space permits. It gives shared blocks priority when it needs to free space.
-`--prefix-memory-gib 0` with disk caching off keeps only the immediately preceding stable turn.
+By default, the server keeps the immediately preceding stable turn. It reserves no extra memory for checkpoints.
+Set `--prefix-memory-gib 2` to reserve 2 GiB for multiple conversations. A new conversation can then reuse a system
+block. After a title request, the next conversation turn can restore its saved history. The engine keeps the current
+and previous turn while space permits. It gives shared blocks priority when it needs to free space.
 
 The response's `torch.cached_tokens` counts the tokens the engine skipped. `torch.restored` is null for a fresh
 prompt. It is `arena` when the required rows are still in place, `memory` for rows copied back from memory, or

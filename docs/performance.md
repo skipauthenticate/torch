@@ -112,7 +112,7 @@ The client timed the first visible output. The times include the work to save or
 | 10,000 | Return after a title | 38.40 s | 1.33 s | 10,110 |
 | 10,000 | Third turn | 38.50 s | 1.38 s | 10,138 |
 
-The 2 GiB default restored the complete previous turn on all six returns. All 14 requests matched their own
+The 2 GiB cache restored the complete previous turn on all six returns. All 14 requests matched their own
 fresh release process. The 1 GiB trial kept the shared 10,000 tokens and sometimes discarded the rest of the turn.
 The 1.25 and 1.5 GiB trials also lost the last turn in the longer series. The first conversation took longer because
 the engine split its prompt at the system boundary. Disk storage requires an explicit directory.

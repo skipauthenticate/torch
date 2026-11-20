@@ -428,7 +428,10 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError(400, "stop must be a string or a list of up to 16 non-empty strings.", "stop")
 
         stream = body.get("stream") is True
-        params["long_copy"] = params["speculative"] and not (stream or stops or schemas or params["sample"])
+        long_copy = ext.get("long_copy", False)
+        if not isinstance(long_copy, bool):
+            raise RequestError(400, "torch.long_copy must be true or false.", "torch")
+        params["long_copy"] = long_copy and params["speculative"] and not (stream or stops or schemas or params["sample"])
         options = body.get("stream_options") or {}
         usage = stream and isinstance(options, dict) and options.get("include_usage") is True
         output = Output(s.chat, thinking, stops, schemas, body.get("parallel_tool_calls") is not False)

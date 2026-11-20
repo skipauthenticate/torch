@@ -10,7 +10,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Conversations can reuse a shared system prompt and tool definitions. A conversation can also resume its previous
-  turn after a title request. The server reserves 2 GiB for saved prompts by default. Disk caching requires an
+  turn after a title request. Set `--prefix-memory-gib 2` to reserve 2 GiB for saved prompts. Disk caching requires an
   explicit directory. [Server settings](docs/server.md#sessions)
 - Version 3 of the C interface accepts checkpoint positions, reports which storage tier the engine used, and
   lets callers clear saved prompts. The engine also accepts the smaller structures from versions 1 and 2.
