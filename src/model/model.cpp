@@ -1032,7 +1032,7 @@ struct Model::Impl {
             kernels::Q8Columns xc{};
             for (int i = 0; i < nq; ++i) {
                 const Matrix& m = *q8[i].m;
-                if (wide && kernels::gemm_q8_supports(m.type) && kernels::gemm_q8_fits(m.cols)) {
+                if (wide && kernels::gemm_q8_can_run(m.type, m.cols, columns)) {
                     if (xc.q == nullptr) {
                         xc = kernels::q8_columns_at(ops->q8_columns, m.cols / 32, columns);
                         kernels::q8_to_columns(xq, xc, stream);
