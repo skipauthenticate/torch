@@ -908,24 +908,29 @@ struct BfArgs {
     int columns;
     float silu_scale;  // non-zero: w's rows store silu(silu_scale * sum)
     const uint4* packed = nullptr;
+    const float4* packed_x = nullptr;
 };
 
-// Store consecutive rows of a weight tile together. A warp of the product then reads one contiguous set of chunks.
-__global__ void pack_bf16_kernel(BfArgs a, uint4* out) {
-    constexpr int tile = 16;
+// Store the same 16-byte chunks in the order the product reads them across rows or input columns.
+template <bool kInput>
+__global__ void pack_bf16_tiles(BfArgs a, uint4* out) {
+    constexpr int tile = 16, pitch = kInput ? kBfCols : kBfRows;
     __shared__ uint4 values[tile][tile + 1];
     const int x = threadIdx.x % tile, y = threadIdx.x / tile;
     const int chunk0 = blockIdx.x * tile, row0 = blockIdx.y * tile;
-    const int row = min(row0 + y, a.total - 1);
-    const auto* w = reinterpret_cast<const uint4*>(row < a.rows ? a.w : a.w2);
-    const int source = row < a.rows ? row : row - a.rows;
-    if (chunk0 + x < a.chunks)
-        values[y][x] = w[int64_t{source} * a.chunks + chunk0 + x];
+    const int width = kInput ? a.chunks * 2 : a.chunks;
+    const int row = min(row0 + y, (kInput ? a.columns : a.total) - 1);
+    const uint4* src;
+    if constexpr (kInput)
+        src = reinterpret_cast<const uint4*>(a.x) + int64_t{row} * width;
+    else
+        src = row < a.rows ? reinterpret_cast<const uint4*>(a.w) + int64_t{row} * width
+                           : reinterpret_cast<const uint4*>(a.w2) + int64_t{row - a.rows} * width;
+    if (chunk0 + x < width)
+        values[y][x] = src[chunk0 + x];
     __syncthreads();
-    if (chunk0 + y < a.chunks) {
-        const int64_t base = (int64_t{row0 / kBfRows} * a.chunks + chunk0 + y) * kBfRows;
-        out[base + row0 % kBfRows + x] = values[x][y];
-    }
+    if (chunk0 + y < width)
+        out[(int64_t{row0 / pitch} * width + chunk0 + y) * pitch + row0 % pitch + x] = values[x][y];
 }
 
 __device__ __forceinline__ float bf16_value(uint32_t v) {
@@ -977,7 +982,9 @@ __device__ __forceinline__ void bf_fold(float (&node)[5][4][4], float (&acc)[4][
 // a pass's last chunk its sums join the tree: a binary counter over the passes, level t combining when 2^(t + 1) passes
 // are done, which with the bit-reversed order pairs lanes l and l ^ 16 first, then ^ 8, ^ 4, ^ 2, ^ 1, as warp_sum
 // does. Every lane has a chunk (chunks >= 32), so no pass is empty.
-template <bool kPacked>
+enum class BfLayout { Original, Weights, WeightsAndInput };
+
+template <BfLayout layout>
 __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
     extern __shared__ uint4 bf_shared[];
     BfStage* stage = reinterpret_cast<BfStage*>(bf_shared);
@@ -1008,7 +1015,7 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
         for (int k = 0; k < 2; ++k) {
             const int j = (static_cast<int>(threadIdx.x) + k * kBfThreads) / kBfRows;
             const int chunk = j < n ? order[f0 + j] & ~kBfLast : 0;
-            if constexpr (kPacked) {
+            if constexpr (layout != BfLayout::Original) {
                 const int row = (threadIdx.x + k * kBfThreads) % kBfRows;
                 l.w[k] =
                     j < n ? a.packed[(int64_t{blockIdx.y} * a.chunks + chunk) * kBfRows + row] : make_uint4(0, 0, 0, 0);
@@ -1019,10 +1026,16 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
         for (int k = 0; k < 4; ++k) {
             const int f = static_cast<int>(threadIdx.x) + k * kBfThreads, c = f % kBfCols, j = f / kBfCols / 2,
                       h = f / kBfCols % 2;
-            const int col = min(col0 + c, a.columns - 1);
-            l.x[k] = j < n ? *reinterpret_cast<const float4*>(
-                                 a.x + (int64_t{col} * a.chunks + (order[f0 + j] & ~kBfLast)) * 8 + 4 * h)
-                           : make_float4(0, 0, 0, 0);
+            if constexpr (layout == BfLayout::WeightsAndInput) {
+                const int vector = j < n ? (order[f0 + j] & ~kBfLast) * 2 + h : 0;
+                l.x[k] = j < n ? a.packed_x[(int64_t{blockIdx.x} * a.chunks * 2 + vector) * kBfCols + c]
+                               : make_float4(0, 0, 0, 0);
+            } else {
+                const int col = min(col0 + c, a.columns - 1);
+                l.x[k] = j < n ? *reinterpret_cast<const float4*>(
+                                     a.x + (int64_t{col} * a.chunks + (order[f0 + j] & ~kBfLast)) * 8 + 4 * h)
+                               : make_float4(0, 0, 0, 0);
+            }
         }
     };
     const auto store = [&](const BfLoads& l, BfStage& st) {
@@ -1176,22 +1189,31 @@ void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, i
     const size_t shared = 2 * sizeof(BfStage) + sizeof(uint16_t) * static_cast<size_t>(a.chunks);
     const dim3 grid(static_cast<unsigned>((columns + kBfCols - 1) / kBfCols),
                     static_cast<unsigned>((a.end + kBfRows - 1) / kBfRows));
-    const auto run = [&]<bool packed>() {
+    const auto run = [&]<BfLayout layout>() {
         static size_t allowed = 0;
         if (shared > allowed) {
-            TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel<packed>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel<layout>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                   static_cast<int>(shared)));
             allowed = shared;
         }
-        gemm_bf16_kernel<packed><<<grid, kBfThreads, shared, stream>>>(a);
+        gemm_bf16_kernel<layout><<<grid, kBfThreads, shared, stream>>>(a);
     };
-    if (columns >= 256 && workspace && size_t{grid.y} * kBfRows * cols * 2 <= workspace_bytes) {
+    const size_t weight_bytes = size_t{grid.y} * kBfRows * cols * 2;
+    if (columns >= 256 && workspace && weight_bytes <= workspace_bytes) {
         auto* weights = static_cast<uint4*>(workspace);
-        pack_bf16_kernel<<<dim3((a.chunks + 15) / 16, grid.y * (kBfRows / 16)), 256, 0, stream>>>(a, weights);
+        pack_bf16_tiles<false><<<dim3((a.chunks + 15) / 16, grid.y * (kBfRows / 16)), 256, 0, stream>>>(a, weights);
         a.packed = weights;
-        run.template operator()<true>();
+        const size_t input_bytes = size_t{grid.x} * kBfCols * cols * sizeof(float);
+        if (input_bytes <= workspace_bytes - weight_bytes) {
+            auto* input = reinterpret_cast<uint4*>(static_cast<uint8_t*>(workspace) + weight_bytes);
+            pack_bf16_tiles<true>
+                <<<dim3((2 * a.chunks + 15) / 16, grid.x * (kBfCols / 16)), 256, 0, stream>>>(a, input);
+            a.packed_x = reinterpret_cast<const float4*>(input);
+            run.template operator()<BfLayout::WeightsAndInput>();
+        } else
+            run.template operator()<BfLayout::Weights>();
     } else
-        run.template operator()<false>();
+        run.template operator()<BfLayout::Original>();
 }
 
 int expert_slots(int n_expert, int routes) {

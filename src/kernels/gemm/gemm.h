@@ -124,7 +124,7 @@ void upload_gemm_tables();
 inline bool gemm_bf16_wins(int cols) {
     return cols >= 256;
 }
-// For long prompts an optional 16-byte-aligned scratch buffer holds a reordered copy of the weight bits.
+// For long prompts an optional 16-byte-aligned scratch buffer holds the reordered weights and inputs that fit.
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
                cudaStream_t stream, const uint8_t* w2 = nullptr, int rows2 = 0, float* y2 = nullptr,
                void* workspace = nullptr, size_t workspace_bytes = 0);

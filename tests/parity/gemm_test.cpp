@@ -253,7 +253,9 @@ void check_bf16(int rows, int cols, int columns, float silu_scale, uint32_t seed
                                 want.get() + static_cast<size_t>(c) * rows,
                                 want2.get() + static_cast<size_t>(c) * static_cast<size_t>(rows2), nullptr, silu_scale,
                                 1);
-    DeviceBuffer<uint8_t> packed(columns >= 256 ? static_cast<size_t>((total + 63) / 64) * 64 * cols * 2 : 1);
+    const size_t weight_bytes = static_cast<size_t>((total + 63) / 64) * 64 * cols * 2;
+    const size_t input_bytes = static_cast<size_t>((columns + 63) / 64) * 64 * cols * sizeof(float);
+    DeviceBuffer<uint8_t> packed(columns >= 256 ? weight_bytes + input_bytes : 1);
     kernels::gemm_bf16(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2, got2.get(),
                        packed.get(), packed.bytes());
     std::vector<float> a = want.download(), b = got.download();
