@@ -25,6 +25,7 @@ extern "C" {
 #endif
 
 #define TORCH_ENGINE_ABI_VERSION 3
+#define TORCH_ENGINE_SPECULATIVE_BUFFERED 2
 
 typedef enum torch_engine_status {
     TORCH_ENGINE_OK = 0,
@@ -67,12 +68,13 @@ typedef struct torch_engine_options {
 typedef struct torch_engine_params {
     uint32_t struct_size; /* sizeof(torch_engine_params) */
     int32_t max_tokens;   /* tokens to generate, at least 1 */
-    int32_t speculative;  /* nonzero: windows of up to 5 drafts (needs a draft file); the tokens are the same */
-    int32_t sample;       /* zero: greedy (the argmax); nonzero: sampled with the fields below */
-    float temperature;    /* 0 is greedy; penalties still apply */
-    int32_t top_k;        /* 0: off */
-    float top_p;          /* 1: off */
-    float min_p;          /* 0: off */
+    int32_t
+        speculative; /* nonzero enables the draft. TORCH_ENGINE_SPECULATIVE_BUFFERED also checks long copied passages */
+    int32_t sample;  /* zero: greedy (the argmax); nonzero: sampled with the fields below */
+    float temperature;                                             /* 0 is greedy; penalties still apply */
+    int32_t top_k;                                                 /* 0: off */
+    float top_p;                                                   /* 1: off */
+    float min_p;                                                   /* 0: off */
     float repetition_penalty, presence_penalty, frequency_penalty; /* over this request's generated tokens */
     int32_t has_seed;                                              /* zero: a random seed, returned in stats.seed */
     uint64_t seed;

@@ -279,6 +279,21 @@ Result Generator::generate(const Request& r, const Observer& o) {
         out.depth_tried.assign(static_cast<size_t>(limit), 0), out.depth_accepted.assign(static_cast<size_t>(limit), 0);
         std::vector<int32_t> win, a(static_cast<size_t>(limit) + 1);
         std::span<const int32_t> copy;
+        size_t next_wide = 0;
+        const auto next_copy = [&]() -> std::span<const int32_t> {
+            const int depth = static_cast<int>(std::min<size_t>(limit, total - sequence.size() - 1));
+            const auto short_copy = model::matching_continuation(sequence, std::min(depth, model::kMaxColumns - 1));
+            if (!short_copy.empty() && depth >= 127 && sequence.size() >= next_wide) {
+                const auto passage = model::matching_continuation(sequence, depth);
+                const auto stop = [&](int32_t id) {
+                    return id == static_cast<int32_t>(m_.config().eos_token) ||
+                           std::find(r.stop_ids.begin(), r.stop_ids.end(), id) != r.stop_ids.end();
+                };
+                if (!passage.empty() && std::none_of(passage.begin(), passage.end(), stop))
+                    return passage;
+            }
+            return short_copy;
+        };
         while (sequence.size() < total && !(out.cancelled = cancel_now)) {
             const int p = m_.position();           // the window's first position, that of sequence.back()
             int use = static_cast<int>(d.size());  // drafts to verify
@@ -296,9 +311,11 @@ Result Generator::generate(const Request& r, const Observer& o) {
             else
                 for (int j = 0; j < use; ++j)
                     win.push_back(d[static_cast<size_t>(j)].token);
+            const auto passage = copy;
             copy = {};
+            const bool wide = use >= model::kMaxColumns;
             const auto verify_start = Clock::now();
-            if (!m_.verify(win)) {
+            if (!(wide ? m_.prefill(win, std::span(a).first(win.size())) : m_.verify(win))) {
                 if (!m_.cancelled())
                     throw Error(m_.error());
                 out.cancelled = true;
@@ -310,41 +327,62 @@ Result Generator::generate(const Request& r, const Observer& o) {
                 n = static_cast<int>(drawn.size());
                 std::copy(drawn.begin(), drawn.end(), a.begin());
             } else {
-                for (int t = 0; t <= use; ++t)
-                    a[static_cast<size_t>(t)] = m_.argmax(t);
+                if (!wide)
+                    for (int t = 0; t <= use; ++t)
+                        a[static_cast<size_t>(t)] = m_.argmax(t);
                 while (n <= use && win[static_cast<size_t>(n)] == a[static_cast<size_t>(n - 1)] &&
                        a[static_cast<size_t>(n - 1)] != static_cast<int32_t>(m_.config().eos_token))
                     ++n;
             }
             for (int j = 0; j < std::min(use, n); ++j)  // draft j was verified with every earlier one accepted
                 ++out.depth_tried[static_cast<size_t>(j)], out.depth_accepted[static_cast<size_t>(j)] += j < n - 1;
-            if (n <= use && !m_.accept(n))
+            if (!wide && n <= use && !m_.accept(n))
                 throw Error(m_.error());
             const double this_verify_ms = ms_since(verify_start);
             out.verify_ms += this_verify_ms;
             if (++out.windows == r.cancel_after)
                 m_.cancel();
             progress();
-            out.window_tokens += n, out.verified_drafts += use;
+            out.verified_drafts += use;
+            if (wide && n <= use) {  // the chunk restored its input state after the first mismatch
+                next_wide = sequence.size() + 128;
+                copy = passage.first(model::kMaxColumns - 1);
+                continue;
+            }
+            out.window_tokens += n;
             const size_t before = sequence.size();
             sequence.insert(sequence.end(), a.begin(), a.begin() + n);
             const size_t counted = std::min<size_t>(static_cast<size_t>(n), total - before);
             generated(std::span(sequence.data() + before, counted));
-            if (const size_t stop = stops(std::span(sequence.data() + before, counted)); stop > 0)
-                total = before + stop, out.stopped = true, out.stop_window = n,
-                out.stop_column = static_cast<int>(stop) - 1;
-            const auto extend_start = Clock::now();
-            if (sequence.size() < total) {
-                if (adaptive && !r.sample)
-                    copy = model::matching_continuation(
-                        sequence, static_cast<int>(std::min<size_t>(limit, total - sequence.size() - 1)));
-                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), copy.empty() ? r.spec : 0, d,
-                            stop_early ? more : std::function<bool(int, float)>());
-                out.extended = p + n - 1;
-            } else {  // the request's end: the K/V-only pass over its last window, for the drafts of a request that
-                      // follows
-                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), 0, scratch);
+            // Keep callbacks as responsive to stop IDs and caller stops as the ordinary windows.
+            for (size_t at = 0; at < counted; at += model::kMaxColumns) {
+                const auto group =
+                    std::span(sequence.data() + before + at, std::min<size_t>(model::kMaxColumns, counted - at));
+                if (const size_t stop = stops(group); stop > 0) {
+                    total = before + at + stop;
+                    out.stopped = true;
+                    out.stop_window = n;
+                    out.stop_column = static_cast<int>(at + stop) - 1;
+                    break;
+                }
             }
+            const auto extend_start = Clock::now();
+            const bool continuing = sequence.size() < total;
+            if (continuing && adaptive && !r.sample)
+                copy = next_copy();
+            const int extend = wide ? static_cast<int>(std::min<size_t>(n, total - before)) : n;
+            for (int g = 0; g < extend; g += model::kMaxColumns) {
+                const int count = std::min(extend - g, model::kMaxColumns);
+                const bool last = g + count == extend;
+                const int depth = continuing && last && copy.empty() ? r.spec : 0;
+                if (wide)
+                    m_.stage_residuals(g, count);
+                draft_->run(0, p + g, std::span(a).subspan(static_cast<size_t>(g), static_cast<size_t>(count)), depth,
+                            continuing && last ? d : scratch,
+                            depth && stop_early ? more : std::function<bool(int, float)>());
+            }
+            if (continuing)
+                out.extended = p + n - 1;
             const double this_extend_ms = ms_since(extend_start);
             out.extend_ms += this_extend_ms;
             if (adaptive && !used_copy && copy.empty())

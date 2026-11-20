@@ -136,7 +136,10 @@ public:
     // Runs 1 to Options::prefill_columns prompt tokens at the next positions as one prefill chunk (milestone M6) and
     // keeps them all; every token's state is bitwise what feeding them in windows gives. Afterwards argmax(0) and
     // logits(0) are the last token's. Errors as decode().
-    bool prefill(std::span<const int32_t> tokens) noexcept;
+    // A nonempty predictions span checks each position. A mismatch rewinds before the chunk.
+    // A complete match keeps the chunk. Both outcomes preserve the preceding prompt checkpoint.
+    bool prefill(std::span<const int32_t> tokens, std::span<int32_t> predictions = {}) noexcept;
+    int copy_window_limit() const noexcept;  // largest proposal that fits the existing prompt workspace
     // Copies the 4-stream residual of columns first .. first + n - 1 (n <= kMaxColumns) of the last prefill chunk to
     // residual(0 .. n - 1), for the draft layer's passes over the chunk. Throws Error when out of range.
     void stage_residuals(int first, int n);

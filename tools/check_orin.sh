@@ -95,6 +95,10 @@ PY
     else echo "FAIL --fast-prefill changes between runs or chunk sizes"; failed=1; fi
 else echo "FAIL a --fast-prefill run"; failed=1; fi
 
+if ./build/tests/copy_window_test "$TORCH_MODEL" > "$out/copy.log" 2>&1; then
+    echo "ok   long copied passages match single-token generation after acceptance and rejection"
+else echo "FAIL long copied passages"; tail -10 "$out/copy.log"; failed=1; fi
+
 if ./build/torch_bench_kernels "$TORCH_MODEL" --json "$out/kernels.json" > "$out/kernels.txt" 2>&1; then
     if [ "${TORCH_KERNEL_GATES:-}" = report ]; then python3 bench/kernel_gates.py "$out/kernels.json" || true
     else python3 bench/kernel_gates.py "$out/kernels.json" || failed=1; fi

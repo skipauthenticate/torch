@@ -67,6 +67,9 @@ if(TORCH_CUDA)
   add_test(NAME prefix_disk COMMAND prefix_disk_test)
   set_tests_properties(prefix_disk PROPERTIES LABELS parity)
 
+  add_executable(copy_window_test model/copy_window_test.cpp)
+  target_link_libraries(copy_window_test PRIVATE torch_engine)
+
   add_executable(torch_engine_test api/torch_engine_test.c)
   set_target_properties(torch_engine_test PROPERTIES C_STANDARD 11)
   target_compile_options(torch_engine_test PRIVATE -Wall -Wextra $<$<BOOL:${TORCH_WERROR}>:-Werror>)

@@ -166,6 +166,8 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
                                            static_cast<PrefixKind>(p->checkpoint_kinds[i]));
         r.spec = p->speculative ? kSpecDrafts : 0;
         r.copy_depth = p->speculative ? model::kMaxColumns - 1 : 0;
+        if (p->speculative == TORCH_ENGINE_SPECULATIVE_BUFFERED && !p->sample)
+            r.copy_depth = std::max(r.copy_depth, e->model->copy_window_limit() - 1);
         r.draft_depth = r.spec;  // without speculation the draft layer only keeps its K/V rows
         r.swaps_after_prompt = e->swaps;
         r.window = model::kMaxColumns;

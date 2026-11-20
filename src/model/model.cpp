@@ -100,6 +100,7 @@ struct Buffers {
     std::vector<uint16_t*> k_cache, v_cache;    // attention layers: [context][kv heads x head dim], F16
     std::vector<float*> conv_state, ssm_state;  // DeltaNet layers: [3][channels]; [v heads][128][128]
     float* ple_history = nullptr;               // [9][hc x n_embd]
+    uint64_t head_scratch_bytes = 0;            // prompt mixer storage that the final vocabulary product can reuse
     uint64_t state_bytes = 0;
     // A window reads the DeltaNet state from one buffer and writes the state after it to the other; which is which
     // flips with every window (Impl::parity). Each DeltaNet layer keeps its window's inputs, which accept() needs to
@@ -175,6 +176,7 @@ struct Buffers {
         qkv = conv_out = beta = alpha = nullptr;  // a window's; a chunk's DeltaNet inputs are win_* below
         const uint64_t region = d.mark();
         xn = d.cols<float>(HCD), lo = d.cols<float>(static_cast<size_t>(c.hc_rank)), hc_gate = d.cols<float>(HCD);
+        head_scratch_bytes = d.mark() - region;
         d.rewind(region);  // DeltaNet: one set of inputs for every layer (each layer commits its history at once)
         float *qkv_in = d.take<float>(N * CC), *conv_in = d.take<float>(N * CC);
         float *alpha_in = d.take<float>(N * HV), *beta_in = d.take<float>(N * HV);
@@ -1792,8 +1794,8 @@ struct Model::Impl {
     // kernels capped at kMaxColumns (matrix products, the expert gate and expert kernels, attention and the indexer)
     // run on groups of that many columns in order, so every column is bitwise what feeding the tokens in windows of
     // kMaxColumns gives. The chunk is kept whole: each DeltaNet layer commits its convolution history right after it,
-    // the PLE ring at the end. Only the last column runs the output head; argmax(0) and logits(0) are its.
-    void prefill(std::span<const int32_t> tokens) {
+    // the PLE ring at the end. Prompt processing scores the last column. A copied passage needs scores at every column.
+    void prefill(std::span<const int32_t> tokens, std::span<int32_t> predictions) {
         const auto start = Clock::now();
         if (dstage_times && std::any_of(dstage_windows.begin(), dstage_windows.end(), [](int w) { return w > 0; }))
             report_windows();  // the windows of the previous request
@@ -1809,9 +1811,14 @@ struct Model::Impl {
                             std::to_string(cfg.n_vocab) + ".");
         if (history.size() + tokens.size() > static_cast<size_t>(context))
             throw Error("The context of " + std::to_string(context) + " tokens is full; start a new sequence.");
+        const bool checking = !predictions.empty();
+        if (checking && (predictions.size() != tokens.size() || n > copy_window_limit()))
+            throw Error("The copy window exceeds the prompt workspace.");
+        std::vector<kernels::ArgmaxResult> scores(predictions.size());
         if (window_open)
             commit(window);
-        snapshot_at = -1;  // until this chunk is in: a failed chunk leaves the sequence to reset()
+        if (!checking)
+            snapshot_at = -1;  // until this chunk is in: a failed chunk leaves the sequence to reset()
         std::fill(layer_grouped.begin(), layer_grouped.end(), 0);
         const int E = cfg.n_embd;
         window_start = history.size();
@@ -1832,13 +1839,17 @@ struct Model::Impl {
         });
         store->before_window();
         reclaim_chunk();  // the chunk's buffers are written below
+        // The unused residual columns hold the state before a proposed continuation.
+        auto* undo = reinterpret_cast<uint8_t*>(chunk.res + static_cast<size_t>(n) * cfg.hc * E);
+        if (checking)
+            copy_snapshot(true, undo);
         while (!lend_regions.empty() && lend_mark < context &&
                window_start + static_cast<size_t>(n) > static_cast<size_t>(lend_mark))
             unlend();  // the chunk writes K/V rows at or past the lend mark
         plan_reads(n);
         prefilling = true;
         try {
-            enqueue_chunk(n);
+            enqueue_chunk(n, scores);
         } catch (...) {
             prefilling = false, ops = &cols[0], b = cols[0];
             if (chunk_ple_read.valid())
@@ -1857,7 +1868,7 @@ struct Model::Impl {
             for (int e = 0; e < cfg.n_expert && layer_grouped[static_cast<size_t>(il)]; ++e)
                 (store->resident(il, e) ? prefill_hits : prefill_misses) +=
                     static_cast<uint64_t>(layer_counts[il * cfg.n_expert + e]);
-        if (lend_chunk_on) {
+        if (lend_chunk_on && !checking) {
             prompt_routes.resize(static_cast<size_t>(cfg.n_layer) * static_cast<size_t>(cfg.n_expert), 0);
             for (int il = 0; il < cfg.n_layer; ++il)
                 for (int e = 0; e < cfg.n_expert && layer_grouped[static_cast<size_t>(il)]; ++e)
@@ -1868,8 +1879,31 @@ struct Model::Impl {
         window = 1;   // logits(0) and argmax(0): the chunk's last token's
         last_logits = chunk_last.logits, first_draw = history.size();
         window_open = false;
-        take_snapshot();
+        if (checking) {
+            std::transform(scores.begin(), scores.end(), predictions.begin(),
+                           [](const auto& best) { return best.index; });
+            const bool match = std::equal(tokens.begin() + 1, tokens.end(), predictions.begin());
+            if (dstage_times)
+                std::fprintf(stderr, "Copied passage of %d positions at %zu: %s\n", n, window_start,
+                             match ? "accepted" : "rejected");
+            if (!match)
+                restore_state(undo, window_start);
+        } else
+            take_snapshot();
         times.total += ms(Clock::now() - start);
+    }
+
+    int copy_window_limit() const noexcept {
+        if (!chunk_cap || fast_prefill || want_logits)
+            return 0;
+        const uint64_t per_residual = sizeof(float) * static_cast<uint64_t>(cfg.hc) * cfg.n_embd;
+        const uint64_t undo_cols = (snapshot_bytes() + per_residual - 1) / per_residual;
+        const uint64_t per_score = sizeof(float) * static_cast<uint64_t>(cfg.n_vocab) +
+                                   sizeof(kernels::ArgmaxResult) * (kernels::kArgmaxBlocks + 1);
+        if (undo_cols >= static_cast<uint64_t>(chunk_cap))
+            return 0;
+        return static_cast<int>(std::min(
+            {uint64_t{256}, static_cast<uint64_t>(chunk_cap) - undo_cols, chunk.head_scratch_bytes / per_score}));
     }
 
     uint64_t snapshot_bytes() const {
@@ -1882,18 +1916,18 @@ struct Model::Impl {
 
     // Copies (to==true) the sequence state to the snapshot, or back; every DeltaNet state goes through ssm_state's
     // place, so a restored state is the one before the next window at parity 0.
-    void copy_snapshot(bool to) {
+    void copy_snapshot(bool to, uint8_t* storage) {
         const Buffers& w = cols[0];
         const auto copy = [&](void* snap, void* live, size_t n) {
             TORCH_CUDA_CHECK(cudaMemcpyAsync(to ? snap : live, to ? live : snap, n, cudaMemcpyDeviceToDevice, stream));
         };
-        copy(snapshot, device, w.state_bytes);
+        copy(storage, device, w.state_bytes);
         const size_t state = sizeof(float) * static_cast<size_t>(cfg.ssm_v_heads) *
                              static_cast<size_t>(cfg.ssm_head_dim) * static_cast<size_t>(cfg.ssm_head_dim);
-        uint8_t* ring = snapshot + w.state_bytes;
+        uint8_t* ring = storage + w.state_bytes;
         for (size_t l = 0; l < w.ssm_state.size(); ++l) {
             if (to && parity && w.ssm_state[l])  // the state before the next window is in ssm_other
-                copy(snapshot + (reinterpret_cast<uint8_t*>(w.ssm_state[l]) - device), w.ssm_other[l], state);
+                copy(storage + (reinterpret_cast<uint8_t*>(w.ssm_state[l]) - device), w.ssm_other[l], state);
             if (!w.idx_ring.empty() && w.idx_ring[l]) {
                 copy(ring, w.idx_ring[l], kernels::kIndexRing * kernels::kIndexDim * sizeof(uint16_t));
                 ring += kernels::kIndexRing * kernels::kIndexDim * sizeof(uint16_t);
@@ -1902,7 +1936,7 @@ struct Model::Impl {
     }
 
     void take_snapshot() {
-        copy_snapshot(true);
+        copy_snapshot(true, snapshot);
         snapshot_at = static_cast<int>(history.size());
     }
 
@@ -1911,11 +1945,15 @@ struct Model::Impl {
     void rewind() {
         if (snapshot_at < 0)
             throw Error("There is no prefill to go back to; start a new sequence.");
-        window_open = false;  // the last window's columns are dropped, not committed
-        copy_snapshot(false);
+        restore_state(snapshot, static_cast<size_t>(snapshot_at));
+    }
+
+    void restore_state(uint8_t* storage, size_t at) {
+        window_open = false;
+        copy_snapshot(false, storage);
         parity = 0;
-        history.resize(static_cast<size_t>(snapshot_at));
-        window = 0;  // no results until the next window
+        history.resize(at);
+        window = 0;
     }
 
     // A wide chunk routes nearly every expert, so each layer's non-resident experts are read ahead, in passes of the
@@ -1942,12 +1980,12 @@ struct Model::Impl {
         }
     }
 
-    void enqueue_chunk(int n) {
+    void enqueue_chunk(int n, std::span<kernels::ArgmaxResult> scores) {
         DeviceLayout last(chunk_device, n - 1, chunk_cap);
         chunk_last.lay_out(last, cfg, context, chunk_cap);
         share_state(chunk_last);
         ops = &chunk, b = chunk;
-        stage(kTotal, [&] { enqueue_chunk_work(n); });
+        stage(kTotal, [&] { enqueue_chunk_work(n, scores); });
     }
 
     // The chunk's PLE rows, once their reads are done, into the chunk's device rows (before the PLE layer reads them).
@@ -1962,7 +2000,7 @@ struct Model::Impl {
                                          cudaMemcpyHostToDevice, stream));
     }
 
-    void enqueue_chunk_work(int n) {
+    void enqueue_chunk_work(int n, std::span<kernels::ArgmaxResult> scores) {
         const int E = cfg.n_embd;
         const size_t N = static_cast<size_t>(n);
         TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk.pos, chunk_pos, sizeof(int32_t) * N, cudaMemcpyHostToDevice, stream));
@@ -1992,6 +2030,22 @@ struct Model::Impl {
         }
         ple_rows_in(n);  // (joined above when a layer is the PLE layer)
         layer_ = -1;
+        if (!scores.empty()) {
+            hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending, n);
+            // The mixer is finished with xn, lo and hc_gate. Their shared region holds the vocabulary results.
+            float* logits = chunk.xn;
+            auto* scratch = reinterpret_cast<kernels::ArgmaxResult*>(logits + static_cast<size_t>(n) * cfg.n_vocab);
+            auto* best = scratch + static_cast<size_t>(n) * kernels::kArgmaxBlocks;
+            matvec(weights->output, chunk.mixed, logits, true, n);
+            kernels::argmax(logits, cfg.n_vocab, scratch, best, stream, n);
+            TORCH_CUDA_CHECK(cudaMemcpyAsync(scores.data(), best, scores.size_bytes(), cudaMemcpyDeviceToHost, stream));
+            TORCH_CUDA_CHECK(cudaMemcpyAsync(hb.argmax, best + n - 1, sizeof(*best), cudaMemcpyDeviceToHost, stream));
+            TORCH_CUDA_CHECK(cudaMemcpyAsync(chunk_last.logits, logits + static_cast<size_t>(n - 1) * cfg.n_vocab,
+                                             sizeof(float) * static_cast<size_t>(cfg.n_vocab), cudaMemcpyDeviceToDevice,
+                                             stream));
+            kernels::ple_commit(chunk.ple_history, chunk.ple_x, cfg.hc * E, chunk.pos, n, stream);
+            return;
+        }
         // The draft reads every residual. Only the last column feeds the output head.
         if (fast_prefill) {
             hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending, n);
@@ -2144,19 +2198,23 @@ bool Model::verify(std::span<const int32_t> tokens) noexcept {
     }
 }
 
-bool Model::prefill(std::span<const int32_t> tokens) noexcept {
+bool Model::prefill(std::span<const int32_t> tokens, std::span<int32_t> predictions) noexcept {
     if ((impl_->cancelled = impl_->cancel_requested.exchange(false))) {
         impl_->error = "The request was cancelled between windows.";
         return false;
     }
     try {
         impl_->error.clear();
-        impl_->prefill(tokens);
+        impl_->prefill(tokens, predictions);
         return true;
     } catch (const std::exception& e) {
         impl_->error = e.what();
         return false;
     }
+}
+
+int Model::copy_window_limit() const noexcept {
+    return impl_->copy_window_limit();
 }
 
 void Model::stage_residuals(int first, int n) {

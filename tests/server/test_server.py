@@ -287,6 +287,15 @@ class Basic(unittest.TestCase):
         self.assertEqual(last_params().speculative, 0)
         self.assertEqual(r["torch"]["token_ids"], CHAT.encode("x") + [IM_END])
 
+    def test_long_copy_for_buffered_greedy_text(self):
+        answer("x")
+        for fields, expected in [({}, 2), ({"stream": True}, 1), ({"stop": ["END"]}, 1), ({"temperature": 0.7}, 1),
+                                 ({"torch": {"speculative": False}}, 0)]:
+            with self.subTest(fields=fields):
+                status, _ = self.s.chat({"reasoning_effort": "none", "temperature": 0} | fields)
+                self.assertEqual(status, 200)
+                self.assertEqual(last_params().speculative, expected)
+
     def test_session(self):
         answer("Paris.")
         _, r1 = self.s.chat({"reasoning_effort": "none"})

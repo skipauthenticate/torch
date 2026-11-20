@@ -106,7 +106,8 @@ class Engine:
                 return 1
 
         stop = (c_int32 * max(1, len(params.get("stop_ids", ()))))(*params.get("stop_ids", ()))
-        p = Params(ctypes.sizeof(Params), params["max_tokens"], int(params.get("speculative", False)),
+        speculation = 2 if params.get("long_copy") else int(params.get("speculative", False))
+        p = Params(ctypes.sizeof(Params), params["max_tokens"], speculation,
                    int(params.get("sample", False)), params.get("temperature", 1.0), params.get("top_k", 0),
                    params.get("top_p", 1.0), params.get("min_p", 0.0), params.get("repetition_penalty", 1.0),
                    params.get("presence_penalty", 0.0), params.get("frequency_penalty", 0.0),
