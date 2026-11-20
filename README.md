@@ -22,54 +22,16 @@ speculative decoding changes the speed, never the tokens.
 
 ## Speed
 
-**v0.4.0 is the current release. The v0.5.0 draft is on hold.**
-One Jetson AGX Orin 64 GB ran both builds on 2026-11-19. Prompt processing (PP) and generation rates are in tokens per second.
-Each row gives the median of three requests. Each request read 4,096 uncached tokens and generated 256 tokens.
-Both servers used the full 262,144-token context. The draft used its default settings.
-
-| Model file | Workload | v0.4.0 PP | Draft PP | v0.4.0 generation | Draft generation |
-| --- | --- | ---: | ---: | ---: | ---: |
-| IQ3_S | Code review | 288.13 | 303.97 | 36.86 | 36.94 |
-| IQ3_S | Prose | 271.05 | 284.55 | 32.99 | 33.16 |
-| IQ3_S | Repetition | 272.13 | 284.82 | 50.90 | 70.17 |
-| UD-IQ3_XXS | Code review | 288.06 | 350.37 | 35.12 | 36.62 |
-| UD-IQ3_XXS | Prose | 271.32 | 323.47 | 33.52 | 33.87 |
-| UD-IQ3_XXS | Repetition | 272.64 | 324.62 | 47.56 | 69.54 |
-
-All 4,608 output token IDs and all 18 answers matched v0.4.0. On UD-IQ3_XXS repetition, the median longest pause between output groups rose from 126 to 163 ms. The draft kept 17,341 experts in memory in that run. v0.4.0 kept 17,406. Both speed targets and the GPU bandwidth requirement remain open. [Default settings and paired measurements](docs/performance.md#default-release-checks)
-
-In an earlier cache test, a new conversation reused a 2,073-token system prompt and tool definitions. Time to first visible output
-fell from 8.73 to 2.28 seconds. With 10,000 shared tokens, it fell from 38.35 to 2.07 seconds. The first conversation
-with the 2,073-token prompt took 1.64 seconds longer to start with the cache. Disk caching requires an explicit
-directory. [Paired measurements](docs/performance.md#saved-prompts)
-
-Earlier v0.4.0 tests measured both model files with the same context and request lengths.
+The v0.5.0 release candidate ran on a Jetson AGX Orin 64 GB. PP means prompt processing.
 
 | Model file | Generation | PP | PP with `--fast-prefill` |
 | --- | ---: | ---: | ---: |
-| IQ3_S (default) | 33.7–53.0 tokens/s | 273–289 tokens/s | 359–390 tokens/s |
-| UD-IQ3_XXS | 33.9–49.0 tokens/s | 272–288 tokens/s | 283–299 tokens/s |
+| IQ3_S (default) | 33.2–70.2 tokens/s | 285–304 tokens/s | Pending |
+| UD-IQ3_XXS | 33.9–69.5 tokens/s | 323–350 tokens/s | Pending |
 
-In those tests, fresh 4,096-token prompts took 14.2–15.1 seconds in the default mode. With `--fast-prefill`,
-they took 10.5–11.4 seconds on IQ3_S and 13.7–14.5 seconds on UD-IQ3_XXS.
-[Benchmark method](docs/benchmarking.md) · [All measurements](docs/performance.md)
+Each range covers the median speeds for code review, prose, and repetition. Each workload used three requests with 4,096 uncached input tokens and 256 output tokens. The context limit was 262,144 tokens.
 
-### Why `--fast-prefill` is off by default
-
-`--fast-prefill` reads the prompt about a quarter faster by running its BF16 matrix products on the GPU's tensor
-cores. To do that it rounds the prompt's activations to BF16 first, and that rounding has costs:
-
-- **Answers can change.** The numbers inside the model come out slightly different. In the earlier v0.4.0
-  benchmark, 7 of 9 answers differed from the default's at some token, often one where two choices were nearly tied.
-- **No exact match with the default path.** By default, reading a prompt in chunks gives bit for bit the same result
-  as feeding it one token at a time, at the model file's own precision. With `--fast-prefill` it does not. Its
-  results are still the same from run to run and at any chunk size.
-- **Long prompts.** On IQ3_S, fast-mode cache restores matched fresh fast-mode runs through 70,000 tokens.
-  Those checks used greedy decoding. Sampled answers in fast mode remain unverified.
-
-On the IQ3_S file, quality stays inside the project's parity limit against the reference implementation either way
-(mean KL 0.00179 with the flag and 0.00143 without, against a limit of 0.00328). Answer speed is the same
-with or without the flag.
+`--fast-prefill` rounds some prompt activations to 16-bit floating point. It can change the generated text. The default uses exact prompt processing. The release candidate is in draft. [Measurements and release checks](docs/performance.md#default-release-checks)
 
 ## Install
 
