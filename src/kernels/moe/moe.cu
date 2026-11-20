@@ -43,13 +43,26 @@ __global__ void router_kernel(const float* logits, int n, int k, int32_t* ids, f
         cand_i[warp * k + rank] = t;
     }
     __syncthreads();
-    if (rank < k) {
-        rank = 0;  // overall
-        for (int c = 0; c < warps * k; ++c)
-            rank += better(cand_v[c], cand_i[c], p, t) ? 1 : 0;
-        if (rank < k) {
-            sel_v[rank] = p;
-            sel_i[rank] = t;
+    const int lane = t % kWarp;
+    for (int r = 0; r < k; ++r) {
+        const float v = cand_v[warp * k + r];
+        const int id = cand_i[warp * k + r];
+        // Each lane counts the better candidates in one sorted warp. Later candidates cannot improve in rank.
+        int lo = 0, hi = lane < warps ? k : 0;
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            const int at = lane * k + mid;
+            if (better(cand_v[at], cand_i[at], v, id))
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        const int overall = __reduce_add_sync(0xffffffffu, lo);
+        if (overall >= k)
+            break;
+        if (lane == 0) {
+            sel_v[overall] = v;
+            sel_i[overall] = id;
         }
     }
     __syncthreads();

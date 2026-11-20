@@ -20,12 +20,13 @@ constexpr double kTolerance = 1e-5;
 
 // The reference order: probability descending, index ascending for equal probabilities.
 void check_router(const char* name, const std::vector<float>& logits) {
+    const int experts = static_cast<int>(logits.size());
     double peak = *std::max_element(logits.begin(), logits.end());
-    std::vector<double> p(kExperts);
+    std::vector<double> p(experts);
     double sum = 0;
-    for (int i = 0; i < kExperts; ++i)
+    for (int i = 0; i < experts; ++i)
         sum += p[i] = std::exp(logits[i] - peak);
-    std::vector<int> order(kExperts);
+    std::vector<int> order(experts);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
     double chosen = 0;
@@ -35,7 +36,7 @@ void check_router(const char* name, const std::vector<float>& logits) {
 
     DeviceBuffer<float> dlogits(logits), dweights(kTopK);
     DeviceBuffer<int32_t> dids(kTopK);
-    kernels::router_top_k(dlogits.get(), kExperts, kTopK, dids.get(), dweights.get(), nullptr);
+    kernels::router_top_k(dlogits.get(), experts, kTopK, dids.get(), dweights.get(), nullptr);
     const std::vector<int32_t> ids = dids.download();
     bool same_ids = true;
     std::vector<double> want(kTopK);
@@ -114,6 +115,8 @@ int main() {
         for (int i : {9, 260, 400})
             ties[i] = 1.0f;  // then three equal runners-up
         check_router("router_top_k ties", ties);
+        check_router("router_top_k partial warp", std::vector<float>(37, 0.0f));
+        check_router("router_top_k one warp", test::random_floats(19, -4, 4, 8));
         check_swiglu();
         check_combine();
         check_table();
