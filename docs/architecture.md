@@ -352,6 +352,8 @@ output and chunk size is free to follow memory. Per stage:
 
 - **Dense quantized products**: the int8 tensor cores (`kernels/gemm`, Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL, Q8_0). Each
   format's formula and its lane order are the one-column kernel's, so each column is bitwise `gemv_q8`.
+  For wide Q8_0 rows, a prompt with at least 64 columns reads each pair of weight blocks directly from memory.
+  The operation uses the existing prompt workspace and the same order of additions.
 - **BF16 x F32 products** (the hyper-connection mixers, the router and the other BF16 matrices): FP32 cores in the
   window order
   (`gemm_bf16`), bitwise `gemv_bf16`. An exact split onto the BF16 tensor cores measured too slow (82-2,695 us per

@@ -17,6 +17,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- On a Jetson AGX Orin 64 GB on 2026-11-19, fresh code review input on UD-IQ3_XXS increased from 288.06 to 350.37 tokens/s. Wide eight-bit prompt products stream their weights. Short verification windows reuse the mixer weights across tokens. [Default release checks](docs/performance.md#default-release-checks)
 - A Jetson AGX Orin 64 GB ran both model files on 2026-11-19. With long checks and a 2 GiB prompt cache,
   repeated text reached 99.07 tokens/s on IQ3_S and 103.69 on UD-IQ3_XXS. Code review generation slowed on
   both files. Long checks now require `torch.long_copy` on a buffered greedy request.

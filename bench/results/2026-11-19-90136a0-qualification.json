@@ -1,0 +1,1485 @@
+{
+  "reference_code": "b51633482e78fca4014753903e26df51d31a4e5d",
+  "candidate_code": "90136a0eab2219ed491af403f34f7b05ae95b039",
+  "device": "NVIDIA Jetson AGX Orin 64 GB",
+  "measurement_dates_pacific": [
+    "2026-11-19"
+  ],
+  "status": "First paired run. Additional release checks are in progress.",
+  "release_ready": false,
+  "context_tokens": 262144,
+  "private_server_free_memory_gib": 9,
+  "input_tokens": 4096,
+  "output_tokens": 256,
+  "default_extra_prefix_memory_gib": 0,
+  "generation_target_tokens_s": 200,
+  "uncached_input_target_tokens_s": 2000,
+  "models": {
+    "IQ3_S": {
+      "matching_requests": 9,
+      "matching_output_ids": 2304,
+      "startup_s": {
+        "v0.4.0": 17.033086,
+        "candidate": 16.980792,
+        "worse": false
+      },
+      "unmeasured": [
+        "max_verify_ms",
+        "checks_over_200ms",
+        "hedged_reads",
+        "grouped_reads"
+      ],
+      "requests_with_lower_results": {
+        "review-1": [
+          "output_tokens_s",
+          "resident_experts",
+          "expert_hit_percent"
+        ],
+        "review-2": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms"
+        ],
+        "review-3": [
+          "output_tokens_s",
+          "resident_experts",
+          "expert_hit_percent",
+          "tokens_per_window",
+          "max_callback_ms"
+        ],
+        "prose-1": [
+          "resident_experts",
+          "expert_hit_percent"
+        ],
+        "prose-2": [
+          "resident_experts",
+          "expert_hit_percent",
+          "tokens_per_window",
+          "max_callback_ms"
+        ],
+        "prose-3": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms"
+        ],
+        "repetition-1": [
+          "resident_experts",
+          "expert_hit_percent",
+          "available_gib"
+        ],
+        "repetition-2": [
+          "resident_experts",
+          "expert_hit_percent",
+          "available_gib"
+        ],
+        "repetition-3": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms",
+          "available_gib"
+        ]
+      },
+      "workloads": {
+        "review": {
+          "input_tokens_s": {
+            "v0.4.0": 288.126055,
+            "candidate": 303.974827,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 36.86,
+            "candidate": 36.94,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 80.455344,
+            "candidate": 80.421555,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.406,
+            "candidate": 2.406,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 21.175568,
+            "candidate": 20.425584,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.21994,
+            "candidate": 13.477438,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 128.827496,
+            "candidate": 137.850624,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.22686,
+            "candidate": 10.239658,
+            "worse": false
+          }
+        },
+        "prose": {
+          "input_tokens_s": {
+            "v0.4.0": 271.053642,
+            "candidate": 284.545221,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 32.99,
+            "candidate": 33.16,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.075698,
+            "candidate": 85.017591,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.297,
+            "candidate": 2.297,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 22.837316,
+            "candidate": 22.090918,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.115319,
+            "candidate": 14.398693,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 88.459486,
+            "candidate": 98.749763,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.160358,
+            "candidate": 10.16309,
+            "worse": false
+          }
+        },
+        "repetition": {
+          "input_tokens_s": {
+            "v0.4.0": 272.134154,
+            "candidate": 284.82421,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 50.9,
+            "candidate": 70.17,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 84.872558,
+            "candidate": 84.758054,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.396,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.111089,
+            "candidate": 18.053519,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.055177,
+            "candidate": 14.384607,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 125.459207,
+            "candidate": 123.99913,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.167137,
+            "candidate": 10.136501,
+            "worse": true
+          }
+        }
+      },
+      "requests": {
+        "review-1": {
+          "input_tokens_s": {
+            "v0.4.0": 286.233403,
+            "candidate": 301.07685,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 30.67,
+            "candidate": 30.43,
+            "worse": true
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 78.000122,
+            "candidate": 77.942043,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.358,
+            "candidate": 2.358,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 22.672034,
+            "candidate": 22.031922,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.312344,
+            "candidate": 13.607026,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 222.509242,
+            "candidate": 220.200611,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 1,
+            "candidate": 1,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.260128,
+            "candidate": 10.271053,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "d43b946705a0f929a1113c3206e8cbcce6598fb19def4a924e035473fa7713cd",
+          "message_sha256": "ba64e414beba6001d269368e2a4a1027363540994888cec0e2c738ff308f5ce4"
+        },
+        "review-2": {
+          "input_tokens_s": {
+            "v0.4.0": 288.176733,
+            "candidate": 303.974827,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 36.86,
+            "candidate": 36.94,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 80.455344,
+            "candidate": 80.421555,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.406,
+            "candidate": 2.406,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 21.175568,
+            "candidate": 20.425584,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.217243,
+            "candidate": 13.477438,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 128.827496,
+            "candidate": 129.642224,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.22686,
+            "candidate": 10.239658,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "59deda1585605c0208daf01ab78ec9fdd06855c400198190eb83218fb78a1e00",
+          "message_sha256": "69d0e7502156cd4b775c9b7e18075541af7b54d984f86c5349370015f7bec53e"
+        },
+        "review-3": {
+          "input_tokens_s": {
+            "v0.4.0": 288.126055,
+            "candidate": 304.374642,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 38.39,
+            "candidate": 37.89,
+            "worse": true
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 81.037984,
+            "candidate": 80.97391,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 3.096,
+            "candidate": 2.91,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 20.904958,
+            "candidate": 20.23374,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.21994,
+            "candidate": 13.461285,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 125.208325,
+            "candidate": 137.850624,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.215694,
+            "candidate": 10.22982,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "243a8d710e87eb3636491cac5d73acf1498ae68929cd7bef1f2e3c6fd91eb892",
+          "message_sha256": "298ff56df36c2153d5bdb3c29ba33df262574567249775fd48b0ccb778fb57ca"
+        },
+        "prose-1": {
+          "input_tokens_s": {
+            "v0.4.0": 270.550547,
+            "candidate": 284.036142,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 32.62,
+            "candidate": 32.76,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 84.681209,
+            "candidate": 84.60295,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.297,
+            "candidate": 2.297,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 23.012027,
+            "candidate": 22.257024,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.143278,
+            "candidate": 14.422983,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 100.010063,
+            "candidate": 98.749763,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.184475,
+            "candidate": 10.187653,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "6afd08524c0aefc666cec7ef96a1036908bcdb0e15ec2c9d3813615e88e58938",
+          "message_sha256": "1510e2fc18fc2b85cbd5405fbada7c1642e18163328ef10d3c1308026ce4ac65"
+        },
+        "prose-2": {
+          "input_tokens_s": {
+            "v0.4.0": 271.053642,
+            "candidate": 284.545221,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 34.44,
+            "candidate": 34.47,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.183743,
+            "candidate": 85.101083,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.318,
+            "candidate": 2.297,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 22.569611,
+            "candidate": 21.846675,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.115319,
+            "candidate": 14.398693,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 85.652963,
+            "candidate": 132.578285,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.159084,
+            "candidate": 10.160133,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "d5e2e5cda11f101cab4a3670a35193c0a3ee64605a56d8800884a09d4496b516",
+          "message_sha256": "04949d7088ca0a0cd8e9057c238f1eef8469790cf320132b5d6c615b3c3adc2c"
+        },
+        "prose-3": {
+          "input_tokens_s": {
+            "v0.4.0": 272.123306,
+            "candidate": 285.517116,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 32.99,
+            "candidate": 33.16,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.075698,
+            "candidate": 85.017591,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.286,
+            "candidate": 2.286,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 22.837316,
+            "candidate": 22.090918,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.0558,
+            "candidate": 14.349565,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 88.459486,
+            "candidate": 89.608714,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.160358,
+            "candidate": 10.16309,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "5615cd1b044d8393ecd7cb9481947e7638f7eec6dc0498cb9d78fa0c515e3608",
+          "message_sha256": "3c489fd073c28ba0930917ca7c2d24f7ac9569a550b5d549e3a63eabd5a9c857"
+        },
+        "repetition-1": {
+          "input_tokens_s": {
+            "v0.4.0": 272.134154,
+            "candidate": 284.679701,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 45.45,
+            "candidate": 63.27,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 84.600651,
+            "candidate": 84.484697,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 3.821,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.70903,
+            "candidate": 18.457937,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.055177,
+            "candidate": 14.390713,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 171.795723,
+            "candidate": 170.760449,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.167137,
+            "candidate": 10.164829,
+            "worse": true
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "38e1590e026f55e41392217f123c90fe7c5d8d783bd2c251cd11ab23a8880cf4",
+          "message_sha256": "d108624446d24ba0a5d2e974dfde76bbee3aee93a2d0c24ba24288c834d2b345"
+        },
+        "repetition-2": {
+          "input_tokens_s": {
+            "v0.4.0": 272.05643,
+            "candidate": 284.82421,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 50.9,
+            "candidate": 70.17,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.019229,
+            "candidate": 84.864112,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.396,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.111089,
+            "candidate": 18.053519,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.05942,
+            "candidate": 14.384607,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 125.459207,
+            "candidate": 123.99913,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.167732,
+            "candidate": 10.133839,
+            "worse": true
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "b9fef54248c3ad55e78d310185d49e006bf4ffefc342d3ed21b953ba5962e47d",
+          "message_sha256": "bd4c96332d7efbbeda8aceeaa62f967fadb200a1a5e71edee668d66c122f7f4b"
+        },
+        "repetition-3": {
+          "input_tokens_s": {
+            "v0.4.0": 272.414688,
+            "candidate": 285.26458,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 54.15,
+            "candidate": 72.21,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17392,
+            "candidate": 17375,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 84.872558,
+            "candidate": 84.758054,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.468,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 19.787821,
+            "candidate": 17.927068,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.039554,
+            "candidate": 14.360837,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 113.683444,
+            "candidate": 117.34444,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.166008,
+            "candidate": 10.136501,
+            "worse": true
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "e363429c98e1d6019dbb43f42af89903c8103b8a0835040a9d4236a118388063",
+          "message_sha256": "6d305bb613fb908ac006a1e9c949cfb36580240b4be849df86bd9ad73a97e055"
+        }
+      },
+      "device_during_requests": {
+        "reference": {
+          "minimum_available_gib": 10.159,
+          "min_gpu_hz": 306000000,
+          "max_gpu_hz": 1300500000,
+          "min_gpu_millicelsius": 50406,
+          "max_gpu_millicelsius": 64937
+        },
+        "candidate": {
+          "minimum_available_gib": 10.134,
+          "min_gpu_hz": 306000000,
+          "max_gpu_hz": 1300500000,
+          "min_gpu_millicelsius": 52500,
+          "max_gpu_millicelsius": 65437
+        }
+      }
+    },
+    "UD-IQ3_XXS": {
+      "matching_requests": 9,
+      "matching_output_ids": 2304,
+      "startup_s": {
+        "v0.4.0": 16.981678,
+        "candidate": 17.082345,
+        "worse": true
+      },
+      "unmeasured": [
+        "max_verify_ms",
+        "checks_over_200ms",
+        "hedged_reads",
+        "grouped_reads"
+      ],
+      "requests_with_lower_results": {
+        "review-1": [
+          "resident_experts",
+          "expert_hit_percent"
+        ],
+        "review-2": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms"
+        ],
+        "review-3": [
+          "resident_experts",
+          "expert_hit_percent",
+          "tokens_per_window"
+        ],
+        "prose-1": [
+          "resident_experts",
+          "expert_hit_percent",
+          "tokens_per_window"
+        ],
+        "prose-2": [
+          "resident_experts",
+          "expert_hit_percent",
+          "tokens_per_window"
+        ],
+        "prose-3": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms"
+        ],
+        "repetition-1": [
+          "resident_experts",
+          "expert_hit_percent",
+          "max_callback_ms"
+        ],
+        "repetition-2": [
+          "resident_experts",
+          "expert_hit_percent"
+        ],
+        "repetition-3": [
+          "resident_experts",
+          "expert_hit_percent"
+        ]
+      },
+      "workloads": {
+        "review": {
+          "input_tokens_s": {
+            "v0.4.0": 288.055136,
+            "candidate": 350.369959,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 35.12,
+            "candidate": 36.62,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 80.723699,
+            "candidate": 80.52437,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.633,
+            "candidate": 2.639,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 21.510547,
+            "candidate": 18.693927,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.223349,
+            "candidate": 11.692778,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 134.570848,
+            "candidate": 120.005009,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.058586,
+            "candidate": 10.244896,
+            "worse": false
+          }
+        },
+        "prose": {
+          "input_tokens_s": {
+            "v0.4.0": 271.315776,
+            "candidate": 323.469718,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 33.52,
+            "candidate": 33.87,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.49068,
+            "candidate": 85.029795,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.277,
+            "candidate": 2.243,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 22.732294,
+            "candidate": 20.218954,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.10049,
+            "candidate": 12.666426,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 111.888803,
+            "candidate": 113.604308,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.000465,
+            "candidate": 10.189381,
+            "worse": false
+          }
+        },
+        "repetition": {
+          "input_tokens_s": {
+            "v0.4.0": 272.644976,
+            "candidate": 324.618201,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 47.56,
+            "candidate": 69.54,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.470335,
+            "candidate": 84.806271,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.059,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.393838,
+            "candidate": 16.27035,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.026968,
+            "candidate": 12.621666,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 125.605096,
+            "candidate": 162.832243,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 9.995274,
+            "candidate": 10.148941,
+            "worse": false
+          }
+        }
+      },
+      "requests": {
+        "review-1": {
+          "input_tokens_s": {
+            "v0.4.0": 286.207403,
+            "candidate": 347.295235,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 30.63,
+            "candidate": 32.32,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 77.870449,
+            "candidate": 77.608288,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.55,
+            "candidate": 2.629,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 22.68233,
+            "candidate": 19.729973,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.313771,
+            "candidate": 11.796485,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 182.847958,
+            "candidate": 181.564202,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.068977,
+            "candidate": 10.249763,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "8a80c6733e73e1a385f5f2647390d2ff9d199cbcc5278c66350f8ceddd7b9fcb",
+          "message_sha256": "c2d9cc185a3a1cbfbc1c98c92fcbb281b1bf8a11da25caaeb35bbd4e4359ac46"
+        },
+        "review-2": {
+          "input_tokens_s": {
+            "v0.4.0": 288.280172,
+            "candidate": 350.369959,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 35.12,
+            "candidate": 36.62,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 80.723699,
+            "candidate": 80.52437,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.633,
+            "candidate": 2.639,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 21.510547,
+            "candidate": 18.693927,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.210729,
+            "candidate": 11.692778,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 97.860313,
+            "candidate": 97.975899,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.058586,
+            "candidate": 10.244896,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "2b8fe280827e554fe7221d370b9af83eb4b59b1206d927839e08d828ce0c1efe",
+          "message_sha256": "00467759b80b8967f300f3a6bd0bf124bdb7777629e8a8508ac24ba96a094392"
+        },
+        "review-3": {
+          "input_tokens_s": {
+            "v0.4.0": 288.055136,
+            "candidate": 350.579878,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 36.57,
+            "candidate": 37.25,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 81.134517,
+            "candidate": 80.899985,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 3.083,
+            "candidate": 2.783,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 21.240728,
+            "candidate": 18.575943,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.223349,
+            "candidate": 11.687468,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 134.570848,
+            "candidate": 120.005009,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.05093,
+            "candidate": 10.242508,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "7bf77071ae4baa0dca7fb58411a2aa8e6beff77e15ba7d45cb7a064b2f31e4ec",
+          "message_sha256": "b019906e0ae190997d63e889878cd8fc451f7a544169ae82d634388c788d2ea4"
+        },
+        "prose-1": {
+          "input_tokens_s": {
+            "v0.4.0": 271.787454,
+            "candidate": 324.119867,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 33.52,
+            "candidate": 33.87,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.391358,
+            "candidate": 84.78281,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.586,
+            "candidate": 2.415,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 22.732294,
+            "candidate": 20.218954,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.074322,
+            "candidate": 12.641206,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 124.55475,
+            "candidate": 113.604308,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.017498,
+            "candidate": 10.215908,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "d765671e0a932d08dbaefda906af829fe0ded99c47749313e201eb096ee11910",
+          "message_sha256": "c6c924f0ec30cfa5155eee36ff3dc5bcac9e7ae13cd31e15bf79763a5e921de5"
+        },
+        "prose-2": {
+          "input_tokens_s": {
+            "v0.4.0": 270.666755,
+            "candidate": 323.469718,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 33.95,
+            "candidate": 34.56,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.832105,
+            "candidate": 85.293865,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.277,
+            "candidate": 2.217,
+            "worse": true
+          },
+          "wall_s": {
+            "v0.4.0": 22.698533,
+            "candidate": 20.095979,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.136804,
+            "candidate": 12.666426,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 111.888803,
+            "candidate": 95.727269,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 9.996811,
+            "candidate": 10.189381,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "5c140963f1eebafb55fc45ec299407296a87651a78524820bf25d88cdbc786fb",
+          "message_sha256": "6740953bb4425d0d01df259c8acbfe61b91f8d5b418c8447de6878c9acdab083"
+        },
+        "prose-3": {
+          "input_tokens_s": {
+            "v0.4.0": 271.315776,
+            "candidate": 322.476519,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 32.32,
+            "candidate": 33.01,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.49068,
+            "candidate": 85.029795,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 2.089,
+            "candidate": 2.243,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 23.042142,
+            "candidate": 20.479499,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.10049,
+            "candidate": 12.704015,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 78.372636,
+            "candidate": 122.023398,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.000465,
+            "candidate": 10.185154,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "841d7d21431d493fef6a492d3778fc32e190dc0bf6842db7889fcb9ab08faf2a",
+          "message_sha256": "87a170bf83ff071b013ff68dd2e9dcb3ee36fba9fffff0fbd86175b695044c10"
+        },
+        "repetition-1": {
+          "input_tokens_s": {
+            "v0.4.0": 272.047396,
+            "candidate": 323.31652,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 45.23,
+            "candidate": 65.89,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.384509,
+            "candidate": 84.675506,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.059,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.74048,
+            "candidate": 16.578277,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.059857,
+            "candidate": 12.67248,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 125.605096,
+            "candidate": 162.832243,
+            "worse": true
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 9.990501,
+            "candidate": 10.175491,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "0b02a5b96201dcdf5978b67d0de52d8b092877e33a1c0071248e37fb0764efb6",
+          "message_sha256": "79035a71f812bc2de447733a7bca1d72850d905770c38094bc546907dd32c674"
+        },
+        "repetition-2": {
+          "input_tokens_s": {
+            "v0.4.0": 273.323591,
+            "candidate": 326.013419,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 47.56,
+            "candidate": 69.54,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.750162,
+            "candidate": 85.112953,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 4.709,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.393838,
+            "candidate": 16.27035,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 14.989683,
+            "candidate": 12.567665,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 188.970706,
+            "candidate": 183.243931,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 9.995274,
+            "candidate": 10.1395,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "b9fef54248c3ad55e78d310185d49e006bf4ffefc342d3ed21b953ba5962e47d",
+          "message_sha256": "bd4c96332d7efbbeda8aceeaa62f967fadb200a1a5e71edee668d66c122f7f4b"
+        },
+        "repetition-3": {
+          "input_tokens_s": {
+            "v0.4.0": 272.644976,
+            "candidate": 324.618201,
+            "worse": false
+          },
+          "output_tokens_s": {
+            "v0.4.0": 51.65,
+            "candidate": 74.39,
+            "worse": false
+          },
+          "resident_experts": {
+            "v0.4.0": 17406,
+            "candidate": 17341,
+            "worse": true
+          },
+          "expert_hit_percent": {
+            "v0.4.0": 85.470335,
+            "candidate": 84.806271,
+            "worse": true
+          },
+          "tokens_per_window": {
+            "v0.4.0": 5.354,
+            "candidate": 7.727,
+            "worse": false
+          },
+          "wall_s": {
+            "v0.4.0": 20.005916,
+            "candidate": 16.083687,
+            "worse": false
+          },
+          "first_callback_s": {
+            "v0.4.0": 15.026968,
+            "candidate": 12.621666,
+            "worse": false
+          },
+          "max_callback_ms": {
+            "v0.4.0": 113.993399,
+            "candidate": 112.393608,
+            "worse": false
+          },
+          "intervals_over_200ms": {
+            "v0.4.0": 0,
+            "candidate": 0,
+            "worse": false
+          },
+          "available_gib": {
+            "v0.4.0": 10.000835,
+            "candidate": 10.148941,
+            "worse": false
+          },
+          "output_tokens": 256,
+          "token_ids_sha256_le32": "e363429c98e1d6019dbb43f42af89903c8103b8a0835040a9d4236a118388063",
+          "message_sha256": "6d305bb613fb908ac006a1e9c949cfb36580240b4be849df86bd9ad73a97e055"
+        }
+      },
+      "device_during_requests": {
+        "reference": {
+          "minimum_available_gib": 9.991,
+          "min_gpu_hz": 306000000,
+          "max_gpu_hz": 1300500000,
+          "min_gpu_millicelsius": 41843,
+          "max_gpu_millicelsius": 60968
+        },
+        "candidate": {
+          "minimum_available_gib": 10.139,
+          "min_gpu_hz": 306000000,
+          "max_gpu_hz": 1300500000,
+          "min_gpu_millicelsius": 49093,
+          "max_gpu_millicelsius": 63812
+        }
+      }
+    }
+  }
+}

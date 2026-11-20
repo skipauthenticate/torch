@@ -95,6 +95,26 @@ Memory: the chunk's activations are 1.55 GiB at 4,096 columns, the read-ahead po
 session snapshot 0.11 GiB, each its own budget line. Long prompts run at about the same rate: 131,001 tokens took
 854.7 s (153 tok/s) and 262,040 took 1,763.6 s (149 tok/s) on 2026-11-11, before the BF16 tuning (the needles below).
 
+## Default release checks
+
+On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 first and the candidate at `90136a0` second. Each process loaded the same model, draft layer and placement. The context was 262,144 tokens. Both test processes kept a 9 GiB free-memory floor. The candidate kept one previous turn and reserved zero extra bytes for shared prompts. The client sent one warm-up and then nine requests to each server. Each timed request read 4,096 uncached input tokens and generated 256 tokens. The table gives the median of three requests per workload in tokens per second.
+
+| Model file | Workload | v0.4.0 PP | Draft PP | v0.4.0 generation | Draft generation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| IQ3_S | Code review | 288.13 | 303.97 | 36.86 | 36.94 |
+| IQ3_S | Prose | 271.05 | 284.55 | 32.99 | 33.16 |
+| IQ3_S | Repetition | 272.13 | 284.82 | 50.90 | 70.17 |
+| UD-IQ3_XXS | Code review | 288.06 | 350.37 | 35.12 | 36.62 |
+| UD-IQ3_XXS | Prose | 271.32 | 323.47 | 33.52 | 33.87 |
+| UD-IQ3_XXS | Repetition | 272.64 | 324.62 | 47.56 | 69.54 |
+
+| Model file | v0.4.0 resident experts | Draft resident experts | v0.4.0 start (s) | Draft start (s) |
+| --- | ---: | ---: | ---: | ---: |
+| IQ3_S | 17,392 | 17,375 | 17.03 | 16.98 |
+| UD-IQ3_XXS | 17,406 | 17,341 | 16.98 | 17.08 |
+
+All 18 answers and all 4,608 output token IDs matched. On UD-IQ3_XXS repetition, the median longest interval between engine output groups increased from 125.61 ms to 162.83 ms. The candidate must meet each v0.4.0 metric and the 153 GB/s bandwidth requirement. The targets are 200 generated tokens/s and 2,000 uncached input tokens/s on each workload. [Per-request measurements and output hashes](../bench/results/2026-11-19-90136a0-qualification.json)
+
 ## Fresh prompt and generation tests
 
 On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 and an experimental build at `c4abe94`.
