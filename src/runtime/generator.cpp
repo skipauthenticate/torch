@@ -284,7 +284,7 @@ Result Generator::generate(const Request& r, const Observer& o) {
             const int depth = static_cast<int>(std::min<size_t>(limit, total - sequence.size() - 1));
             const auto short_copy = model::matching_continuation(sequence, std::min(depth, model::kMaxColumns - 1));
             if (!short_copy.empty() && depth >= 127 && sequence.size() >= next_wide) {
-                const auto passage = model::matching_continuation(sequence, depth);
+                const auto passage = model::matching_continuation(sequence, depth, sequence.size() - prompt.size());
                 const auto stop = [&](int32_t id) {
                     return id == static_cast<int32_t>(m_.config().eos_token) ||
                            std::find(r.stop_ids.begin(), r.stop_ids.end(), id) != r.stop_ids.end();

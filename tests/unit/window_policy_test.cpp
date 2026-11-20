@@ -2,7 +2,9 @@
 // weak drafts or steeply rising costs, learning of the acceptance rates and the costs, and determinism.
 #include "model/window_policy.h"
 
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <vector>
 
 #include "check.h"
@@ -169,6 +171,16 @@ int main() {
     CHECK(model::matching_continuation(ambiguous, 2).empty());
     CHECK(model::matching_continuation(std::span(same).first(8), 2).empty());
     CHECK(model::matching_continuation(same, 0).empty());
+    std::vector<int32_t> passage(180);
+    std::iota(passage.begin(), passage.end(), 100);
+    auto reply = passage;
+    reply.insert(reply.end(), passage.begin(), passage.begin() + 36);
+    CHECK(model::matching_continuation(reply, 128, 36).size() == 128);
+    reply[passage.size() + 15] = -1;  // an edit after copying the first 15 tokens
+    CHECK(model::matching_continuation(reply, 128).size() == 128);
+    CHECK(model::matching_continuation(reply, 128, 36).empty());
+    std::fill_n(reply.begin() + static_cast<std::ptrdiff_t>(passage.size()), 16, -1);  // a different introduction
+    CHECK(model::matching_continuation(reply, 128, 36).size() == 128);
     check_validation();
     check_shapes();
     check_learning();
