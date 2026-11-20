@@ -90,6 +90,11 @@ void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, in
 bool gemv_bf16_collapse(const uint8_t* w, int n, int hc, int cols, const float* x, const float* xn, float* mixed,
                         BlockQ8* q8, cudaStream_t stream, int columns = 1);
 
+// Without inject rows the ordinary multi-column product is faster from four columns on.
+constexpr bool mixer_down_q8_fuses(int columns, bool inject) {
+    return inject || columns <= 3;
+}
+
 // The Q8_0 mixer down projection with its scaled SiLU and optional BF16 inject rows on the same F32 input.
 void mixer_down_q8(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols, const BlockQ8* xq,
                    const float* x, float* low, float* skip, float scale, int columns, cudaStream_t stream);

@@ -485,7 +485,7 @@ std::vector<Matvec> matvec_cases(const gguf::File& file, const model::Config& cf
             const bool mixer_down = name.find("hc_") != std::string::npos && name.find("_down") != std::string::npos;
             const bool mixer_up = name.find("hc_") != std::string::npos && name.size() > 3 &&
                                   name.compare(name.size() - 3, 3, "_up") == 0;
-            if (type == Type::Q8_0 && mixer_down) {
+            if (type == Type::Q8_0 && mixer_down && kernels::mixer_down_q8_fuses(g_columns, inject_of(t) != nullptr)) {
                 Matvec m{"mixer_down_q8", name, type, rows, cols, false};
                 if (const auto* inject = inject_of(t)) {
                     m.name += "+inject";

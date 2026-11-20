@@ -6,6 +6,7 @@
 #include "kernels/gemv/dot_q8.cuh"
 #include "kernels/gemv/gemv.h"
 #include "kernels/gemv/q8.cuh"
+#include "kernels/hc/hc.h"
 
 namespace torch::kernels {
 namespace {
@@ -321,32 +322,50 @@ __device__ __forceinline__ void bf16_chunk(float& acc, uint4 v, float4 a, float4
     acc += bf16_high(v.w) * b.w;
 }
 
-// Inject rows use F32 activations. Their four long dot products can run alongside the quantized down projection.
+// A warp reuses each weight across its columns. The inject rows use the original F32 input.
+template <int kColumns>
 __global__ void __launch_bounds__(kThreads)
     mixer_down_q8_kernel(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols,
-                         const BlockQ8* xq, const float* x, float* low, float* skip, float scale) {
-    const int column = blockIdx.x, lane = threadIdx.x % kWarp;
-    const int index = blockIdx.y * kRowsPerBlock + threadIdx.x / kWarp;
-    if (index >= rows + inject_rows)
+                         const BlockQ8* xq, const float* x, float* low, float* skip, float scale, int columns) {
+    const int lane = threadIdx.x % kWarp, first = blockIdx.x * kColumns;
+    const int row = blockIdx.y * kRowsPerBlock + threadIdx.x / kWarp;
+    if (row >= rows + inject_rows)
         return;
-    float sum = 0.0f;
-    if (index < inject_rows) {
-        const auto* weight = reinterpret_cast<const uint4*>(inject + int64_t{index} * cols * 2);
-        const auto* input = reinterpret_cast<const float4*>(x + int64_t{column} * cols);
-        for (int c = lane; c < cols / 8; c += kWarp)
-            bf16_chunk(sum, weight[c], input[2 * c], input[2 * c + 1]);
-        sum = warp_sum(sum);
-        if (lane == 0)
-            skip[int64_t{column} * inject_rows + index] = sum;
+    float sums[kColumns]{};
+    if (row < inject_rows) {
+        const auto* weights = reinterpret_cast<const uint4*>(inject + int64_t{row} * cols * 2);
+        for (int u = lane; u < cols / 8; u += kWarp) {
+            const uint4 weight = weights[u];
+#pragma unroll
+            for (int c = 0; c < kColumns; ++c) {
+                if (kColumns == 1 || first + c < columns) {
+                    const auto* input = reinterpret_cast<const float4*>(x + int64_t{first + c} * cols);
+                    bf16_chunk(sums[c], weight, input[2 * u], input[2 * u + 1]);
+                }
+            }
+        }
     } else {
-        const int row = index - inject_rows, units = cols / 32;
-        const uint8_t* weight = w + int64_t{row} * units * 34;
-        xq += int64_t{column} * units;
-        for (int u = lane; u < units; u += kWarp)
-            sum += dot_unit<Type::Q8_0>(weight, u, act_of<Type::Q8_0>(xq[u]), nullptr);
-        sum = warp_sum(sum);
-        if (lane == 0)
-            low[int64_t{column} * rows + row] = silu(sum * scale);
+        const int units = cols / 32;
+        const uint8_t* weight = w + int64_t{row - inject_rows} * units * 34;
+        for (int u = lane; u < units; u += kWarp) {
+            const Unit decoded = decode_unit<Type::Q8_0>(weight, u, nullptr);
+#pragma unroll
+            for (int c = 0; c < kColumns; ++c)
+                if (kColumns == 1 || first + c < columns)
+                    sums[c] += apply_unit<Type::Q8_0>(decoded, act_of<Type::Q8_0>(xq[(first + c) * units + u]));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kColumns; ++c) {
+        if (kColumns == 1 || first + c < columns) {
+            const float sum = warp_sum(sums[c]);
+            if (lane == 0) {
+                if (row < inject_rows)
+                    skip[int64_t{first + c} * inject_rows + row] = sum;
+                else
+                    low[int64_t{first + c} * rows + row - inject_rows] = silu(sum * scale);
+            }
+        }
     }
 }
 
@@ -1456,8 +1475,22 @@ bool gemv_bf16_collapse(const uint8_t* w, int n, int hc, int cols, const float* 
 
 void mixer_down_q8(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols, const BlockQ8* xq,
                    const float* x, float* low, float* skip, float scale, int columns, cudaStream_t stream) {
-    mixer_down_q8_kernel<<<dim3(columns, blocks_for(rows + inject_rows, kRowsPerBlock)), kThreads, 0, stream>>>(
-        w, inject, rows, inject_rows, cols, xq, x, low, skip, scale);
+    if (!mixer_down_q8_fuses(columns, inject_rows > 0)) {
+        gemv_q8(Type::Q8_0, w, rows, cols, xq, low, stream, columns);
+        silu_scale(low, rows, scale, stream, columns);
+        return;
+    }
+    const auto run = [&]<int C>() {
+        mixer_down_q8_kernel<C>
+            <<<dim3(blocks_for(columns, C), blocks_for(rows + inject_rows, kRowsPerBlock)), kThreads, 0, stream>>>(
+                w, inject, rows, inject_rows, cols, xq, x, low, skip, scale, columns);
+    };
+    if (columns == 1)
+        run.template operator()<1>();
+    else if (columns == 2 || (inject_rows > 0 && columns <= 4))
+        run.template operator()<2>();
+    else
+        run.template operator()<4>();
 }
 
 void mixer_up_q8(const uint8_t* w, int n, const float* low, const float* xn, float* mixed, BlockQ8* q8, int columns,
