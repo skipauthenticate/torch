@@ -80,9 +80,7 @@ For scripts and C programs there is also `torch run` and a small C API (`include
 
 ## Hardware
 
-| Supported hardware | Needs |
-| --- | --- |
-| **NVIDIA Jetson AGX Orin 64 GB** (developer kit or module) | JetPack 7 (CUDA 13), about 85 GB of free NVMe space |
+Torch supports the **NVIDIA Jetson AGX Orin 64 GB** developer kit and module. Both need JetPack 7 (CUDA 13) and about 85 GB of free NVMe storage.
 
 That is the only device. Supporting one board is what lets every kernel, memory decision and default fit the Orin's
 unified memory, small L2 cache and 16 streaming multiprocessors.

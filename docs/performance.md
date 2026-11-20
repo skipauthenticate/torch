@@ -131,6 +131,14 @@ On UD-IQ3_XXS repetition, the median longest pause between output groups increas
 
 With 14,000 resident experts in both builds, the median longest pause on IQ3_S code review increased from 150.41 to 183.32 ms. On UD-IQ3_XXS repetition it increased from 179.05 to 209.24 ms. The per-window measurements give the time spent submitting GPU work and waiting for it to finish.
 
+A trial skipped attention index work when the prompt selected every earlier block. It matched the candidate on 18 of 18 answers. Prompt processing was faster in 6 of six workload measurements. Generation slowed in 4 of six.
+
+Another test gave the verifier the next 255 correct tokens from each of three reference answers. It used 14,000 resident experts and tested three group sizes. Code review reached 89.73 verified tokens/s on IQ3_S and 91.07 on UD-IQ3_XXS. The highest rates across all three answers were 139.67 and 170.23 verified tokens/s. Timing covered verification alone.
+
+With 14,000 resident experts, the server tested 16, 24 and 32 workers for storage reads in both orders. The comparison used 16 workers as the reference. With 24 workers, 2 of six requests met two conditions in both orders. Generation was at least as fast and the longest pause at the client was at least as short. With 32 workers, 2 of six requests met both conditions.
+
+A streamed trial limited draft length during the first 64 output tokens. It matched 18 of 18 answers. Generation rate and longest client pause both matched or improved on v0.4.0 in 3 of six workload medians.
+
 The IQ3_S lower bounds in the candidate README are 33.2 generated tokens/s and 358 input tokens/s with fast prefill. The earlier release listed 33.7 and 359 tokens/s for these two values. The paired runs on this page compare both builds during the same test session. [v0.4.0 measurements](https://github.com/skipauthenticate/torch/blob/v0.4.0/README.md#speed)
 
 The optional fast prompt test used nine additional uncached requests per file. The following rates give the median for code review, prose, and repetition, in that order. IQ3_S measured 391.00, 358.12, 360.74 tokens/s. UD-IQ3_XXS measured 365.01, 338.16, 337.29 tokens/s.
