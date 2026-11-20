@@ -1992,10 +1992,16 @@ struct Model::Impl {
         }
         ple_rows_in(n);  // (joined above when a layer is the PLE layer)
         layer_ = -1;
-        // The head's mixer for every column, as windows run it (the draft layer reads each column's residual after it);
-        // the output head for the last column only.
-        hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending, n);
-        ops = &chunk_last, b = chunk_last;
+        // The draft reads every residual. Only the last column feeds the output head.
+        if (fast_prefill) {
+            hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending, n);
+            ops = &chunk_last, b = chunk_last;
+        } else {
+            if (pending && n > 1)
+                kernels::hc_combine(chunk.res, chunk.out, chunk.inject, E, cfg.hc, stream, n - 1);
+            ops = &chunk_last, b = chunk_last;
+            hc_mix(weights->head_hc_norm, weights->head_hc_down, weights->head_hc_up, nullptr, pending, 1);
+        }
         matvec(weights->output, chunk_last.mixed, chunk_last.logits, true, 1);
         kernels::argmax(chunk_last.logits, cfg.n_vocab, chunk_last.argmax_scratch, chunk_last.argmax, stream, 1);
         TORCH_CUDA_CHECK(cudaMemcpyAsync(hb.argmax, chunk_last.argmax, sizeof(kernels::ArgmaxResult),
