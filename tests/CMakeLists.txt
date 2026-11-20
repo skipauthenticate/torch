@@ -22,7 +22,11 @@ add_executable(direct_io_test unit/direct_io_test.cpp)
 target_link_libraries(direct_io_test PRIVATE torch_core)
 add_test(NAME direct_io COMMAND direct_io_test ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(hedged_reads_test unit/hedged_reads_test.cpp)
+# Give the test control over the completion of one real disk read.
+add_library(hedged_test_io OBJECT ../src/runtime/direct_io.cpp)
+target_link_libraries(hedged_test_io PRIVATE torch_core)
+target_compile_definitions(hedged_test_io PRIVATE pread=torch_test_pread)
+add_executable(hedged_reads_test unit/hedged_reads_test.cpp $<TARGET_OBJECTS:hedged_test_io>)
 target_link_libraries(hedged_reads_test PRIVATE torch_core)
 add_test(NAME hedged_reads COMMAND hedged_reads_test ${CMAKE_CURRENT_BINARY_DIR})
 

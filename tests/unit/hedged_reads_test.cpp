@@ -1,15 +1,18 @@
-// Checks hedged reads: every request's bytes arrive from the right offset, with and without hedging, buffers come back
-// after release(), and a failed read gives nullptr. With a hedge delay of 0 almost every read is issued twice, so the
-// winner-and-loser path (and late buffers) runs on every round; a batch far larger than its spare buffers, all late,
-// still completes.
+// Checks the bytes from each file offset, buffer reuse, failed reads, and a batch with one spare buffer.
+// The tests for a late read hold one file operation until the reader issues a second request.
 //
 // usage: hedged_reads_test DIR (a directory on a disk file system: tmpfs does not support O_DIRECT)
 #include "runtime/hedged_reads.h"
 
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "check.h"
@@ -22,6 +25,21 @@ using runtime::kReadChunk;
 using runtime::span_bytes;
 
 namespace {
+std::atomic<const HedgedReads*> slow_read{nullptr};
+}
+
+// Only the test copy of DirectFile calls this function. A fast disk can finish every normal read before it needs a
+// hedge.
+extern "C" ssize_t torch_test_pread(int fd, void* buffer, size_t count, off_t offset) {
+    if (const auto* reader = slow_read.exchange(nullptr)) {
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (reader->hedged() == 0 && std::chrono::steady_clock::now() < limit)
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return ::pread(fd, buffer, count, offset);
+}
+
+namespace {
 
 void check(const DirectFile& f, const std::vector<uint8_t>& bytes, std::chrono::microseconds hedge_after, bool hedges) {
     constexpr int kReads = 6, kBuffers = kReads + 4;
@@ -32,6 +50,8 @@ void check(const DirectFile& f, const std::vector<uint8_t>& bytes, std::chrono::
         const int small = reads.add_pool(memory, kBuffer, kBuffers);
         const int large = reads.add_pool(memory + kBuffers * kBuffer, kBuffer, kBuffers);
         CHECK(small == 0 && large == 1);
+        if (hedges)
+            slow_read.store(&reads);
         std::mt19937 rng(7);
         for (int round = 0; round < 200; ++round) {
             std::vector<HedgedReads::Request> requests;
@@ -47,6 +67,7 @@ void check(const DirectFile& f, const std::vector<uint8_t>& bytes, std::chrono::
                                   requests[static_cast<size_t>(i)].n) == 0);
             reads.release();
         }
+        CHECK(slow_read.exchange(nullptr) == nullptr);
         CHECK(hedges ? reads.hedged() > 0 : reads.hedged() == 0);
         // Past the end of the file: the read fails and its result is nullptr.
         const HedgedReads::Request bad{0, bytes.size() - 10, 100};
@@ -69,6 +90,8 @@ void check_chunks(const DirectFile& f, const std::vector<uint8_t>& bytes, std::c
     {
         HedgedReads reads(f, 8, hedge_after);
         const int pool = reads.add_pool(memory, buffer_bytes, kBuffers);
+        if (hedges)
+            slow_read.store(&reads);
         std::mt19937 rng(11);
         for (int round = 0; round < 60; ++round) {
             std::vector<HedgedReads::Request> requests;
@@ -84,6 +107,7 @@ void check_chunks(const DirectFile& f, const std::vector<uint8_t>& bytes, std::c
                 CHECK(out[i] != nullptr && std::memcmp(out[i], bytes.data() + requests[i].offset, requests[i].n) == 0);
             reads.release();
         }
+        CHECK(slow_read.exchange(nullptr) == nullptr);
         CHECK(hedges ? reads.hedged() > 0 : reads.hedged() == 0);
         // a multi-chunk request that runs past the end of the file fails as a whole
         const HedgedReads::Request bad{pool, bytes.size() - 3 * kReadChunk, 4 * kReadChunk};
@@ -95,8 +119,7 @@ void check_chunks(const DirectFile& f, const std::vector<uint8_t>& bytes, std::c
     std::free(memory);
 }
 
-// A batch far larger than its pool's spares (one), every read late at once (hedge delay 0): hedges must wait for the
-// spare without stopping the batch from resolving (a hedge that waited for a buffer inside read_all() hung it).
+// A large batch has one spare buffer. A duplicate read that needs the spare must let the batch make progress.
 void check_many_late(const DirectFile& f, const std::vector<uint8_t>& bytes) {
     constexpr int kReads = 48, kBuffers = kReads + 1;
     const uint64_t buffer_bytes = span_bytes(1, 40 * kPage);
@@ -104,6 +127,7 @@ void check_many_late(const DirectFile& f, const std::vector<uint8_t>& bytes) {
     {
         HedgedReads reads(f, 4, std::chrono::microseconds(0));
         const int pool = reads.add_pool(memory, buffer_bytes, kBuffers);
+        slow_read.store(&reads);
         std::mt19937 rng(13);
         for (int round = 0; round < 20; ++round) {
             std::vector<HedgedReads::Request> requests;
@@ -117,6 +141,7 @@ void check_many_late(const DirectFile& f, const std::vector<uint8_t>& bytes) {
                 CHECK(out[i] != nullptr && std::memcmp(out[i], bytes.data() + requests[i].offset, requests[i].n) == 0);
             reads.release();
         }
+        CHECK(slow_read.exchange(nullptr) == nullptr);
         CHECK(reads.hedged() > 0);
     }
     std::free(memory);
@@ -137,7 +162,7 @@ int main(int argc, char** argv) {
     {
         const DirectFile f(path);
         check(f, bytes, std::chrono::seconds(10), false);     // never hedged
-        check(f, bytes, std::chrono::microseconds(0), true);  // hedged almost always
+        check(f, bytes, std::chrono::microseconds(0), true);  // one controlled late read
         check_chunks(f, bytes, std::chrono::seconds(10), false);
         check_chunks(f, bytes, std::chrono::microseconds(0), true);
         check_many_late(f, bytes);
