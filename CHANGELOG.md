@@ -18,6 +18,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Performance
 
 - On a Jetson AGX Orin 64 GB on 2026-11-19, fresh code review input on UD-IQ3_XXS increased from 288.06 to 350.37 tokens/s. Wide eight-bit prompt products stream their weights. Short verification windows reuse the mixer weights across tokens. [Default release checks](docs/performance.md#default-release-checks)
+- Both test orders produced the same benchmark answers as v0.4.0 on both files. The large-operation bandwidth check failed. Some pauses between outputs exceeded those of v0.4.0. All three workloads missed both speed targets. [Board measurements](docs/performance.md#default-release-checks)
 - A Jetson AGX Orin 64 GB ran both model files on 2026-11-19. With long checks and a 2 GiB prompt cache,
   repeated text reached 99.07 tokens/s on IQ3_S and 103.69 on UD-IQ3_XXS. Code review generation slowed on
   both files. Long checks now require `torch.long_copy` on a buffered greedy request.
@@ -29,10 +30,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Verification
 
-- All 2,304 generated token IDs from nine fresh requests matched v0.4.0. All 30 cache restore checks passed
-  at lengths up to 70,000 tokens. Both supported model files passed their output reference checks.
-- The 153 GB/s GPU bandwidth check remains open. The build tested on 2026-11-19 fell below the limit in 35 of 61
-  large cases on IQ3_S and 18 of 33 on UD-IQ3_XXS. The release stays in draft.
+- The two standard test orders matched v0.4.0 on 9,216 output token IDs and 36 answers. All 30 cache restore checks passed at lengths up to 70,000 tokens. Both model files passed their reference output checks.
+- The 153 GB/s GPU bandwidth check failed for 36 of 61 large cases on IQ3_S and 18 of 33 on UD-IQ3_XXS. The release stays in draft.
 
 ## [0.4.0] - 2026-11-16
 

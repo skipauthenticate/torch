@@ -31,7 +31,7 @@ The v0.5.0 release candidate ran on a Jetson AGX Orin 64 GB on 2026-11-19 and 20
 
 Each range covers the median speeds for code review, prose, and repetition. Each workload used three requests with 4,096 uncached input tokens and 256 output tokens. The context limit was 262,144 tokens.
 
-`--fast-prefill` rounds some input values to 16-bit floating point. It can change the generated text. The default uses exact prompt processing. [Measurements and release checks](docs/performance.md#default-release-checks)
+`--fast-prefill` rounds some input values to 16-bit floating point. It changed 14 of the 18 answers in these tests. The default uses exact prompt processing. [Measurements and release checks](docs/performance.md#default-release-checks)
 
 ## Install
 

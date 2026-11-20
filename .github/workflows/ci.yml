@@ -63,6 +63,7 @@ jobs:
           cmp "$RUNNER_TEMP/fixtures/tiny.gguf" tests/fixtures/tiny.gguf
       - run: python tests/tools/make_draft_test.py
       - run: python tests/tools/run_workloads_test.py
+      - run: python tests/tools/release_gates_test.py
 
   # The tokenizer export on the real header: the first 11 MiB of shard 1 at the pinned revision (docs/model-files.md),
   # fetched by range request and cached by revision. Nothing of the model is in the repository; the goldens are ids

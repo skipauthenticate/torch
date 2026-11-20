@@ -97,9 +97,11 @@ session snapshot 0.11 GiB, each its own budget line. Long prompts run at about t
 
 ## Default release checks
 
-On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 first and the candidate at `90136a0` second. Each process loaded the same model, draft layer and placement. The context was 262,144 tokens. Both test processes kept a 9 GiB free-memory floor. The candidate kept one previous turn and reserved zero extra bytes for shared prompts. The client sent one warm-up and then nine requests to each server. Each timed request read 4,096 uncached input tokens and generated 256 tokens. The table gives the median of three requests per workload in tokens per second.
+A Jetson AGX Orin 64 GB ran v0.4.0 and candidate `90136a0` on 2026-11-19 and 2026-11-20. Each process used the shipped placement and draft vocabulary for its model file. The context limit was 262,144 tokens. Both servers set a 9 GiB free-memory floor. The candidate reserved zero extra bytes for shared prompts.
 
-| Model file | Workload | v0.4.0 PP | Draft PP | v0.4.0 generation | Draft generation |
+The first pair ran v0.4.0 first. Each server received one warm-up request and nine timed requests. Each timed request read 4,096 uncached input tokens and generated 256 output tokens. The table gives the median of three requests per workload.
+
+| Model file | Workload | v0.4.0 input/s | Candidate input/s | v0.4.0 output/s | Candidate output/s |
 | --- | --- | ---: | ---: | ---: | ---: |
 | IQ3_S | Code review | 288.13 | 303.97 | 36.86 | 36.94 |
 | IQ3_S | Prose | 271.05 | 284.55 | 32.99 | 33.16 |
@@ -108,12 +110,28 @@ On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 first and the candidate at `90
 | UD-IQ3_XXS | Prose | 271.32 | 323.47 | 33.52 | 33.87 |
 | UD-IQ3_XXS | Repetition | 272.64 | 324.62 | 47.56 | 69.54 |
 
-| Model file | v0.4.0 resident experts | Draft resident experts | v0.4.0 start (s) | Draft start (s) |
-| --- | ---: | ---: | ---: | ---: |
-| IQ3_S | 17,392 | 17,375 | 17.03 | 16.98 |
-| UD-IQ3_XXS | 17,406 | 17,341 | 16.98 | 17.08 |
+The second pair ran the candidate first. Across the two orders, 9,216 output token IDs matched and 36 complete answers matched. Single-token generation reproduced every standard answer on both files. The detailed measurements include the decoded text hashes, each request, the allocated experts, server startup, time to first output and the longest output intervals. They also cover streaming clients, multiple turns, independent prompts, and a run with exactly 14,000 resident experts on each side.
 
-All 18 answers and all 4,608 output token IDs matched. On UD-IQ3_XXS repetition, the median longest interval between engine output groups increased from 125.61 ms to 162.83 ms. The candidate must meet each v0.4.0 metric and the 153 GB/s bandwidth requirement. The targets are 200 generated tokens/s and 2,000 uncached input tokens/s on each workload. [Per-request measurements and output hashes](../bench/results/2026-11-19-90136a0-qualification.json)
+The multi-turn runs matched 28 of 28 answers. On the first 10,000-token conversation, time to first output on IQ3_S changed from 38.52 to 36.68 seconds. On UD-IQ3_XXS it changed from 38.37 to 32.21 seconds.
+
+Six new prompts tested the fixed engine on inputs outside the original benchmark. The two builds matched on 1,536 output token IDs. Prompt processing was faster on 6 of six requests. IQ3_S generation on the new prose request changed from 36.01 to 35.88 tokens/s.
+
+Across all eight comparisons per file, 142 of 142 paired requests returned identical answers. The builds agreed at 29,352 of 29,352 output token positions. These totals include repeated prompts and compare fast mode with fast mode.
+
+- **IQ3_S.** The board passed 13 unit tests and 13 GPU result tests. The large-operation test measured 36 of 61 operations below 153 GB/s. The small-operation test measured 476 launches and 1.911 ms per token. The mean divergence from the reference was 0.00143. The limit was 0.00328. Both builds returned the same five highest token scores at all 298 measured positions.
+- **UD-IQ3_XXS.** The board passed 13 unit tests and 13 GPU result tests. The large-operation test measured 18 of 33 operations below 153 GB/s. The small-operation test measured 529 launches and 1.567 ms per token. The mean divergence from the reference was 0.00249. The limit was 0.00596. Both builds returned the same five highest token scores at all 298 measured positions.
+
+A separate 4,096-token code review test read 17.7 GB from storage on IQ3_S and 18.3 GB on UD-IQ3_XXS. The selected expert weights outside memory accounted for 14.6 GB and 15.1 GB. At these placements, reading those weights in 2.048 seconds would require 7.13 and 7.35 GB/s. The best measured rates for random 2 MiB reads were 5.88 and 5.81 GB/s on the two model files. The detailed results give storage traffic for prose and repetition at the same memory floor.
+
+A lossless compression test sampled 432 blocks of expert weights from each model file. It saved 0.97% on IQ3_S and 0.77% on UD-IQ3_XXS, before block metadata.
+
+A separate test compared 73,728 decoded expert rows per file across three layers. Every sampled row was distinct within its projection.
+
+On UD-IQ3_XXS repetition, the median longest pause between output groups increased from 125.61 to 162.83 ms in the first order and from 126.82 to 146.26 ms in the second. Both model files also kept fewer resident experts in both standard runs. On streamed IQ3_S code review, generation measured 36.39 tokens/s on v0.4.0 and 35.93 tokens/s on the candidate. The median longest gap at the client measured 133.11 ms and 174.00 ms. The release stays in draft because of the bandwidth and timing results. All three workloads also missed the speed targets of 200 generated tokens/s and 2,000 uncached input tokens/s. [Per-request measurements, exact output comparisons, and GPU timings](../bench/results/2026-11-19-90136a0-qualification.json)
+
+With 14,000 resident experts in both builds, the median longest pause on IQ3_S code review increased from 150.41 to 183.32 ms. On UD-IQ3_XXS repetition it increased from 179.05 to 209.24 ms. The per-window measurements give the time spent submitting GPU work and waiting for it to finish.
+
+The IQ3_S lower bounds in the candidate README are 33.2 generated tokens/s and 358 input tokens/s with fast prefill. The earlier release listed 33.7 and 359 tokens/s for these two values. The paired runs on this page compare both builds during the same test session. [v0.4.0 measurements](https://github.com/skipauthenticate/torch/blob/v0.4.0/README.md#speed)
 
 The optional fast prompt test used nine additional uncached requests per file. The following rates give the median for code review, prose, and repetition, in that order. IQ3_S measured 391.00, 358.12, 360.74 tokens/s. UD-IQ3_XXS measured 365.01, 338.16, 337.29 tokens/s.
 
