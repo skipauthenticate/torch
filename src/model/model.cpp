@@ -1115,8 +1115,9 @@ struct Model::Impl {
         // A BF16 down projection applies the low-rank SiLU as it stores; BF16 inject rows read the same input, so
         // they share its launch.
         const float scale = 1.0f / static_cast<float>(cfg.hc);
+        const bool q8_down = !prefilling && down.type == Type::Q8_0;
         const bool paired =
-            inject && down.type == Type::BF16 && inject->type == Type::BF16 && inject->cols == down.cols;
+            inject && (down.type == Type::BF16 || q8_down) && inject->type == Type::BF16 && inject->cols == down.cols;
         if (down.type == Type::BF16 && prefilling && kernels::gemm_bf16_wins(down.cols)) {  // a chunk: all columns
             stage(kBf16, [&] {
                 bf16_chunk(down.data, down.rows, down.cols, c.xn, c.lo, columns, scale, paired ? inject->data : nullptr,
@@ -1131,6 +1132,11 @@ struct Model::Impl {
                                             scale, n);
                 });
             });
+        } else if (q8_down) {
+            BlockQ8* xq = q8_of(c.xn);
+            kernels::quantize_q8(c.xn, int64_t{columns} * down.cols, xq, stream);
+            kernels::mixer_down_q8(down.data, paired ? inject->data : nullptr, down.rows, paired ? inject->rows : 0,
+                                   down.cols, xq, c.xn, c.lo, c.inject, scale, columns, stream);
         } else {
             matvec(down, c.xn, c.lo, false, columns);
             kernels::silu_scale(c.lo, cfg.hc_rank, scale, stream, columns);
@@ -1138,8 +1144,11 @@ struct Model::Impl {
         if (inject && !paired)
             matvec(*inject, c.xn, c.inject, false, columns);
         // A window's up projection and collapse share one launch, bitwise the two (gemv_bf16_collapse).
-        if (prefilling || up.type != Type::BF16 ||
-            !kernels::gemv_bf16_collapse(up.data, E, cfg.hc, up.cols, c.lo, c.xn, c.mixed, c.q8, stream, columns)) {
+        if (!prefilling && up.type == Type::Q8_0 && up.cols == 320 && cfg.hc == 4 && E % 32 == 0)
+            kernels::mixer_up_q8(up.data, E, c.lo, c.xn, c.mixed, c.q8, columns, stream);
+        else if (prefilling || up.type != Type::BF16 ||
+                 !kernels::gemv_bf16_collapse(up.data, E, cfg.hc, up.cols, c.lo, c.xn, c.mixed, c.q8, stream,
+                                              columns)) {
             matvec(up, c.lo, c.hc_gate, false, columns);
             kernels::hc_collapse(c.xn, c.hc_gate, c.mixed, c.q8, E, cfg.hc, stream, columns);
         }

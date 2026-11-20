@@ -324,6 +324,8 @@ std::string shape_name(int rows, int cols) {
 }
 
 std::string Matvec::format() const {
+    if (kernel == "mixer_down_q8" && rows2 > 0)
+        return format_name(type) + "+BF16";
     std::string f;
     for (const auto& [t, r] : parts)
         f += (f.empty() ? "" : "+") + format_name(t);
@@ -457,7 +459,8 @@ std::vector<Matvec> matvec_cases(const gguf::File& file, const model::Config& cf
     auto inject_of = [&](const gguf::TensorInfo& down) -> const gguf::TensorInfo* {
         const size_t at = down.name.find("hc_");
         const size_t end = down.name.rfind("_down.weight");
-        if (at == std::string::npos || end == std::string::npos || model::matrix_type(down) != Type::BF16)
+        if (at == std::string::npos || end == std::string::npos ||
+            (model::matrix_type(down) != Type::BF16 && model::matrix_type(down) != Type::Q8_0))
             return nullptr;
         const gguf::TensorInfo* inject = file.tensor(down.name.substr(0, end) + "_inject.weight");
         return inject != nullptr && model::matrix_type(*inject) == Type::BF16 && inject->shape[0] == down.shape[0]
@@ -482,8 +485,21 @@ std::vector<Matvec> matvec_cases(const gguf::File& file, const model::Config& cf
             const bool mixer_down = name.find("hc_") != std::string::npos && name.find("_down") != std::string::npos;
             const bool mixer_up = name.find("hc_") != std::string::npos && name.size() > 3 &&
                                   name.compare(name.size() - 3, 3, "_up") == 0;
-            if (type == Type::BF16 && mixer_up && cfg.hc == 4 && cols % 8 == 0 && cols <= 320 &&
-                rows % (32 * cfg.hc) == 0) {
+            if (type == Type::Q8_0 && mixer_down) {
+                Matvec m{"mixer_down_q8", name, type, rows, cols, false};
+                if (const auto* inject = inject_of(t)) {
+                    m.name += "+inject";
+                    m.rows2 = static_cast<int>(inject->shape[1]);
+                }
+                m.silu_scale = 1.0f / static_cast<float>(cfg.hc);
+                add_case(m);
+            } else if (type == Type::Q8_0 && mixer_up && cfg.hc == 4 && cols == 320 && rows % (32 * cfg.hc) == 0) {
+                Matvec m{"mixer_up_q8", name, type, rows, cols, false};
+                m.collapse_hc = cfg.hc;
+                m.quantizes = false;
+                add_case(m);
+            } else if (type == Type::BF16 && mixer_up && cfg.hc == 4 && cols % 8 == 0 && cols <= 320 &&
+                       rows % (32 * cfg.hc) == 0) {
                 Matvec m{"gemv_bf16_collapse", name, type, rows, cols, false};
                 m.collapse_hc = cfg.hc;
                 add_case(m);
@@ -522,11 +538,18 @@ std::vector<Matvec> matvec_cases(const gguf::File& file, const model::Config& cf
 // A plain matrix: copies of the weights rotated through a graph, one launch per copy.
 Row time_matrix(const Matvec& c, cudaStream_t stream, Rng& rng) {
     const uint64_t row_size = row_bytes(*type_info(static_cast<uint32_t>(c.type)), c.cols);
-    const uint64_t matrix_bytes = static_cast<uint64_t>(c.rows + c.rows2) * row_size;
+    const bool q8_down = c.kernel == "mixer_down_q8";
+    const uint64_t first_bytes = static_cast<uint64_t>(c.rows) * row_size;
+    const uint64_t second_bytes = static_cast<uint64_t>(c.rows2) * (q8_down ? 2ull * c.cols : row_size);
+    const uint64_t matrix_bytes = first_bytes + second_bytes;
     const uint64_t stride = round_up(matrix_bytes, 256);
     const uint64_t copies = copies_for(matrix_bytes);
     Pinned weights(stride * copies);
-    fill_weights(c.type, weights.host(), matrix_bytes, rng);
+    if (q8_down && second_bytes) {
+        fill_weights(c.type, weights.host(), first_bytes, rng);
+        fill_weights(Type::BF16, weights.host() + first_bytes, second_bytes, rng);
+    } else
+        fill_weights(c.type, weights.host(), matrix_bytes, rng);
     for (uint64_t i = 1; i < copies; ++i)
         std::memcpy(weights.host() + i * stride, weights.host(), matrix_bytes);
     const int launches = static_cast<int>(std::max<uint64_t>(kMinLaunches, copies));
@@ -544,8 +567,24 @@ Row time_matrix(const Matvec& c, cudaStream_t stream, Rng& rng) {
         Device<BlockQ8> q8(static_cast<size_t>(n / 32) * T);
         row.bytes = row.weight_bytes + T * (4.0 * (c.cols + c.rows + n) + n / 32.0 * sizeof(BlockQ8));
         row.us = time_graph(stream, launches, [&](int i) {
-            kernels::gemv_bf16_collapse(weights.device() + stride * (static_cast<uint64_t>(i) % copies), n,
-                                        c.collapse_hc, c.cols, x.get(), xn.get(), mixed.get(), q8.get(), stream, T);
+            const uint8_t* w = weights.device() + stride * (static_cast<uint64_t>(i) % copies);
+            if (c.type == Type::Q8_0)
+                kernels::mixer_up_q8(w, n, x.get(), xn.get(), mixed.get(), q8.get(), T, stream);
+            else
+                kernels::gemv_bf16_collapse(w, n, c.collapse_hc, c.cols, x.get(), xn.get(), mixed.get(), q8.get(),
+                                            stream, T);
+        });
+    } else if (q8_down) {
+        Device<float> x = random_floats(static_cast<size_t>(c.cols) * T, -1.0f, 1.0f, rng);
+        Device<BlockQ8> xq(static_cast<size_t>(c.cols / 32) * T);
+        kernels::quantize_q8(x.get(), int64_t{c.cols} * T, xq.get(), stream);
+        row.bytes = row.weight_bytes +
+                    T * (c.cols / 32.0 * sizeof(BlockQ8) + 4.0 * (c.rows + c.rows2 + (c.rows2 > 0 ? c.cols : 0)));
+        row.us = time_graph(stream, launches, [&](int i) {
+            const uint8_t* w = weights.device() + stride * (static_cast<uint64_t>(i) % copies);
+            kernels::mixer_down_q8(w, c.rows2 > 0 ? w + first_bytes : nullptr, c.rows, c.rows2, c.cols, xq.get(),
+                                   x.get(), y.get(), y.get() + static_cast<size_t>(c.rows) * T, c.silu_scale, T,
+                                   stream);
         });
     } else if (c.type == Type::BF16) {
         Device<float> x = random_floats(static_cast<size_t>(c.cols) * T, -1.0f, 1.0f, rng);

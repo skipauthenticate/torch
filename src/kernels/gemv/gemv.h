@@ -90,6 +90,15 @@ void gemv_bf16_pair(const uint8_t* w, int rows, const uint8_t* w2, int rows2, in
 bool gemv_bf16_collapse(const uint8_t* w, int n, int hc, int cols, const float* x, const float* xn, float* mixed,
                         BlockQ8* q8, cudaStream_t stream, int columns = 1);
 
+// The Q8_0 mixer down projection with its scaled SiLU and optional BF16 inject rows on the same F32 input.
+void mixer_down_q8(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols, const BlockQ8* xq,
+                   const float* x, float* low, float* skip, float scale, int columns, cudaStream_t stream);
+
+// A Q8_0 mixer with 320 input values and four streams of n values (n divisible by 32). Quantizes the input and
+// collapses its projected streams into mixed and its Q8 blocks. Supports one to eight columns.
+void mixer_up_q8(const uint8_t* w, int n, const float* low, const float* xn, float* mixed, BlockQ8* q8, int columns,
+                 cudaStream_t stream);
+
 // Routed experts. For each slot s < slots, W_s = table[s] (a device-readable pointer table, so a resident expert and
 // one read into a staging slot run the same code) and x_s = x + s * x_stride blocks:
 //   up_table == nullptr: y[s * rows + r] = W_s[r] . x_s                      (the down projection)
