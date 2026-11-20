@@ -115,6 +115,8 @@ On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 first and the candidate at `90
 
 All 18 answers and all 4,608 output token IDs matched. On UD-IQ3_XXS repetition, the median longest interval between engine output groups increased from 125.61 ms to 162.83 ms. The candidate must meet each v0.4.0 metric and the 153 GB/s bandwidth requirement. The targets are 200 generated tokens/s and 2,000 uncached input tokens/s on each workload. [Per-request measurements and output hashes](../bench/results/2026-11-19-90136a0-qualification.json)
 
+The optional fast prompt test used nine additional uncached requests per file. The following rates give the median for code review, prose, and repetition, in that order. IQ3_S measured 391.00, 358.12, 360.74 tokens/s. UD-IQ3_XXS measured 365.01, 338.16, 337.29 tokens/s.
+
 ## Fresh prompt and generation tests
 
 On 2026-11-19, a Jetson AGX Orin 64 GB ran v0.4.0 and an experimental build at `c4abe94`.

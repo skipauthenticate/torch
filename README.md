@@ -22,16 +22,16 @@ speculative decoding changes the speed, never the tokens.
 
 ## Speed
 
-The v0.5.0 release candidate ran on a Jetson AGX Orin 64 GB. PP means prompt processing.
+The v0.5.0 release candidate ran on a Jetson AGX Orin 64 GB on 2026-11-19 and 2026-11-20. PP means prompt processing.
 
 | Model file | Generation | PP | PP with `--fast-prefill` |
 | --- | ---: | ---: | ---: |
-| IQ3_S (default) | 33.2–70.2 tokens/s | 285–304 tokens/s | Pending |
-| UD-IQ3_XXS | 33.9–69.5 tokens/s | 323–350 tokens/s | Pending |
+| IQ3_S (default) | 33.2–70.2 tokens/s | 285–304 tokens/s | 358–391 tokens/s |
+| UD-IQ3_XXS | 33.9–69.5 tokens/s | 323–350 tokens/s | 337–365 tokens/s |
 
 Each range covers the median speeds for code review, prose, and repetition. Each workload used three requests with 4,096 uncached input tokens and 256 output tokens. The context limit was 262,144 tokens.
 
-`--fast-prefill` rounds some prompt activations to 16-bit floating point. It can change the generated text. The default uses exact prompt processing. The release candidate is in draft. [Measurements and release checks](docs/performance.md#default-release-checks)
+`--fast-prefill` rounds some input values to 16-bit floating point. It can change the generated text. The default uses exact prompt processing. [Measurements and release checks](docs/performance.md#default-release-checks)
 
 ## Install
 
@@ -74,10 +74,6 @@ Streaming, thinking (returned as `reasoning_content`), stop strings, seeds, mult
 read the earlier turns again, and tool calls for agent clients (the server runs no tool; your client does) are all
 supported. Conversations can share a system prompt and resume after a title request. The server answers one request at a time and listens only on your
 machine unless you give it an API key. [Server guide](docs/server.md)
-
-`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.2 -> 10.6 s on code
-review) by rounding the prompt's activations to BF16 on the tensor cores; answers can then differ from the default
-exact path. Off by default. [Server guide](docs/server.md)
 
 For scripts and C programs there is also `torch run` and a small C API (`include/torch_engine.h`).
 [Development guide](docs/development.md)
