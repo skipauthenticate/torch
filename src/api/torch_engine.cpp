@@ -34,6 +34,16 @@ struct torch_engine {
 namespace {
 
 constexpr int kSpecDrafts = 5;
+constexpr size_t kOldParams = offsetof(torch_engine_params, checkpoints);
+constexpr size_t kOldStats = offsetof(torch_engine_stats, restored_tier);
+bool stats_size(uint32_t size) {
+    return size == sizeof(torch_engine_stats) || size == kOldStats;
+}
+void write_stats(torch_engine_stats* out, const torch_engine_stats& s) {
+    const auto n = out->struct_size;
+    std::memcpy(out, &s, n);
+    out->struct_size = n;
+}
 
 void copy_error(const std::string& message, char* out, size_t size) {
     if (out && size > 0) {
@@ -57,7 +67,8 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
         *engine = nullptr;
     // ABI 1 callers end the struct before fast_prefill
     const bool abi1 = o && o->struct_size == offsetof(torch_engine_options, fast_prefill);
-    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1) || !o->model) {
+    const bool abi2 = o && o->struct_size == offsetof(torch_engine_options, prefix_memory_bytes);
+    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1 && !abi2) || !o->model) {
         copy_error("Pass torch_engine_options with struct_size = sizeof(torch_engine_options) and a model path.", error,
                    error_size);
         return TORCH_ENGINE_INVALID;
@@ -65,6 +76,14 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
     try {
         auto e = std::make_unique<torch_engine>();
         model::Options& opt = e->options;
+        runtime::PrefixOptions prefix;
+        if (!abi1 && !abi2) {
+            prefix.memory_bytes = o->prefix_memory_bytes;
+            if (o->prefix_disk_dir)
+                prefix.directory = o->prefix_disk_dir;
+            prefix.disk_bytes = o->prefix_disk_bytes;
+        }
+        prefix.reserve(opt.reserve);
         opt.model = o->model;
         opt.context = o->context;
         opt.prefill_columns = o->prefill_columns;
@@ -93,7 +112,7 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
         e->model = std::make_unique<model::Model>(opt);
         if (o->draft)
             e->draft = std::make_unique<model::Draft>(*e->model, o->draft, variants, vocab, opt.context);
-        e->generator = std::make_unique<runtime::Generator>(*e->model, e->draft.get(), 1, opt.prefill_columns);
+        e->generator = std::make_unique<runtime::Generator>(*e->model, e->draft.get(), 1, opt.prefill_columns, prefix);
         *engine = e.release();
         return TORCH_ENGINE_OK;
     } catch (const std::exception& x) {
@@ -111,21 +130,45 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
     if (!lock.owns_lock())
         return TORCH_ENGINE_BUSY;
     e->error.clear();
-    if (!ids || n_ids < 1 || stable < 0 || stable > n_ids || !p || p->struct_size != sizeof(torch_engine_params) ||
-        p->max_tokens < 1 || (stats && stats->struct_size != sizeof(torch_engine_stats)) ||
-        (p->n_stop_ids > 0 && !p->stop_ids) || (p->speculative && !e->draft)) {
+    const bool extended = p && p->struct_size == sizeof(torch_engine_params);
+    if (!ids || n_ids < 1 || stable < 0 || stable > n_ids || !p || (!extended && p->struct_size != kOldParams) ||
+        p->max_tokens < 1 || (stats && !stats_size(stats->struct_size)) || (p->n_stop_ids > 0 && !p->stop_ids) ||
+        (p->speculative && !e->draft)) {
         e->error =
             "Pass ids, a stable length of 0 to n_ids, torch_engine_params and torch_engine_stats with their "
             "struct_size, max_tokens of at least 1, and speculative only with a draft file.";
         return TORCH_ENGINE_INVALID;
+    }
+    if (extended) {
+        if (p->n_checkpoints < 0 || p->n_checkpoints > n_ids ||
+            (p->n_checkpoints && (!p->checkpoints || !p->checkpoint_kinds))) {
+            e->error = "Give one position and kind per checkpoint.";
+            return TORCH_ENGINE_INVALID;
+        }
+        for (int i = 0; i < p->n_checkpoints; ++i) {
+            if (p->checkpoints[i] < 1 || p->checkpoints[i] > (stable ? stable : n_ids) ||
+                (p->checkpoint_kinds[i] != 1 && p->checkpoint_kinds[i] != 2)) {
+                e->error = "The checkpoint position or kind is outside the stable prompt.";
+                return TORCH_ENGINE_INVALID;
+            }
+        }
     }
     e->cancel = false;  // a cancel before this request does not stop it
     try {
         runtime::Request r;
         r.prompt.assign(ids, ids + n_ids);
         r.max_tokens = p->max_tokens;
-        r.stop_ids.assign(p->stop_ids, p->stop_ids + std::max(p->n_stop_ids, 0));
+        if (p->n_stop_ids > 0)
+            r.stop_ids.assign(p->stop_ids, p->stop_ids + p->n_stop_ids);
+        if (extended)
+            for (int i = 0; i < p->n_checkpoints; ++i)
+                r.checkpoints.emplace_back(static_cast<size_t>(p->checkpoints[i]),
+                                           static_cast<PrefixKind>(p->checkpoint_kinds[i]));
         r.spec = p->speculative ? kSpecDrafts : 0;
+        r.copy_depth = p->speculative ? model::kMaxColumns - 1 : 0;
+        // Before ABI 3 any nonzero value meant "on"; only ABI 3 callers mean long copied passages by 2
+        if (extended && p->speculative == TORCH_ENGINE_SPECULATIVE_BUFFERED && !p->sample)
+            r.copy_depth = std::max(r.copy_depth, e->model->copy_window_limit() - 1);
         r.draft_depth = r.spec;  // without speculation the draft layer only keeps its K/V rows
         r.swaps_after_prompt = e->swaps;
         r.window = model::kMaxColumns;
@@ -171,8 +214,13 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
         s.tokens_per_window = res.windows > 0 ? static_cast<double>(res.window_tokens) / res.windows : 1.0;
         s.resident_experts = x.resident, s.total_experts = x.experts;
         s.expert_hits = x.hits, s.expert_misses = x.misses;
+        s.restored_tier = static_cast<int32_t>(res.prefix.tier);
+        s.restore_seconds = res.prefix.restore_seconds;
+        s.parked_bytes = res.prefix.parked_bytes;
+        s.checkpoints_memory = res.prefix.in_memory;
+        s.checkpoints_disk = res.prefix.on_disk;
         if (stats)
-            *stats = s;
+            write_stats(stats, s);
         return res.cancelled ? TORCH_ENGINE_CANCELLED : TORCH_ENGINE_OK;
     } catch (const std::exception& x) {
         e->error = x.what();
@@ -192,7 +240,7 @@ torch_engine_status torch_engine_reset(torch_engine* e) {
     if (!lock.owns_lock())
         return TORCH_ENGINE_BUSY;
     try {
-        e->model->reset();
+        e->generator->forget();
         return TORCH_ENGINE_OK;
     } catch (const std::exception& x) {
         e->error = x.what();
@@ -200,14 +248,18 @@ torch_engine_status torch_engine_reset(torch_engine* e) {
     }
 }
 
+torch_engine_status torch_engine_forget(torch_engine* e) {
+    return torch_engine_reset(e);
+}
+
 const char* torch_engine_error(const torch_engine* e) {
     return e ? e->error.c_str() : "";
 }
 
 torch_engine_status torch_engine_last_stats(const torch_engine* e, torch_engine_stats* stats) {
-    if (!e || !stats || stats->struct_size != sizeof(torch_engine_stats))
+    if (!e || !stats || !stats_size(stats->struct_size))
         return TORCH_ENGINE_INVALID;
-    *stats = e->last;
+    write_stats(stats, e->last);
     return TORCH_ENGINE_OK;
 }
 

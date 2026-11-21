@@ -332,17 +332,18 @@ constexpr int kRing256 = std::max({8 * kStages * kWarpStage, 2 * 16 * raw_pitch<
 // The kernel (gemm.h) for format T at kT threads (512 or 256). Shared memory: the item's fragments [unit][32 lanes]
 // [16 B] (a thread's a0..a3: words t of rows g and g + 8, then words 4 + t), its records [unit][8 g][16 B], then the
 // ring.
-template <Type T, int kT>
+template <Type T, int kT, bool kDirect = false>
 __global__ void __launch_bounds__(kT, 512 / kT) gemm_kernel(GemmArgs a) {
     using F = Fmt<T>;
+    static_assert(!kDirect || T == Type::Q8_0);
     constexpr int kRunUnits = 32, kRun = kRunUnits / F::kUnits * F::kBytes;  // raw bytes of 32 units of a row
     constexpr int kRawPitch = raw_pitch<T>(), kRawChunks = kRawPitch / 16;
     constexpr int kPass = 32 * (kT / 256), kPitch = node_pitch(kT);  // a pass's columns
     static_assert(2 * 16 * kRawPitch <= (kT == 512 ? kRing : kRing256<T>), "the ring holds two raw stages");
     extern __shared__ uint4 smem[];
     uint8_t* frag = reinterpret_cast<uint8_t*>(smem);
-    uint8_t* rec = frag + size_t{512} * a.units;
-    uint8_t* ring = rec + size_t{128} * a.units;
+    uint8_t* rec = kDirect ? frag : frag + size_t{512} * a.units;
+    uint8_t* ring = kDirect ? frag : rec + size_t{128} * a.units;
     const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp, g = lane / 4, t = lane % 4;
     const int ls = warp % 8, half = warp / 8;
     const int octets = (a.units + 7) / 8, row_tiles = a.rows / 16;  // a last octet may be short (K = 640: 20 units)
@@ -356,47 +357,49 @@ __global__ void __launch_bounds__(kT, 512 / kT) gemm_kernel(GemmArgs a) {
         const int last = routed ? first + a.buckets.counts[expert] : min(first + a.range, a.x.columns);
         if (first >= last)
             continue;  // an unrouted expert of a read-ahead pass (the whole block)
-        // ---- decode the 16 rows, 32 units at a time
-        const int chunks = (a.units + kRunUnits - 1) / kRunUnits;
-        const auto run_of = [&](int i, int c) { return w + int64_t{row0 + i} * a.row_bytes + c * kRun; };
-        const auto issue_raw = [&](int c) {
-            uint8_t* stage = ring + (c % 2) * 16 * kRawPitch;
-            const int bytes = min(kRunUnits, a.units - kRunUnits * c) / F::kUnits * F::kBytes;
-            for (int f = threadIdx.x; f < 16 * kRawChunks; f += kT) {
-                const int i = f / kRawChunks, j = f % kRawChunks;
-                const uint8_t* run = run_of(i, c);
-                const auto* src =
-                    reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(run) & ~uintptr_t{15}) + 16 * j;
-                if (src < run + bytes)
-                    copy16(stage + i * kRawPitch + 16 * j, src);
+        if constexpr (!kDirect) {
+            // ---- decode the 16 rows, 32 units at a time
+            const int chunks = (a.units + kRunUnits - 1) / kRunUnits;
+            const auto run_of = [&](int i, int c) { return w + int64_t{row0 + i} * a.row_bytes + c * kRun; };
+            const auto issue_raw = [&](int c) {
+                uint8_t* stage = ring + (c % 2) * 16 * kRawPitch;
+                const int bytes = min(kRunUnits, a.units - kRunUnits * c) / F::kUnits * F::kBytes;
+                for (int f = threadIdx.x; f < 16 * kRawChunks; f += kT) {
+                    const int i = f / kRawChunks, j = f % kRawChunks;
+                    const uint8_t* run = run_of(i, c);
+                    const auto* src =
+                        reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(run) & ~uintptr_t{15}) + 16 * j;
+                    if (src < run + bytes)
+                        copy16(stage + i * kRawPitch + 16 * j, src);
+                }
+                copy_commit();
+            };
+            issue_raw(0);
+            for (int c = 0; c < chunks; ++c) {
+                if (c + 1 < chunks) {
+                    issue_raw(c + 1);
+                    copy_wait<1>();
+                } else {
+                    copy_wait<0>();
+                }
+                __syncthreads();
+                const uint8_t* stage = ring + (c % 2) * 16 * kRawPitch;
+                const int units = min(kRunUnits, a.units - kRunUnits * c);
+                for (int task = threadIdx.x; task < units * kWarp; task += kT) {
+                    const int lu = task / kWarp, l = task % kWarp, gg = l / 4, tt = l % 4;
+                    const int s = lu % F::kUnits, at = lu / F::kUnits * F::kBytes, u = kRunUnits * c + lu;
+                    const uint8_t* ra = stage + gg * kRawPitch + (reinterpret_cast<uintptr_t>(run_of(gg, c)) & 15) + at;
+                    const uint8_t* rb =
+                        stage + (gg + 8) * kRawPitch + (reinterpret_cast<uintptr_t>(run_of(gg + 8, c)) & 15) + at;
+                    uint32_t a0, a1, a2, a3;
+                    F::words(ra, s, tt, a0, a2);
+                    F::words(rb, s, tt, a1, a3);
+                    *reinterpret_cast<uint4*>(frag + size_t{512} * u + 16 * l) = make_uint4(a0, a1, a2, a3);
+                    if (tt == 0)
+                        *reinterpret_cast<uint4*>(rec + size_t{128} * u + 16 * gg) = F::record(ra, rb, s);
+                }
+                __syncthreads();  // the next issue overwrites this stage; the last hands the ring to the passes
             }
-            copy_commit();
-        };
-        issue_raw(0);
-        for (int c = 0; c < chunks; ++c) {
-            if (c + 1 < chunks) {
-                issue_raw(c + 1);
-                copy_wait<1>();
-            } else {
-                copy_wait<0>();
-            }
-            __syncthreads();
-            const uint8_t* stage = ring + (c % 2) * 16 * kRawPitch;
-            const int units = min(kRunUnits, a.units - kRunUnits * c);
-            for (int task = threadIdx.x; task < units * kWarp; task += kT) {
-                const int lu = task / kWarp, l = task % kWarp, gg = l / 4, tt = l % 4;
-                const int s = lu % F::kUnits, at = lu / F::kUnits * F::kBytes, u = kRunUnits * c + lu;
-                const uint8_t* ra = stage + gg * kRawPitch + (reinterpret_cast<uintptr_t>(run_of(gg, c)) & 15) + at;
-                const uint8_t* rb =
-                    stage + (gg + 8) * kRawPitch + (reinterpret_cast<uintptr_t>(run_of(gg + 8, c)) & 15) + at;
-                uint32_t a0, a1, a2, a3;
-                F::words(ra, s, tt, a0, a2);
-                F::words(rb, s, tt, a1, a3);
-                *reinterpret_cast<uint4*>(frag + size_t{512} * u + 16 * l) = make_uint4(a0, a1, a2, a3);
-                if (tt == 0)
-                    *reinterpret_cast<uint4*>(rec + size_t{128} * u + 16 * gg) = F::record(ra, rb, s);
-            }
-            __syncthreads();  // the next issue overwrites this stage; the last hands the ring to the passes
         }
         // ---- passes of kPass columns
         for (int col0 = first; col0 < last; col0 += kPass) {
@@ -442,8 +445,17 @@ __global__ void __launch_bounds__(kT, 512 / kT) gemm_kernel(GemmArgs a) {
                     const int u = 8 * b + ls;
                     if (u >= a.units)  // this lane set has no unit in a short last octet
                         continue;
-                    const uint4 fr = *reinterpret_cast<const uint4*>(frag + size_t{512} * u + 16 * lane);
-                    const uint4 rc = *reinterpret_cast<const uint4*>(rec + size_t{128} * u + 16 * g);
+                    uint4 fr, rc;
+                    if constexpr (kDirect) {  // wide Q8 rows read their two weight blocks for this pass only
+                        const uint8_t* ra = w + int64_t{row0 + g} * a.row_bytes + F::kBytes * u;
+                        const uint8_t* rb = ra + 8 * a.row_bytes;
+                        F::words(ra, 0, t, fr.x, fr.z);
+                        F::words(rb, 0, t, fr.y, fr.w);
+                        rc = F::record(ra, rb, 0);
+                    } else {
+                        fr = *reinterpret_cast<const uint4*>(frag + size_t{512} * u + 16 * lane);
+                        rc = *reinterpret_cast<const uint4*>(rec + size_t{128} * u + 16 * g);
+                    }
                     const uint8_t* stage = wring + (b % kStages) * kWarpStage;
 #pragma unroll
                     for (int n = 0; n < 4; ++n) {
@@ -907,7 +919,31 @@ struct BfArgs {
     float *y, *y2;
     int columns;
     float silu_scale;  // non-zero: w's rows store silu(silu_scale * sum)
+    const uint4* packed = nullptr;
+    const float4* packed_x = nullptr;
 };
+
+// Store the same 16-byte chunks in the order the product reads them across rows or input columns.
+template <bool kInput>
+__global__ void pack_bf16_tiles(BfArgs a, uint4* out) {
+    constexpr int tile = 16, pitch = kInput ? kBfCols : kBfRows;
+    __shared__ uint4 values[tile][tile + 1];
+    const int x = threadIdx.x % tile, y = threadIdx.x / tile;
+    const int chunk0 = blockIdx.x * tile, row0 = blockIdx.y * tile;
+    const int width = kInput ? a.chunks * 2 : a.chunks;
+    const int row = min(row0 + y, (kInput ? a.columns : a.total) - 1);
+    const uint4* src;
+    if constexpr (kInput)
+        src = reinterpret_cast<const uint4*>(a.x) + int64_t{row} * width;
+    else
+        src = row < a.rows ? reinterpret_cast<const uint4*>(a.w) + int64_t{row} * width
+                           : reinterpret_cast<const uint4*>(a.w2) + int64_t{row - a.rows} * width;
+    if (chunk0 + x < width)
+        values[y][x] = src[chunk0 + x];
+    __syncthreads();
+    if (chunk0 + y < width)
+        out[(int64_t{row0 / pitch} * width + chunk0 + y) * pitch + row0 % pitch + x] = values[x][y];
+}
 
 __device__ __forceinline__ float bf16_value(uint32_t v) {
     return __uint_as_float(v << 16);
@@ -958,6 +994,9 @@ __device__ __forceinline__ void bf_fold(float (&node)[5][4][4], float (&acc)[4][
 // a pass's last chunk its sums join the tree: a binary counter over the passes, level t combining when 2^(t + 1) passes
 // are done, which with the bit-reversed order pairs lanes l and l ^ 16 first, then ^ 8, ^ 4, ^ 2, ^ 1, as warp_sum
 // does. Every lane has a chunk (chunks >= 32), so no pass is empty.
+enum class BfLayout { Original, Weights, WeightsAndInput };
+
+template <BfLayout layout>
 __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
     extern __shared__ uint4 bf_shared[];
     BfStage* stage = reinterpret_cast<BfStage*>(bf_shared);
@@ -987,16 +1026,28 @@ __global__ void __launch_bounds__(kBfThreads, 1) gemm_bf16_kernel(BfArgs a) {
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int j = (static_cast<int>(threadIdx.x) + k * kBfThreads) / kBfRows;
-            l.w[k] = j < n ? wrow[k][order[f0 + j] & ~kBfLast] : make_uint4(0, 0, 0, 0);
+            const int chunk = j < n ? order[f0 + j] & ~kBfLast : 0;
+            if constexpr (layout != BfLayout::Original) {
+                const int row = (threadIdx.x + k * kBfThreads) % kBfRows;
+                l.w[k] =
+                    j < n ? a.packed[(int64_t{blockIdx.y} * a.chunks + chunk) * kBfRows + row] : make_uint4(0, 0, 0, 0);
+            } else
+                l.w[k] = j < n ? wrow[k][chunk] : make_uint4(0, 0, 0, 0);
         }
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const int f = static_cast<int>(threadIdx.x) + k * kBfThreads, c = f % kBfCols, j = f / kBfCols / 2,
                       h = f / kBfCols % 2;
-            const int col = min(col0 + c, a.columns - 1);
-            l.x[k] = j < n ? *reinterpret_cast<const float4*>(
-                                 a.x + (int64_t{col} * a.chunks + (order[f0 + j] & ~kBfLast)) * 8 + 4 * h)
-                           : make_float4(0, 0, 0, 0);
+            if constexpr (layout == BfLayout::WeightsAndInput) {
+                const int vector = j < n ? (order[f0 + j] & ~kBfLast) * 2 + h : 0;
+                l.x[k] = j < n ? a.packed_x[(int64_t{blockIdx.x} * a.chunks * 2 + vector) * kBfCols + c]
+                               : make_float4(0, 0, 0, 0);
+            } else {
+                const int col = min(col0 + c, a.columns - 1);
+                l.x[k] = j < n ? *reinterpret_cast<const float4*>(
+                                     a.x + (int64_t{col} * a.chunks + (order[f0 + j] & ~kBfLast)) * 8 + 4 * h)
+                               : make_float4(0, 0, 0, 0);
+            }
         }
     };
     const auto store = [&](const BfLoads& l, BfStage& st) {
@@ -1134,7 +1185,7 @@ __global__ void __launch_bounds__(kBfThreads) gemm_bf16_few_kernel(BfArgs a) {
 }  // namespace
 
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
-               cudaStream_t stream, const uint8_t* w2, int rows2, float* y2) {
+               cudaStream_t stream, const uint8_t* w2, int rows2, float* y2, void* workspace, size_t workspace_bytes) {
     if (cols % 8 != 0 || cols < 256 || cols / 8 > kBfLast || rows < 1 || columns < 1 || rows2 < 0)
         throw Error("gemm_bf16 takes rows of 256 to 262,144 values (a multiple of 8) and at least one column.");
     BfArgs a{w, w2, rows, rows + rows2, cols / 8, rows + rows2, x, y, y2, columns, silu_scale};
@@ -1148,15 +1199,33 @@ void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, i
                                    kBfThreads, 0, stream>>>(a);
     }
     const size_t shared = 2 * sizeof(BfStage) + sizeof(uint16_t) * static_cast<size_t>(a.chunks);
-    static size_t allowed = 0;
-    if (shared > allowed) {
-        TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              static_cast<int>(shared)));
-        allowed = shared;
-    }
     const dim3 grid(static_cast<unsigned>((columns + kBfCols - 1) / kBfCols),
                     static_cast<unsigned>((a.end + kBfRows - 1) / kBfRows));
-    gemm_bf16_kernel<<<grid, kBfThreads, shared, stream>>>(a);
+    const auto run = [&]<BfLayout layout>() {
+        static size_t allowed = 0;
+        if (shared > allowed) {
+            TORCH_CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel<layout>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  static_cast<int>(shared)));
+            allowed = shared;
+        }
+        gemm_bf16_kernel<layout><<<grid, kBfThreads, shared, stream>>>(a);
+    };
+    const size_t weight_bytes = size_t{grid.y} * kBfRows * cols * 2;
+    if (columns >= 256 && workspace && weight_bytes <= workspace_bytes) {
+        auto* weights = static_cast<uint4*>(workspace);
+        pack_bf16_tiles<false><<<dim3((a.chunks + 15) / 16, grid.y * (kBfRows / 16)), 256, 0, stream>>>(a, weights);
+        a.packed = weights;
+        const size_t input_bytes = size_t{grid.x} * kBfCols * cols * sizeof(float);
+        if (input_bytes <= workspace_bytes - weight_bytes) {
+            auto* input = reinterpret_cast<uint4*>(static_cast<uint8_t*>(workspace) + weight_bytes);
+            pack_bf16_tiles<true>
+                <<<dim3((2 * a.chunks + 15) / 16, grid.x * (kBfCols / 16)), 256, 0, stream>>>(a, input);
+            a.packed_x = reinterpret_cast<const float4*>(input);
+            run.template operator()<BfLayout::WeightsAndInput>();
+        } else
+            run.template operator()<BfLayout::Weights>();
+    } else
+        run.template operator()<BfLayout::Original>();
 }
 
 int expert_slots(int n_expert, int routes) {
@@ -1268,16 +1337,22 @@ void gemm_q8_experts(Type type, const uint8_t* const* table, const ExpertBuckets
 
 void gemm_q8(Type type, const uint8_t* w, int rows, int cols, const Q8Columns& x, float* y, cudaStream_t stream) {
     const TypeInfo& info = *type_info(static_cast<uint32_t>(type));
-    if (!gemm_q8_supports(type) || rows % 16 != 0 || cols % static_cast<int>(info.block_elements) != 0 ||
-        !gemm_q8_fits(cols) || x.units != cols / 32 || x.columns < 1)
+    if (!gemm_q8_can_run(type, cols, x.columns) || rows % 16 != 0 ||
+        cols % static_cast<int>(info.block_elements) != 0 || x.units != cols / 32 || x.columns < 1)
         throw Error(
             "gemm_q8 takes Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL or Q8_0 rows (a multiple of 16 rows of whole "
-            "blocks, short enough for gemm_q8_fits) and their columns.");
+            "blocks, with a supported width and column count) and their columns.");
     // Items of one column range run on every SM at once, so the range's activations stay in the 4 MB L2: 256
     // columns at K = 6,144 (1.8 MB), 512 below.
-    const int range = cols > 4096 ? 256 : 512;
+    const bool direct = type == Type::Q8_0 && !gemm_q8_fits(cols);
+    const int range = direct ? 32 : (cols > 4096 ? 256 : 512);
     const auto row = static_cast<int64_t>(row_bytes(info, static_cast<uint64_t>(cols)));
     const GemmArgs a{w, rows, cols / 32, row, x, range, y, nullptr, {}, nullptr};
+    if (direct) {
+        const int blocks = (rows / 16) * blocks_for(x.columns, range);
+        gemm_kernel<Type::Q8_0, 256, true><<<blocks, 256, kRing256<Type::Q8_0>, stream>>>(a);
+        return;
+    }
     switch (type) {
         case Type::Q6_K:
             return launch_gemm<Type::Q6_K>(a, stream);

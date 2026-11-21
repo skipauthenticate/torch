@@ -5,6 +5,40 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-20
+
+### Added
+
+- Saved prompts, opt-in with `--prefix-memory-gib N` ([Sessions](docs/server.md#sessions)). Conversations that share a
+  system prompt and tools continue from a saved prefix, and a conversation resumes its last turn after a client's
+  title request. On the Jetson AGX Orin 64 GB on 2026-11-19 (IQ3_S), a new conversation sharing 2,073 tokens showed
+  its first output in 2.28 s instead of 8.73 s, and one sharing 10,000 tokens in 2.07 s instead of 38.35 s. A 2 GiB
+  reservation keeps about 1,040 fewer experts in memory, and generation on fresh prompts was 0.44-0.86 tokens/s
+  slower. Saving to disk needs an explicit directory on a local file system; the engine refuses one that cannot hold
+  its files.
+- Version 3 of the C API: checkpoint positions, the storage tier a request restored from, and a call that clears saved
+  prompts. Callers built for versions 1 and 2 keep working, with their previous meaning of `speculative`.
+
+### Changed
+
+- Speculative greedy requests also check up to 7 tokens copied from earlier input. Only tokens the model itself
+  picks are kept, so the output is unchanged. Repetitive text on 2026-11-19: 50.90 -> 70.17 tokens/s on IQ3_S and
+  47.56 -> 69.54 on UD-IQ3_XXS.
+- Faster exact prompt processing: wide 8-bit rows stream through the prompt products, and short verification windows
+  reuse the mixer weights. A 4,096-token code-review prompt: 288 -> 304 tokens/s on IQ3_S and 288 -> 350 on
+  UD-IQ3_XXS.
+
+### Known regressions
+
+- Both files keep fewer experts in memory than 0.4.0, and some pauses between output groups are longer (UD-IQ3_XXS
+  repetition: the median longest pause went from 126 to 163 ms).
+
+### Verified
+
+- On both files, the 36 benchmark answers (9,216 generated tokens) are identical to 0.4.0, fixed-seed sampling gives
+  the same tokens, and model parity passes (mean KL 0.00143 on IQ3_S, 0.00249 on UD-IQ3_XXS). Saved prompts restored
+  from memory, from the KV cache and from disk give byte-identical output to a fresh run at 300 to 70,000 tokens.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added

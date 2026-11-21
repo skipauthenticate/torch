@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <random>
+#include <utility>
 
 #include "core/error.h"
 #include "model/window_policy.h"
@@ -19,13 +20,42 @@ double ms_since(Clock::time_point start) {
 
 }  // namespace
 
-Generator::Generator(model::Model& model, model::Draft* draft, int variants, int prefill_columns)
-    : m_(model), draft_(draft), variants_(draft ? variants : 0), prefill_columns_(prefill_columns) {}
+Generator::Generator(model::Model& model, model::Draft* draft, int variants, int prefill_columns,
+                     const PrefixOptions& options)
+    : m_(model), draft_(draft), variants_(draft ? variants : 0), prefill_columns_(prefill_columns) {
+    if (options.enabled()) {
+        if (prefill_columns < 1)
+            throw Error("Prefix checkpoints need prompt prefill.");
+        prefix_ = std::make_unique<PrefixCache>(model, draft, variants_, options);
+    }
+}
+
+void Generator::forget() {
+    if (prefix_)
+        prefix_->clear();
+    sequence_.clear();
+    m_.reset();
+}
 
 Result Generator::generate(const Request& r, const Observer& o) {
     const std::vector<int32_t>& prompt = r.prompt;
     std::vector<int32_t>& sequence = sequence_;
     Result out;
+    const auto request_start = Clock::now();
+    const size_t prefilled = r.stable > 0 ? std::min(r.stable, prompt.size()) : prompt.size();
+    std::vector<std::pair<size_t, PrefixKind>> boundaries;
+    if (prefix_) {
+        if (prompt.empty())
+            throw Error("A prompt must have at least one token.");
+        boundaries = r.checkpoints;
+        boundaries.emplace_back(prefilled, PrefixKind::turn);
+        for (const auto& [at, kind] : boundaries)
+            if (!at || at > prefilled || (kind != PrefixKind::block && kind != PrefixKind::turn))
+                throw Error("A checkpoint must be a block or turn inside the stable prompt.");
+        std::erase_if(boundaries, [&](const auto& v) { return v.first > static_cast<size_t>(m_.checkpoint_limit()); });
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    }
     // A request whose prompt extends the sequence so far (the tokens fed to the model) feeds only its new tokens; any
     // other prompt starts a new sequence. Sessions, option B: with prefill, back to the end of the last prefill, so the
     // tokens fed since (generated ones, and a speculative window's columns past the sequence) are prefilled again with
@@ -33,15 +63,26 @@ Result Generator::generate(const Request& r, const Observer& o) {
     // or starts again, never extends: generated ids rarely equal the history a template renders.
     Resume& resume = out.resume;
     resume.fed = static_cast<size_t>(m_.position());
-    const bool back = prefill_columns_ > 0 && m_.prefill_end() >= 0;
-    const size_t from = back ? static_cast<size_t>(m_.prefill_end()) : r.rewind_only ? 0 : resume.fed;
-    if (from <= sequence.size() && from < prompt.size() &&
-        std::equal(sequence.begin(), sequence.begin() + static_cast<std::ptrdiff_t>(from), prompt.begin()))
-        resume.at = from;
-    if (resume.at == 0 && resume.fed > 0)
-        m_.reset(), resume.reset = true;
-    if (resume.at > 0 && back)
-        m_.rewind(), resume.rewound = true;
+    if (prefix_) {
+        resume.at = prefix_->resume(prompt, prefilled, out.prefix);
+        resume.rewound = resume.at > 0;
+        resume.reset = !resume.at && resume.fed > 0;
+    } else {
+        const bool back = prefill_columns_ > 0 && m_.prefill_end() >= 0;
+        const size_t from = back ? static_cast<size_t>(m_.prefill_end()) : r.rewind_only ? 0 : resume.fed;
+        if (from <= sequence.size() && from < prompt.size() &&
+            std::equal(sequence.begin(), sequence.begin() + static_cast<std::ptrdiff_t>(from), prompt.begin()))
+            resume.at = from;
+        if (resume.at == 0 && resume.fed > 0)
+            m_.reset(), resume.reset = true;
+        if (resume.at > 0 && back) {
+            const auto start = Clock::now();
+            m_.rewind();
+            resume.rewound = true;
+            out.prefix.tier = PrefixTier::arena;
+            out.prefix.restore_seconds = ms_since(start) / 1000.0;
+        }
+    }
     if (o.on_start)
         o.on_start(resume);
     sequence = prompt;  // until the prompt is in: a cancel then leaves only what was fed (below)
@@ -83,13 +124,14 @@ Result Generator::generate(const Request& r, const Observer& o) {
     int prompt_steps = 0;
     // The prompt's positions [0, prefilled) go as prefill chunks, the last one ending exactly there, and the rest as
     // windows: with a caller's stable length, the end of the last prefill is where the next turn rewinds to.
-    const size_t prefilled = r.stable > 0 ? std::min(r.stable, prompt.size()) : prompt.size();
     bool cancel_now = false;  // the caller's on_progress asked to stop: no window after the current one
     const auto progress = [&] {
         if (o.on_progress && !o.on_progress(static_cast<size_t>(m_.position()), prompt.size()))
             cancel_now = true;
     };
-    const auto prompt_start = Clock::now();
+    const auto prompt_start = prefix_ ? request_start : Clock::now();
+    auto boundary =
+        std::find_if(boundaries.begin(), boundaries.end(), [&](const auto& mark) { return mark.first > resume.at; });
     for (size_t i = resume.at; i < sequence.size();) {
         // Prompt tokens are known, so they go `window` at a time, keeping `keep` of each window (or in prefill chunks
         // of up to prefill_columns tokens, kept whole); generated tokens go one at a time.
@@ -98,7 +140,9 @@ Result Generator::generate(const Request& r, const Observer& o) {
             break;
         }
         const bool chunked = prefill_columns_ > 0 && i < prefilled;
-        const size_t width = chunked ? std::min<size_t>(static_cast<size_t>(prefill_columns_), prefilled - i)
+        const size_t width = chunked
+                                 ? std::min<size_t>(static_cast<size_t>(prefill_columns_),
+                                                    (boundary != boundaries.end() ? boundary->first : prefilled) - i)
                              : i < prompt.size() ? std::min<size_t>(static_cast<size_t>(r.window), prompt.size() - i)
                                                  : 1;
         const size_t kept = chunked || i < static_cast<size_t>(r.accept_from)
@@ -137,9 +181,13 @@ Result Generator::generate(const Request& r, const Observer& o) {
         // whose next token is known, then drafts from the argmax at the last position while tokens are still to be
         // generated (the KV-only pass at the window's other positions in the same call). A chunk's positions go
         // kMaxColumns at a time, each group's residuals staged into the window columns.
+        const bool checkpoint = chunked && boundary != boundaries.end() && boundary->first == i + kept;
+        // The final speculative pass can overwrite the oldest ring rows. Save them before that pass.
+        const bool last_checkpoint = checkpoint && i + kept == prompt.size() && draft_;
+        const size_t before_save = kept - static_cast<size_t>(last_checkpoint);
         for (size_t v = 0; v < n_variants; ++v)
-            for (size_t g = 0; g < kept; g += static_cast<size_t>(model::kMaxColumns)) {
-                const size_t at = i + g, count = std::min<size_t>(kept - g, model::kMaxColumns);
+            for (size_t g = 0; g < before_save; g += static_cast<size_t>(model::kMaxColumns)) {
+                const size_t at = i + g, count = std::min<size_t>(before_save - g, model::kMaxColumns);
                 const bool kv_only = at + count < prompt.size();
                 if (!kv_only && sequence.size() >= total)
                     break;
@@ -155,6 +203,7 @@ Result Generator::generate(const Request& r, const Observer& o) {
                                                sequence.begin() + static_cast<std::ptrdiff_t>(at + count));
                     after.push_back(next);
                     draft_->run(static_cast<int>(v), position, after, r.draft_depth, st.drafts.emplace_back());
+                    out.extended = position + static_cast<int>(count) - 1;
                 }
                 (kv_only ? st.kv_ms : st.draft_ms) += ms_since(draft_start);
                 if (kv_only)
@@ -162,6 +211,25 @@ Result Generator::generate(const Request& r, const Observer& o) {
                 else
                     ++st.draft_steps;
             }
+        if (checkpoint) {
+            if (draft_)
+                m_.stage_residuals(static_cast<int>(kept) - 1, 1);
+            while (boundary != boundaries.end() && boundary->first == i + kept) {
+                prefix_->save(std::span(prompt).first(i + kept), boundary->second);
+                ++boundary;
+            }
+            if (last_checkpoint && sequence.size() < total) {
+                for (size_t v = 0; v < n_variants; ++v) {
+                    auto& st = out.variants[v];
+                    const auto began = Clock::now();
+                    draft_->run(static_cast<int>(v), static_cast<int>(i + kept) - 1, std::span(&next, 1), r.draft_depth,
+                                st.drafts.emplace_back());
+                    out.extended = static_cast<int>(i + kept) - 1;
+                    st.draft_ms += ms_since(began);
+                    ++st.draft_steps;
+                }
+            }
+        }
         if (early.valid())
             early.get();
         if (kept < width && !m_.accept(static_cast<int>(kept)))
@@ -208,22 +276,47 @@ Result Generator::generate(const Request& r, const Observer& o) {
             return policy.more(drafted, prob);
         };
         std::vector<model::Drafted> d = out.variants[0].drafts.back();
-        out.depth_tried.assign(static_cast<size_t>(r.spec), 0),
-            out.depth_accepted.assign(static_cast<size_t>(r.spec), 0);
-        std::vector<int32_t> win, a(static_cast<size_t>(r.spec) + 1);
+        const int limit = adaptive && !r.sample ? std::max(r.spec, r.copy_depth) : r.spec;
+        out.depth_tried.assign(static_cast<size_t>(limit), 0), out.depth_accepted.assign(static_cast<size_t>(limit), 0);
+        std::vector<int32_t> win, a(static_cast<size_t>(limit) + 1);
+        std::vector<int32_t> copy;  // the next window's copied tokens: a copy, since `sequence` grows meanwhile
+        size_t next_wide = 0;
+        const auto next_copy = [&]() -> std::span<const int32_t> {
+            const int depth = static_cast<int>(std::min<size_t>(limit, total - sequence.size() - 1));
+            const auto short_copy = model::matching_continuation(sequence, std::min(depth, model::kMaxColumns - 1));
+            if (!short_copy.empty() && depth >= 127 && sequence.size() >= next_wide) {
+                const auto passage = model::matching_continuation(sequence, depth, sequence.size() - prompt.size());
+                const auto stop = [&](int32_t id) {
+                    return id == static_cast<int32_t>(m_.config().eos_token) ||
+                           std::find(r.stop_ids.begin(), r.stop_ids.end(), id) != r.stop_ids.end();
+                };
+                if (!passage.empty() && std::none_of(passage.begin(), passage.end(), stop))
+                    return passage;
+            }
+            return short_copy;
+        };
         while (sequence.size() < total && !(out.cancelled = cancel_now)) {
             const int p = m_.position();           // the window's first position, that of sequence.back()
             int use = static_cast<int>(d.size());  // drafts to verify
-            if (adaptive) {
+            const bool used_copy = !copy.empty();
+            if (used_copy)
+                use = static_cast<int>(copy.size());
+            else if (adaptive) {
                 for (size_t j = 0; j < d.size(); ++j)
                     policy.more(static_cast<int>(j) + 1, d[j].prob);  // records the probabilities
                 use = policy.width();
             }
             win.assign(1, sequence.back());
-            for (int j = 0; j < use; ++j)
-                win.push_back(d[static_cast<size_t>(j)].token);
+            if (used_copy)
+                win.insert(win.end(), copy.begin(), copy.end());
+            else
+                for (int j = 0; j < use; ++j)
+                    win.push_back(d[static_cast<size_t>(j)].token);
+            const std::vector<int32_t> passage = std::move(copy);
+            copy.clear();
+            const bool wide = use >= model::kMaxColumns;
             const auto verify_start = Clock::now();
-            if (!m_.verify(win)) {
+            if (!(wide ? m_.prefill(win, std::span(a).first(win.size())) : m_.verify(win))) {
                 if (!m_.cancelled())
                     throw Error(m_.error());
                 out.cancelled = true;
@@ -235,46 +328,74 @@ Result Generator::generate(const Request& r, const Observer& o) {
                 n = static_cast<int>(drawn.size());
                 std::copy(drawn.begin(), drawn.end(), a.begin());
             } else {
-                for (int t = 0; t <= use; ++t)
-                    a[static_cast<size_t>(t)] = m_.argmax(t);
-                while (n <= use && d[static_cast<size_t>(n - 1)].token == a[static_cast<size_t>(n - 1)] &&
+                if (!wide)
+                    for (int t = 0; t <= use; ++t)
+                        a[static_cast<size_t>(t)] = m_.argmax(t);
+                while (n <= use && win[static_cast<size_t>(n)] == a[static_cast<size_t>(n - 1)] &&
                        a[static_cast<size_t>(n - 1)] != static_cast<int32_t>(m_.config().eos_token))
                     ++n;
             }
             for (int j = 0; j < std::min(use, n); ++j)  // draft j was verified with every earlier one accepted
                 ++out.depth_tried[static_cast<size_t>(j)], out.depth_accepted[static_cast<size_t>(j)] += j < n - 1;
-            if (n <= use && !m_.accept(n))
+            if (!wide && n <= use && !m_.accept(n))
                 throw Error(m_.error());
             const double this_verify_ms = ms_since(verify_start);
             out.verify_ms += this_verify_ms;
             if (++out.windows == r.cancel_after)
                 m_.cancel();
             progress();
-            out.window_tokens += n, out.verified_drafts += use;
+            out.verified_drafts += use;
+            if (wide && n <= use) {  // the chunk restored its input state after the first mismatch
+                next_wide = sequence.size() + 128;
+                copy.assign(passage.begin(), passage.begin() + (model::kMaxColumns - 1));
+                continue;
+            }
+            out.window_tokens += n;
             const size_t before = sequence.size();
             sequence.insert(sequence.end(), a.begin(), a.begin() + n);
             const size_t counted = std::min<size_t>(static_cast<size_t>(n), total - before);
             generated(std::span(sequence.data() + before, counted));
-            if (const size_t stop = stops(std::span(sequence.data() + before, counted)); stop > 0)
-                total = before + stop, out.stopped = true, out.stop_window = n,
-                out.stop_column = static_cast<int>(stop) - 1;
-            const auto extend_start = Clock::now();
-            if (sequence.size() < total) {
-                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), r.spec, d,
-                            stop_early ? more : std::function<bool(int, float)>());
-                out.extended = p + n - 1;
-            } else {  // the request's end: the K/V-only pass over its last window, for the drafts of a request that
-                      // follows
-                draft_->run(0, p, std::span(a.data(), static_cast<size_t>(n)), 0, scratch);
+            // Keep callbacks as responsive to stop IDs and caller stops as the ordinary windows.
+            for (size_t at = 0; at < counted; at += model::kMaxColumns) {
+                const auto group =
+                    std::span(sequence.data() + before + at, std::min<size_t>(model::kMaxColumns, counted - at));
+                if (const size_t stop = stops(group); stop > 0) {
+                    total = before + at + stop;
+                    out.stopped = true;
+                    out.stop_window = n;
+                    out.stop_column = static_cast<int>(at + stop) - 1;
+                    break;
+                }
             }
+            const auto extend_start = Clock::now();
+            const bool continuing = sequence.size() < total;
+            if (continuing && adaptive && !r.sample) {
+                const auto next = next_copy();  // points into `sequence`: copied before it can grow
+                copy.assign(next.begin(), next.end());
+            }
+            const int extend = wide ? static_cast<int>(std::min<size_t>(n, total - before)) : n;
+            for (int g = 0; g < extend; g += model::kMaxColumns) {
+                const int count = std::min(extend - g, model::kMaxColumns);
+                const bool last = g + count == extend;
+                const int depth = continuing && last && copy.empty() ? r.spec : 0;
+                if (wide)
+                    m_.stage_residuals(g, count);
+                draft_->run(0, p + g, std::span(a).subspan(static_cast<size_t>(g), static_cast<size_t>(count)), depth,
+                            continuing && last ? d : scratch,
+                            depth && stop_early ? more : std::function<bool(int, float)>());
+            }
+            if (continuing)
+                out.extended = p + n - 1;
             const double this_extend_ms = ms_since(extend_start);
             out.extend_ms += this_extend_ms;
-            if (adaptive)
+            if (adaptive && !used_copy && copy.empty())
                 policy.observe(use, n - 1, this_verify_ms + this_extend_ms);
         }
         sequence.resize(std::min(sequence.size(), total));
         out.spec_ms = ms_since(spec_start);
     }
+    if (prefix_)
+        prefix_->counts(out.prefix);
     out.sequence = sequence;
     return out;
 }

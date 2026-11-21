@@ -67,6 +67,10 @@ constexpr const char* kUsage =
     "  --profile       print where decode time went: PLE rows, the GPU, expert reads, launches\n"
     "  --window T      feed the prompt T tokens at a time (1-8) as verify windows; every position's results must\n"
     "                  equal --window 1's bit for bit (generated tokens still go one at a time)\n"
+    "  --checkpoint-at LIST  save block checkpoints at these token positions in each prompt that reaches them\n"
+    "  --prefix-memory MiB   reserve device memory for checkpoints (default 0 for torch run)\n"
+    "  --prefix-disk DIR     enable temporary disk checkpoints in a private directory\n"
+    "  --prefix-disk-gib N   checkpoint disk limit in GiB (default 8 with --prefix-disk)\n"
     "  --prefill N     feed the prompt in prefill chunks of up to N tokens (1-4096), each kept whole; every\n"
     "                  position's state must equal --window 8's bit for bit; a chunk prints (and writes to --logits\n"
     "                  and --json) its last position only\n"
@@ -96,8 +100,8 @@ constexpr const char* kUsage =
     "  --carry-policy  with --then, the adaptive policy keeps what it learned from the request before (one process)\n"
     "  --draft-variants LIST  comma-separated HNORM:HEAD, HNORM stream or pooled, HEAD full or a number of\n"
     "                  --draft-vocab ids (default stream:full); each keeps its own draft K/V cache\n"
-    "  --check-draft-kv  after --spec, decode the history again one token at a time and require the draft layer's\n"
-    "                  K/V rows to equal those the windows left, bit for bit\n"
+    "  --check-draft-kv  with one draft variant, replay the final request and compare its active draft K/V rows\n"
+    "                  bit for bit against an independent, one-row draft pass\n"
     "  --draft-vocab FILE  token ids, most frequent first, whitespace-separated (bench/draft_acceptance.py vocab)\n"
     "  --acceptance-report FILE  print each variant's acceptance per depth and write it to FILE (JSON lines)\n";
 
@@ -255,6 +259,8 @@ int run(int argc, char** argv) {
     bool profile = false, quiet = false;
     std::filesystem::path route_counts_path;
     model::Options options;
+    runtime::PrefixOptions prefix;
+    std::vector<int32_t> checkpoint_at;
     options.swaps_per_window = 128;  // M8: with swaps when the staging fills, code review -3% to -6% against 32
     std::FILE* logits_file = nullptr;
     std::FILE* json_file = nullptr;
@@ -327,6 +333,16 @@ int run(int argc, char** argv) {
                 window = std::atoi(value());
                 if (window < 1 || window > model::kMaxColumns)
                     throw Error("--window takes 1 to " + std::to_string(model::kMaxColumns) + " tokens.");
+            } else if (arg == "--checkpoint-at") {
+                checkpoint_at = parse_tokens(value());
+                if (std::find(checkpoint_at.begin(), checkpoint_at.end(), 0) != checkpoint_at.end())
+                    throw Error("Checkpoint positions start at one.");
+            } else if (arg == "--prefix-memory") {
+                prefix.memory_bytes = static_cast<uint64_t>(parse_count(value(), "--prefix-memory", 0)) * kMiB;
+            } else if (arg == "--prefix-disk") {
+                prefix.directory = value();
+            } else if (arg == "--prefix-disk-gib") {
+                prefix.disk_bytes = static_cast<uint64_t>(parse_count(value(), "--prefix-disk-gib", 1)) * kGiB;
             } else if (arg == "--prefill") {
                 options.prefill_columns = std::atoi(value());
                 if (options.prefill_columns < 1 || options.prefill_columns > model::kMaxPrefillColumns)
@@ -417,6 +433,11 @@ int run(int argc, char** argv) {
             std::fputs(kUsage, stderr);
             return 2;
         }
+        if (!prefix.directory.empty() && !prefix.disk_bytes)
+            prefix.disk_bytes = 8 * kGiB;
+        prefix.reserve(options.reserve);
+        if (!checkpoint_at.empty() && !prefix.enabled())
+            throw Error("Enable a prefix cache to save checkpoint positions.");
         options.model = *shard1;
         if (quiet && (logits_file || json_file))
             throw Error("--quiet copies no logits, so it cannot be combined with --logits or --json.");
@@ -429,12 +450,12 @@ int run(int argc, char** argv) {
             throw Error("--spec needs --draft and one --draft-variants variant.");
         if (spec > 0)
             draft_depth = spec;
-        if (check_kv && spec == 0)
-            throw Error("--check-draft-kv checks the speculative loop; give --spec.");
+        if (check_kv && (!drafting || variants.size() != 1))
+            throw Error("--check-draft-kv needs one draft variant.");
         if (options.prefill_columns > 0 && (keep < model::kMaxColumns || accept_from > 0))
             throw Error("--prefill keeps whole chunks: it cannot be combined with --accept.");
-        if (!turns.empty() && (check_kv || !route_counts_path.empty() || !report_path.empty()))
-            throw Error("--then cannot be combined with --check-draft-kv, --route-counts or --acceptance-report.");
+        if (!turns.empty() && (!route_counts_path.empty() || !report_path.empty()))
+            throw Error("--then cannot be combined with --route-counts or --acceptance-report.");
         turns.insert(turns.begin(), prompt);
         // with --check-draft-kv, a second copy of the variant takes the fresh pass
         const std::vector<model::DraftVariant> draft_variants =
@@ -454,7 +475,7 @@ int run(int argc, char** argv) {
         std::printf("loaded in %.1f s; MemAvailable now %.2f GiB\n\n", load_s,
                     static_cast<double>(mem_available()) / static_cast<double>(kGiB));
 
-        runtime::Generator gen(m, draft.get(), static_cast<int>(variants.size()), options.prefill_columns);
+        runtime::Generator gen(m, draft.get(), static_cast<int>(variants.size()), options.prefill_columns, prefix);
         std::vector<int32_t> sequence;
         RouteCounts routes_at_prompt_end{};
         for (size_t turn = 0; turn < turns.size(); ++turn) {
@@ -468,6 +489,9 @@ int run(int argc, char** argv) {
             request.carry_policy = carry_policy;
             request.draft_depth = draft_depth;
             request.swaps_after_prompt = swap_generate;  // --swap-prompt sets the prompt's windows apart
+            for (auto pos : checkpoint_at)
+                if (static_cast<size_t>(pos) <= prompt.size())
+                    request.checkpoints.emplace_back(static_cast<size_t>(pos), PrefixKind::block);
             request.window = window, request.keep = keep, request.accept_from = accept_from;
             request.cancel_after = cancel_after;
             request.sample = sample, request.sampling = sampling, request.seed = seed;
@@ -477,7 +501,9 @@ int run(int argc, char** argv) {
             runtime::Observer observer;
             observer.on_start = [&](const runtime::Resume& resume) {
                 if (turn > 0) {
-                    if (resume.rewound)
+                    if (resume.rewound && prefix.enabled())
+                        std::printf("\nrestored a prefix of %zu tokens\n", resume.at);
+                    else if (resume.rewound)
                         std::printf(
                             "\nback to the end of the last prefill at position %zu: the %zu tokens fed since are "
                             "dropped\n",
@@ -523,6 +549,11 @@ int run(int argc, char** argv) {
                     routes_at_prompt_end = m.route_counts();
             };
             const runtime::Result res = gen.generate(request, observer);
+            if (prefix.enabled())
+                std::printf(
+                    "prefix checkpoint: cached %zu, tier %d, restore %.6f s, parked %llu bytes, memory %d, disk %d\n",
+                    res.resume.at, static_cast<int>(res.prefix.tier), res.prefix.restore_seconds,
+                    static_cast<unsigned long long>(res.prefix.parked_bytes), res.prefix.in_memory, res.prefix.on_disk);
             sequence = res.sequence;
             const bool cancelled = res.cancelled;
             const double prompt_s = res.prompt_s, decode_ms = res.decode_ms;
@@ -536,22 +567,37 @@ int run(int argc, char** argv) {
             }
             std::vector<model::Drafted> scratch;
             const int ring = std::min(options.context, model::kDraftWindow);
-            if (check_kv && extended >= 0 && extended + 1 + spec > ring) {
-                std::printf("draft K/V check skipped: %d positions pass the draft's ring of %d rows\n",
-                            extended + 1 + spec, ring);
-            } else if (check_kv && extended >= 0) {  // the K/V invariant: decode the history again, one at a time
+            if (check_kv && extended >= 0 && turn + 1 == turns.size()) {
+                const int farthest =
+                    std::max(m.position() - 1, std::min(extended + draft_depth - 1, options.context - 1));
+                const int first = std::max(0, farthest + 1 - ring);
                 m.reset();
-                for (int q = 0; q <= extended; ++q) {
-                    if (!m.decode(sequence[static_cast<size_t>(q)]))
+                for (int q = 0; q <= extended;) {
+                    // Replay the prompt with the same arithmetic. Each reference draft row still runs by itself.
+                    const bool chunk = options.prefill_columns > 0 && q < static_cast<int>(prompt.size()) &&
+                                       (prefix.enabled() || first > 0 || options.fast_prefill);
+                    const int count =
+                        chunk
+                            ? std::min({options.prefill_columns, extended + 1 - q, static_cast<int>(prompt.size()) - q})
+                            : 1;
+                    const auto ids = std::span(sequence).subspan(static_cast<size_t>(q), static_cast<size_t>(count));
+                    if (!(chunk ? m.prefill(ids) : m.decode(ids.front())))
                         throw Error(m.error());
-                    draft->run(1, q, std::span(&sequence[static_cast<size_t>(q) + 1], 1), 0, scratch);
+                    for (int t = std::max(0, first - q); t < count; ++t) {
+                        if (chunk)
+                            m.stage_residuals(t, 1);
+                        draft->run(1, q + t, std::span(&sequence[static_cast<size_t>(q + t + 1)], 1), 0, scratch);
+                    }
+                    q += count;
                 }
-                const int same = draft->first_kv_difference(0, 1, extended + 1);
-                const int beyond = draft->first_kv_difference(0, 1, std::min(extended + 1 + spec, options.context));
+                const int same = draft->first_kv_difference(0, 1, extended - first + 1, first);
+                const int end = std::min({extended + 1 + draft_depth, options.context, first + ring});
+                const int beyond = draft->first_kv_difference(0, 1, end - first, first);
                 std::printf(
-                    "draft K/V after %d windows: rows 0-%d %s a fresh KV-only pass over the accepted history "
+                    "draft K/V after %d windows: rows %d-%d %s a fresh KV-only pass over the accepted history "
                     "(first difference including the %d rows after them: row %d)\n",
-                    windows, extended, same < 0 ? "equal, bit for bit," : "DIFFER from", spec, beyond);
+                    spec ? windows : decoded, first, extended, same < 0 ? "equal, bit for bit," : "DIFFER from",
+                    end - extended - 1, beyond);
                 if (same >= 0)
                     throw Error("The draft K/V differs from a fresh pass at row " + std::to_string(same) + ".");
             }

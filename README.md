@@ -26,29 +26,28 @@ Jetson AGX Orin 64 GB, full 262K context, 4,096-token prompts, 256-token answers
 
 | Model file | Output | Prompt (4K) | Prompt (4K), `--fast-prefill` |
 | --- | ---: | ---: | ---: |
-| IQ3_S (default) | 33.7 to 53.0 tokens/s | 273 to 289 tokens/s | 359 to 390 tokens/s |
-| UD-IQ3_XXS | 33.9 to 49.0 tokens/s | 272 to 288 tokens/s | 283 to 299 tokens/s |
+| IQ3_S (default) | 33.2 to 70.2 tokens/s | 285 to 304 tokens/s | 358 to 391 tokens/s |
+| UD-IQ3_XXS | 33.9 to 69.5 tokens/s | 323 to 350 tokens/s | 337 to 365 tokens/s |
 
-A 4,096-token prompt is the wait before the first answer token: 14.2-15.1 s by default; with `--fast-prefill`,
-10.5-11.4 s on IQ3_S and 13.7-14.5 s on UD-IQ3_XXS.
+A 4,096-token prompt is the wait before the first answer token: 11.7-14.4 s by default; with `--fast-prefill`,
+10.5-11.4 s on IQ3_S and 11.2-12.2 s on UD-IQ3_XXS. With `--prefix-memory-gib 2`, a new conversation that shares a
+2,073-token system prompt and tools starts answering in 2.3 s instead of 8.7 s.
 
 [How it is measured](docs/benchmarking.md) · [All measurements](docs/performance.md)
 
 ### Why `--fast-prefill` is off by default
 
-`--fast-prefill` reads the prompt about a quarter faster by running its BF16 matrix products on the GPU's tensor
-cores. To do that it rounds the prompt's activations to BF16 first, and that rounding has costs:
+`--fast-prefill` reads the prompt faster by running its BF16 matrix products on the GPU's tensor cores. To do that it
+rounds the prompt's activations to BF16 first, and that rounding has costs:
 
 - **Answers can change.** The numbers inside the model come out slightly different. In the benchmark behind the
-  table, 7 of 9 answers differed from the default's at some token, often one where two choices were nearly tied.
+  table, 14 of 18 answers differed from the default's at some token, often one where two choices were nearly tied.
 - **No exact match with the default path.** By default, reading a prompt in chunks gives bit for bit the same result
   as feeding it one token at a time, at the model file's own precision. With `--fast-prefill` it does not. Its
   results are still the same from run to run and at any chunk size.
 - **Less tested.** Prompts of 32K tokens or more, and sampled (non-greedy) answers, have not been checked with it.
 
-On the IQ3_S file, quality stays inside the project's parity limit against the reference implementation either way
-(mean KL 0.00179 with the flag and 0.00143 without, against a limit of 0.00328). Answer speed is the same
-with or without the flag.
+Answer speed is the same with or without the flag.
 
 ## Install
 
@@ -89,12 +88,13 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 Streaming, thinking (returned as `reasoning_content`), stop strings, seeds, multi-turn conversations that don't
 read the earlier turns again, and tool calls for agent clients (the server runs no tool; your client does) are all
-supported. The server answers one request at a time and listens only on your
-machine unless you give it an API key. [Server guide](docs/server.md)
+supported. The server answers one request at a time and listens only on your machine unless you give it an API key.
+With `--prefix-memory-gib 2` it also keeps saved prompts, so conversations that share a system prompt start faster
+and a conversation resumes its last turn after a client's title request. [Server guide](docs/server.md)
 
-`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a quarter (14.2 -> 10.6 s on code
-review) by rounding the prompt's activations to BF16 on the tensor cores; answers can then differ from the default
-exact path. Off by default. [Server guide](docs/server.md)
+`--fast-prefill` cuts the wait for the first token of a 4,096-token prompt by about a fifth (13.5 -> 10.5 s on code
+review with the IQ3_S file) by rounding the prompt's activations to BF16 on the tensor cores; answers can then differ
+from the default exact path. Off by default. [Server guide](docs/server.md)
 
 For scripts and C programs there is also `torch run` and a small C API (`include/torch_engine.h`).
 [Development guide](docs/development.md)

@@ -54,11 +54,15 @@ void q8_to_columns(const BlockQ8* x, const Q8Columns& out, cudaStream_t stream);
 // True for the formats gemm_q8 multiplies: Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL and Q8_0.
 bool gemm_q8_supports(Type type);
 // True when rows of `cols` values fit gemm_q8's shared memory (640 bytes a 32-value unit, plus the rings): up to about
-// 8,000 values on the Orin. Wider rows (a Q8_0 hyper-connection mixer's 10,240) take gemv_q8 a window at a time.
+// 8,000 values on the Orin.
 bool gemm_q8_fits(int cols);
+// Wide Q8_0 rows stream their weights once per 32 columns. Small prompts use window products.
+inline bool gemm_q8_can_run(Type type, int cols, int columns) {
+    return gemm_q8_supports(type) && (gemm_q8_fits(cols) || (type == Type::Q8_0 && columns >= 64));
+}
 
 // y[c * rows + r] = W[r] . x_c for every column c < x.columns, bitwise gemv_q8 on that column. rows % 16 == 0, cols a
-// whole number of the format's blocks that gemm_q8_fits, and x.units == cols / 32.
+// whole number of the format's blocks that gemm_q8_can_run accepts, and x.units == cols / 32.
 void gemm_q8(Type type, const uint8_t* w, int rows, int cols, const Q8Columns& x, float* y, cudaStream_t stream);
 
 // ---- Routed experts over a chunk --------------------------------------------------------------------------------
@@ -124,8 +128,10 @@ void upload_gemm_tables();
 inline bool gemm_bf16_wins(int cols) {
     return cols >= 256;
 }
+// For long prompts an optional 16-byte-aligned scratch buffer holds the reordered weights and inputs that fit.
 void gemm_bf16(const uint8_t* w, int rows, int cols, const float* x, float* y, int columns, float silu_scale,
-               cudaStream_t stream, const uint8_t* w2 = nullptr, int rows2 = 0, float* y2 = nullptr);
+               cudaStream_t stream, const uint8_t* w2 = nullptr, int rows2 = 0, float* y2 = nullptr,
+               void* workspace = nullptr, size_t workspace_bytes = 0);
 
 // gemm_bf16's products on the tensor cores, for --fast-prefill (gemm_bf16_tc.cu): the same outputs and epilogues, but
 // the activations are rounded to BF16 before the products, which accumulate in F32 in a tensor-core order. Not bitwise

@@ -460,16 +460,21 @@ void check_bf16_columns(int rows, int rows2, int cols, float silu) {
 
 // gemv_bf16_collapse at T = 1..8 against gemv_bf16 and hc_collapse one column at a time: mixed and its Q8 blocks bit
 // for bit (a mixer's up projection, hc x n rows of `cols`).
-void check_bf16_collapse(int n, int hc, int cols) {
+void check_collapse(Type type, int n, int hc, int cols) {
     const int T8 = kernels::kMaxColumns, rows = hc * n;
-    const std::vector<uint8_t> m = random_bf16(rows, cols, 95);
+    const auto m = type == Type::BF16 ? random_bf16(rows, cols, 95) : random_matrix(type, rows, cols, 95);
     const std::vector<float> x = activations(T8 * cols, 96), xn = activations(T8 * rows, 97);
     DeviceBuffer<uint8_t> dm(m);
+    DeviceBuffer<BlockQ8> xq(static_cast<size_t>(T8 * cols / 32));
     DeviceBuffer<float> dx(x), dxn(xn), gate(static_cast<size_t>(rows)), want(static_cast<size_t>(T8) * n),
         got(static_cast<size_t>(T8) * n);
     DeviceBuffer<kernels::BlockQ8> want_q8(static_cast<size_t>(T8) * n / 32), got_q8(static_cast<size_t>(T8) * n / 32);
+    kernels::quantize_q8(dx.get(), T8 * cols, xq.get(), nullptr);
     for (int c = 0; c < T8; ++c) {
-        kernels::gemv_bf16(dm.get(), rows, cols, dx.get() + static_cast<size_t>(c) * cols, gate.get(), nullptr);
+        if (type == Type::BF16)
+            kernels::gemv_bf16(dm.get(), rows, cols, dx.get() + static_cast<size_t>(c) * cols, gate.get(), nullptr);
+        else
+            kernels::gemv_q8(type, dm.get(), rows, cols, xq.get() + c * (cols / 32), gate.get(), nullptr);
         kernels::hc_collapse(dxn.get() + static_cast<size_t>(c) * rows, gate.get(),
                              want.get() + static_cast<size_t>(c) * n, want_q8.get() + static_cast<size_t>(c) * n / 32,
                              n, hc, nullptr);
@@ -478,15 +483,46 @@ void check_bf16_collapse(int n, int hc, int cols) {
     const std::vector<kernels::BlockQ8> wq = want_q8.download();
     bool same = true;
     for (int T = 1; T <= T8; ++T) {
-        same = same && kernels::gemv_bf16_collapse(dm.get(), n, hc, cols, dx.get(), dxn.get(), got.get(), got_q8.get(),
-                                                   nullptr, T);
+        TORCH_CUDA_CHECK(cudaMemset(got.get(), 0xff, got.bytes()));
+        TORCH_CUDA_CHECK(cudaMemset(got_q8.get(), 0xff, got_q8.bytes()));
+        if (type == Type::BF16)
+            same &= kernels::gemv_bf16_collapse(dm.get(), n, hc, cols, dx.get(), dxn.get(), got.get(), got_q8.get(),
+                                                nullptr, T);
+        else
+            kernels::mixer_up_q8(dm.get(), n, dx.get(), dxn.get(), got.get(), got_q8.get(), T, nullptr);
         const std::vector<float> g = got.download();
         const std::vector<kernels::BlockQ8> gq = got_q8.download();
         same = same && std::memcmp(g.data(), w.data(), static_cast<size_t>(T) * n * sizeof(float)) == 0 &&
                std::memcmp(gq.data(), wq.data(), static_cast<size_t>(T) * n / 32 * sizeof(kernels::BlockQ8)) == 0;
     }
     CHECK(same);
-    std::printf("%-40s %s\n", "columns 1-8 bf16 up + hc_collapse", same ? "ok" : "FAIL");
+    std::printf("columns 1-8 %s up + collapse: %s\n", type == Type::BF16 ? "BF16" : "Q8_0", same ? "ok" : "FAIL");
+}
+
+void check_mixer_down_q8() {
+    constexpr int kCols = 10240, kRows = 320, kInject = 4;
+    DeviceBuffer<uint8_t> w(random_matrix(Type::Q8_0, kRows, kCols, 181)), wi(random_bf16(kInject, kCols, 182));
+    DeviceBuffer<float> x(activations(8 * kCols, 183)), low(8 * kRows), inject(8 * kInject);
+    DeviceBuffer<BlockQ8> q(8 * kCols / 32);
+    kernels::quantize_q8(x.get(), 8 * kCols, q.get(), nullptr);
+    for (int c = 0; c < 8; ++c) {
+        kernels::gemv_q8(Type::Q8_0, w.get(), kRows, kCols, q.get() + c * (kCols / 32), low.get() + c * kRows, nullptr);
+        kernels::silu_scale(low.get() + c * kRows, kRows, 0.25f, nullptr);
+        kernels::gemv_bf16(wi.get(), kInject, kCols, x.get() + c * kCols, inject.get() + c * kInject, nullptr);
+    }
+    const auto expected = low.download(), expected_inject = inject.download();
+    for (int t = 1; t <= 8; ++t) {
+        for (int paired : {0, kInject}) {
+            DeviceBuffer<float> result(t * kRows), result_inject(t * kInject);
+            TORCH_CUDA_CHECK(cudaMemset(result.get(), 0xff, result.bytes()));
+            TORCH_CUDA_CHECK(cudaMemset(result_inject.get(), 0xff, result_inject.bytes()));
+            kernels::mixer_down_q8(w.get(), paired ? wi.get() : nullptr, kRows, paired, kCols, q.get(), x.get(),
+                                   result.get(), paired ? result_inject.get() : nullptr, 0.25f, t, nullptr);
+            CHECK(std::memcmp(result.download().data(), expected.data(), result.bytes()) == 0);
+            if (paired)
+                CHECK(std::memcmp(result_inject.download().data(), expected_inject.data(), result_inject.bytes()) == 0);
+        }
+    }
 }
 
 }  // namespace
@@ -682,7 +718,9 @@ int main() {
         check_group_columns({{Type::Q4_K, 37}, {Type::IQ4_XS, 37}}, true);
         check_bf16_columns(37, 0, 320, 0.0f);
         check_bf16_columns(320, 4, 10240, 0.25f);
-        check_bf16_collapse(2560, 4, 320);
+        check_collapse(Type::BF16, 2560, 4, 320);
+        check_collapse(Type::Q8_0, 2560, 4, 320);
+        check_mixer_down_q8();
         check_bf16_columns(37, 5, 2560, 0.0f);
         for (Type t : {Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S, Type::IQ4_XS})
             check_experts_window(t, 37, 2560);  // gate and up of the routed experts, 37 rows of 2,560

@@ -76,7 +76,9 @@ public:
 
     // The first of the first `rows` K/V ring rows (at most min(context, kDraftWindow)) in which variants a and b
     // differ (keys or values, bitwise), or -1 when they are equal: for tests. Waits for the GPU.
-    int first_kv_difference(int a, int b, int rows) const;
+    int first_kv_difference(int a, int b, int rows, int first = 0) const;
+    // The ring rows before position end-1. The last row depends on the next request's first new token.
+    void checkpoint_rows(int end, int variants, std::vector<std::span<uint8_t>>& out) const;
 
 private:
     struct Impl;

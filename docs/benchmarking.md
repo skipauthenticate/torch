@@ -43,6 +43,19 @@ Each milestone pull request commits its result file.
 
 Report each workload separately. Averages hide the difference between predictable and ordinary text.
 
+## Check a release comparison
+
+Run the saved comparison after the board tests. Use the report for the engine revision under test.
+
+```sh
+python3 bench/release_gates.py bench/results/2026-11-19-90136a0-qualification.json
+```
+
+The command checks both model files against v0.4.0. It checks each request, the output hashes, and the GPU operation
+times. Add `--speed-targets` to also check the project's long-term goals of 200 generated tokens/s and 2,000 uncached
+prompt tokens/s for each workload. Exit code 0 means all checks passed. Exit code 1 means at least one result failed.
+Exit code 2 means the report is incomplete. The board test still runs the hardware and model checks.
+
 ## Rules
 
 - Same device state for before and after: same JetPack, same power mode (`nvpmodel -q`), same clocks, nothing else
@@ -50,3 +63,5 @@ Report each workload separately. Averages hide the difference between predictabl
 - Fresh prompts (the generator adds a nonce), so prefix caching cannot help.
 - One run is a screening result; confirm a gain with a repeat run before claiming it.
 - Report outliers (a request much slower than the others) instead of dropping them.
+- Compare each model file and workload separately against the previous release, and repeat a lower result with the
+  run order reversed. The release notes list every regression that remains.

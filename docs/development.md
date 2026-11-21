@@ -246,7 +246,8 @@ machine's modification times, and the build on the board can then skip files tha
 `tools/check_orin.sh` runs everything a milestone must pass on the board, from the development machine:
 `TORCH_ORIN=user@host TORCH_MODEL=/path/on/board/MODEL-00001-of-00002.gguf TORCH_GPU_LOCK=/path/to/lock
 tools/check_orin.sh` copies the tree, builds it, and under the lock runs the unit, kernel parity and model parity
-tests, the graph-versus-eager and residency checks, and the kernel harness against its gates.
+tests, the graph-versus-eager and residency checks, and the kernel harness against its gates. `TORCH_DRAFT` adds the
+prefix checkpoint checks, and `TORCH_MODEL_UD` the UD-IQ3_XXS file's checks (see the script's header).
 
 ### Fuzzing
 
@@ -276,6 +277,33 @@ python3 -m venv .venv
 .venv/bin/pip install -r tests/fixtures/requirements.txt
 .venv/bin/python tests/fixtures/make_fixtures.py
 ```
+
+### Prefix checkpoint checks
+
+`tests/model/checkpoints.py` compares five full output vectors and four generated ids with a fresh run. It also
+checks every active draft key and value against a separate one-row draft pass. Supply a comma-separated token file.
+Use an empty results directory for each model or change of options. The `damaged` tier saves a second checkpoint at
+half the length, overwrites the full-length checkpoint's parked file just before the restore reads it (the
+engine's test-only `TORCH_TEST_DAMAGE_PREFIX_AT`), and requires the restore to come from the shorter checkpoint on
+disk with the same bytes as a fresh run. For example, with `MODEL`, `DRAFT`, `TOKENS` and `RELEASE` set to local
+paths, run the following on the board.
+
+```sh
+for tier in fresh arena memory disk damaged; do
+  exe=build/torch
+  if [ "$tier" = fresh ]; then exe="$RELEASE"; fi
+  python3 tests/model/checkpoints.py "$exe" "$MODEL" "$TOKENS" 2073 "$tier" results -- \
+    --context 262144 --prefill 4096 --draft "$DRAFT"
+done
+```
+
+Use positions 300, 2,073, 4,113, 16,500 and 70,000. Repeat with `--fast-prefill` to compare each mode with its
+own reference. The 70,000-token memory test reserves 3 GiB so the complete parked state fits.
+
+`tools/check_orin.sh` runs these five tiers in both prompt modes when `TORCH_DRAFT` names the draft file, at the
+lengths in `TORCH_CHECKPOINT_LENGTHS` (default 2,073), with the build's own fresh run as the reference. With
+`TORCH_MODEL_UD` it also runs them, and the model parity check against `tests/model/reference-ud-iq3_xxs.json`, on
+the UD-IQ3_XXS file. All five lengths on both files take longer than one 19-minute lock: run them in several.
 
 ## Formatting
 

@@ -15,9 +15,19 @@
 
 #define MAX_IDS 300000
 
+enum { MAX_PREFIXES = 12 };
+struct saved_prefix {
+    int32_t* ids;
+    int32_t n;
+    int kind;
+    unsigned age;
+};
+
 struct torch_engine {
     char answer_path[4096];
-    int has_draft;
+    int has_draft, cache, disk_only;
+    struct saved_prefix prefixes[MAX_PREFIXES];
+    unsigned age;
     int32_t context, prefill, window, delay_ms;
     int32_t* sequence; /* the session: what was fed, and how much of it the next request may keep */
     int32_t n_sequence, stable;
@@ -30,6 +40,8 @@ static atomic_int running; /* a request is in torch_engine_generate */
 
 static struct {
     int32_t ids[MAX_IDS], n, stable, generated, stop_ids[64];
+    int32_t checkpoints[MAX_IDS];
+    uint8_t kinds[MAX_IDS];
     torch_engine_params params; /* its stop_ids point at the copy above: the caller's array is gone after the call */
     int cancelled_by_progress, stopped_by_tokens, requests;
 } last_request;
@@ -55,8 +67,9 @@ static int last_fast_prefill = -1;
 torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engine** engine, char* error,
                                       size_t error_size) {
     const int abi1 = o && o->struct_size == offsetof(torch_engine_options, fast_prefill); /* ends before it */
-    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1) || !o->model || o->context < 1 ||
-        o->prefill_columns < 1) {
+    const int abi2 = o && o->struct_size == offsetof(torch_engine_options, prefix_memory_bytes);
+    if (!o || !engine || (o->struct_size != sizeof(torch_engine_options) && !abi1 && !abi2) || !o->model ||
+        o->context < 1 || o->prefill_columns < 1) {
         if (error && error_size)
             snprintf(error, error_size, "stub: bad options");
         return TORCH_ENGINE_INVALID;
@@ -64,6 +77,10 @@ torch_engine_status torch_engine_open(const torch_engine_options* o, torch_engin
     torch_engine* e = calloc(1, sizeof *e);
     snprintf(e->answer_path, sizeof e->answer_path, "%s", o->model);
     e->has_draft = o->draft != NULL;
+    if (!abi1 && !abi2) {
+        e->cache = o->prefix_memory_bytes || (o->prefix_disk_dir && o->prefix_disk_bytes);
+        e->disk_only = o->prefix_memory_bytes == 0 && o->prefix_disk_bytes;
+    }
     e->context = o->context, e->prefill = o->prefill_columns;
     last_fast_prefill = abi1 ? 0 : o->fast_prefill != 0;
     e->window = env_int("TORCH_STUB_WINDOW", 4), e->delay_ms = env_int("TORCH_STUB_DELAY_MS", 0);
@@ -87,6 +104,35 @@ static int32_t read_answer(const char* path, int32_t* out, int32_t cap) {
     return n;
 }
 
+static void remember(torch_engine* e, const int32_t* ids, int32_t n, int kind) {
+    struct saved_prefix* slot = NULL;
+    for (int i = 0; i < MAX_PREFIXES; ++i) {
+        struct saved_prefix* p = &e->prefixes[i];
+        if (p->n == n && p->kind == kind && !memcmp(p->ids, ids, (size_t)n * sizeof(*ids))) {
+            p->age = ++e->age;
+            return;
+        }
+        if (!slot || (!p->n && slot->n) ||
+            (p->n && slot->n && (p->kind > slot->kind || (p->kind == slot->kind && p->age < slot->age))))
+            slot = p;
+    }
+    int32_t* copy = malloc((size_t)n * sizeof(*ids));
+    if (!copy)
+        return;
+    memcpy(copy, ids, (size_t)n * sizeof(*ids));
+    free(slot->ids);
+    *slot = (struct saved_prefix){copy, n, kind, ++e->age};
+}
+
+static int valid_stats(uint32_t size) {
+    return size == sizeof(torch_engine_stats) || size == offsetof(torch_engine_stats, restored_tier);
+}
+static void copy_stats(torch_engine_stats* out, const torch_engine_stats* in) {
+    const uint32_t size = out->struct_size;
+    memcpy(out, in, size);
+    out->struct_size = size;
+}
+
 torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, int32_t n_ids, int32_t stable,
                                           const torch_engine_params* p, torch_engine_on_tokens on_tokens,
                                           torch_engine_on_progress on_progress, void* user, torch_engine_stats* stats) {
@@ -96,19 +142,39 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
         return TORCH_ENGINE_BUSY;
     torch_engine_status status = TORCH_ENGINE_OK;
     if (!ids || n_ids < 1 || n_ids > MAX_IDS || stable < 0 || stable > n_ids || !p ||
-        p->struct_size != sizeof(torch_engine_params) || p->max_tokens < 1 ||
-        (stats && stats->struct_size != sizeof(torch_engine_stats)) || (p->n_stop_ids > 0 && !p->stop_ids) ||
+        (p->struct_size != sizeof(torch_engine_params) &&
+         p->struct_size != offsetof(torch_engine_params, checkpoints)) ||
+        p->max_tokens < 1 || (stats && !valid_stats(stats->struct_size)) || (p->n_stop_ids > 0 && !p->stop_ids) ||
         (p->speculative && !e->has_draft) || n_ids + p->max_tokens > e->context) {
         snprintf(e->error, sizeof e->error, "stub: invalid request");
         atomic_store(&e->busy, 0);
         return TORCH_ENGINE_INVALID;
     }
+    const int marks = p->struct_size == sizeof(*p) ? p->n_checkpoints : 0;
+    if (marks < 0 || marks > n_ids || (marks && (!p->checkpoints || !p->checkpoint_kinds))) {
+        atomic_store(&e->busy, 0);
+        return TORCH_ENGINE_INVALID;
+    }
+    for (int i = 0; i < marks; ++i)
+        if (p->checkpoints[i] < 1 || p->checkpoints[i] > (stable ? stable : n_ids) ||
+            (p->checkpoint_kinds[i] != 1 && p->checkpoint_kinds[i] != 2)) {
+            atomic_store(&e->busy, 0);
+            return TORCH_ENGINE_INVALID;
+        }
     atomic_store(&e->cancel, 0);
     atomic_store(&running, 1);
     if (stable == 0)
         stable = n_ids;
     memcpy(last_request.ids, ids, sizeof(int32_t) * (size_t)n_ids);
-    last_request.n = n_ids, last_request.stable = stable, last_request.params = *p, last_request.generated = 0;
+    last_request.n = n_ids, last_request.stable = stable, last_request.generated = 0;
+    memset(&last_request.params, 0, sizeof last_request.params);
+    memcpy(&last_request.params, p, p->struct_size);
+    if (marks) {
+        memcpy(last_request.checkpoints, p->checkpoints, (size_t)marks * sizeof(int32_t));
+        memcpy(last_request.kinds, p->checkpoint_kinds, (size_t)marks);
+        last_request.params.checkpoints = last_request.checkpoints;
+        last_request.params.checkpoint_kinds = last_request.kinds;
+    }
     last_request.params.n_stop_ids = p->n_stop_ids < 0 ? 0 : p->n_stop_ids < 64 ? p->n_stop_ids : 64;
     if (last_request.params.n_stop_ids > 0)
         memcpy(last_request.stop_ids, p->stop_ids, sizeof(int32_t) * (size_t)last_request.params.n_stop_ids);
@@ -119,6 +185,17 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
     int32_t cached = 0;
     if (e->stable > 0 && n_ids >= e->stable && memcmp(ids, e->sequence, sizeof(int32_t) * (size_t)e->stable) == 0)
         cached = e->stable;
+    int tier = cached ? 1 : 0;
+    if (e->cache)
+        for (int i = 0; i < MAX_PREFIXES; ++i) {
+            struct saved_prefix* entry = &e->prefixes[i];
+            const int32_t n = entry->n;
+            if (n <= cached || n >= n_ids || n > stable || memcmp(ids, entry->ids, (size_t)n * sizeof(*ids)))
+                continue;
+            cached = n;
+            tier = (n <= e->stable && !memcmp(e->sequence, ids, (size_t)n * sizeof(*ids))) ? 1 : (e->disk_only ? 3 : 2);
+            entry->age = ++e->age;
+        }
     int32_t fed = cached, generated = 0;
     int finish = TORCH_ENGINE_FINISH_LENGTH;
     clock_t t0 = clock();
@@ -176,9 +253,22 @@ torch_engine_status torch_engine_generate(torch_engine* e, const int32_t* ids, i
     s.seed = seed, s.prompt_seconds = prompt_s > 0 ? prompt_s : 1e-6, s.decode_seconds = 1e-3 * (windows + 1);
     s.tokens_per_window = windows ? (double)generated / windows : 1.0;
     s.resident_experts = 100, s.total_experts = 24576;
+    if (e->cache && status == TORCH_ENGINE_OK) {
+        for (int i = 0; i < marks; ++i)
+            remember(e, ids, p->checkpoints[i], p->checkpoint_kinds[i]);
+        remember(e, ids, stable, 2);
+    }
+    s.restored_tier = tier;
+    for (int i = 0; i < MAX_PREFIXES; ++i)
+        if (e->prefixes[i].n) {
+            if (e->disk_only)
+                ++s.checkpoints_disk;
+            else
+                ++s.checkpoints_memory;
+        }
     e->last = s;
     if (stats)
-        *stats = s;
+        copy_stats(stats, &s);
     atomic_store(&running, 0);
     atomic_store(&e->busy, 0);
     return status;
@@ -192,8 +282,19 @@ void torch_engine_cancel(torch_engine* e) {
 torch_engine_status torch_engine_reset(torch_engine* e) {
     if (!e)
         return TORCH_ENGINE_INVALID;
+    if (atomic_exchange(&e->busy, 1))
+        return TORCH_ENGINE_BUSY;
     e->stable = 0;
+    for (int i = 0; i < MAX_PREFIXES; ++i) {
+        free(e->prefixes[i].ids);
+        e->prefixes[i] = (struct saved_prefix){0};
+    }
+    atomic_store(&e->busy, 0);
     return TORCH_ENGINE_OK;
+}
+
+torch_engine_status torch_engine_forget(torch_engine* e) {
+    return torch_engine_reset(e);
 }
 
 const char* torch_engine_error(const torch_engine* e) {
@@ -201,14 +302,16 @@ const char* torch_engine_error(const torch_engine* e) {
 }
 
 torch_engine_status torch_engine_last_stats(const torch_engine* e, torch_engine_stats* stats) {
-    if (!e || !stats || stats->struct_size != sizeof(torch_engine_stats))
+    if (!e || !stats || !valid_stats(stats->struct_size))
         return TORCH_ENGINE_INVALID;
-    *stats = e->last;
+    copy_stats(stats, &e->last);
     return TORCH_ENGINE_OK;
 }
 
 void torch_engine_close(torch_engine* e) {
     if (e) {
+        for (int i = 0; i < MAX_PREFIXES; ++i)
+            free(e->prefixes[i].ids);
         free(e->sequence);
         free(e);
     }

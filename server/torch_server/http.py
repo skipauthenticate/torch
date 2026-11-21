@@ -419,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
         ext = body.get("torch") or {}
         if not isinstance(ext, dict):
             raise RequestError(400, "torch must be an object of this server's extensions.", "torch")
+        block = s.chat.system_boundary(ids, stable)
+        params["checkpoints"] = [(block, 1)] if block else []
         params["speculative"] = s.engine.has_draft and ext.get("speculative", True) is not False
         stop = body.get("stop")
         stops = [stop] if isinstance(stop, str) else (stop or [])
@@ -426,6 +428,10 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError(400, "stop must be a string or a list of up to 16 non-empty strings.", "stop")
 
         stream = body.get("stream") is True
+        long_copy = ext.get("long_copy", False)
+        if not isinstance(long_copy, bool):
+            raise RequestError(400, "torch.long_copy must be true or false.", "torch")
+        params["long_copy"] = long_copy and params["speculative"] and not (stream or stops or schemas or params["sample"])
         options = body.get("stream_options") or {}
         usage = stream and isinstance(options, dict) and options.get("include_usage") is True
         output = Output(s.chat, thinking, stops, schemas, body.get("parallel_tool_calls") is not False)
@@ -442,6 +448,9 @@ class Handler(BaseHTTPRequestHandler):
                  "completion_tokens_details": {"reasoning_tokens": out.reasoning_tokens}}
         decode = stats.decode_seconds
         torch = {"cached_tokens": stats.cached_tokens, "stable_tokens": job.stable, "speculative": job.params["speculative"],
+                 "restored": (None, "arena", "memory", "disk")[stats.restored_tier],
+                 "restore_seconds": round(stats.restore_seconds, 6), "parked_bytes": stats.parked_bytes,
+                 "checkpoints_memory": stats.checkpoints_memory, "checkpoints_disk": stats.checkpoints_disk,
                  "seed": job.params["seed"] if job.params["sample"] else None,
                  "prompt_seconds": round(stats.prompt_seconds, 4), "decode_seconds": round(decode, 4),
                  "prompt_tokens_per_second": round((len(job.ids) - stats.cached_tokens) / stats.prompt_seconds, 2)
