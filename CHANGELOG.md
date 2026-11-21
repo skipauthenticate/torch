@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-20
+
 ### Fixed
 
 - `scripts/install.sh` from a clone in another folder than the last install stopped at CMake ("does not match the
