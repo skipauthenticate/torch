@@ -5,6 +5,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/install.sh` from a clone in another folder than the last install stopped at CMake ("does not match the
+  source"). It now starts its build folder again when that folder was configured from another source folder.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added
