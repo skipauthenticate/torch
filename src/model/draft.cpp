@@ -471,20 +471,27 @@ struct Draft::Impl {
         TORCH_CUDA_CHECK(cudaGetLastError());
     }
 
-    int first_kv_difference(int a, int b2, int rows) const {
+    int first_kv_difference(int a, int b2, int rows, int first) const {
         const size_t row = static_cast<size_t>(cfg.n_head_kv * cfg.head_dim), n = row * static_cast<size_t>(rows);
         std::vector<uint16_t> ka(n), kb(n), va(n), vb(n);
         TORCH_CUDA_CHECK(cudaStreamSynchronize(stream));
         for (auto [dst, src] : {std::pair{&ka, b.k_cache[static_cast<size_t>(a)]},
                                 {&kb, b.k_cache[static_cast<size_t>(b2)]},
                                 {&va, b.v_cache[static_cast<size_t>(a)]},
-                                {&vb, b.v_cache[static_cast<size_t>(b2)]}})
-            TORCH_CUDA_CHECK(cudaMemcpy(dst->data(), src, sizeof(uint16_t) * n, cudaMemcpyDeviceToHost));
+                                {&vb, b.v_cache[static_cast<size_t>(b2)]}}) {
+            const int offset = first % ring_rows(context);
+            const size_t part = row * static_cast<size_t>(std::min(rows, ring_rows(context) - offset));
+            TORCH_CUDA_CHECK(
+                cudaMemcpy(dst->data(), src + row * offset, sizeof(uint16_t) * part, cudaMemcpyDeviceToHost));
+            if (part < n)
+                TORCH_CUDA_CHECK(
+                    cudaMemcpy(dst->data() + part, src, sizeof(uint16_t) * (n - part), cudaMemcpyDeviceToHost));
+        }
         for (int r = 0; r < rows; ++r) {
             const size_t at = static_cast<size_t>(r) * row;
             if (!std::equal(ka.begin() + at, ka.begin() + at + row, kb.begin() + at) ||
                 !std::equal(va.begin() + at, va.begin() + at + row, vb.begin() + at))
-                return r;
+                return first + r;
         }
         return -1;
     }
@@ -514,11 +521,27 @@ void Draft::run(int variant, int position, std::span<const int32_t> next, int de
     impl_->run(variant, position, next, depth, out, more);
 }
 
-int Draft::first_kv_difference(int a, int b, int rows) const {
+void Draft::checkpoint_rows(int end, int variants, std::vector<std::span<uint8_t>>& out) const {
+    const int ring = ring_rows(impl_->context);
+    if (end < 1 || end > impl_->context || variants < 0 || variants > static_cast<int>(impl_->variants.size()))
+        throw Error("The draft checkpoint exceeds its cache.");
+    const size_t width = static_cast<size_t>(impl_->cfg.n_head_kv) * impl_->cfg.head_dim;
+    for (int v = 0; v < variants; ++v)
+        for (auto* cache : {impl_->b.k_cache[static_cast<size_t>(v)], impl_->b.v_cache[static_cast<size_t>(v)]}) {
+            for (int pos = std::max(0, end - ring); pos < end - 1;) {
+                const int row = pos % ring, n = std::min(ring - row, end - 1 - pos);
+                out.emplace_back(reinterpret_cast<uint8_t*>(cache + row * width), n * width * sizeof(uint16_t));
+                pos += n;
+            }
+        }
+}
+
+int Draft::first_kv_difference(int a, int b, int rows, int first) const {
     if (a < 0 || b < 0 || a >= static_cast<int>(impl_->variants.size()) ||
-        b >= static_cast<int>(impl_->variants.size()) || rows < 0 || rows > ring_rows(impl_->context))
+        b >= static_cast<int>(impl_->variants.size()) || rows < 0 || rows > ring_rows(impl_->context) || first < 0 ||
+        first > impl_->context - rows)
         throw Error("Compare existing draft variants over rows within the draft's K/V ring.");
-    return impl_->first_kv_difference(a, b, rows);
+    return impl_->first_kv_difference(a, b, rows, first);
 }
 
 }  // namespace torch::model

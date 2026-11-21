@@ -239,8 +239,12 @@ ms. The host's work per token is the embedding row, the PLE rows, one graph laun
   - With `adaptive-stop`, drafting stops once one or two more drafts could not beat the best window so far.
   - It is deterministic and changes only how many drafts are verified. The benchmarks use `--spec 5 --spec-policy
     adaptive-stop`: at most 5 drafts, 2.0-2.8 verified on average [M4].
-- **Prompt-lookup copies** (M5): when the recent output matches an earlier span of the context, the continuation of
-  that span is proposed directly, up to T tokens per window [est].
+- **Copied passages.** When the last eight tokens match an earlier passage, Torch can propose the next seven
+  tokens from that passage. Each match must have the same continuation. The target checks each proposed token.
+  A buffered greedy request can set `torch.long_copy` to check up to 256 positions together. The engine saves the
+  state in unused prompt memory before the check. A wrong token restores that state and triggers a short check.
+  An edit inside a previously matching passage also selects short checks. Streaming, sampling, tool calls, and custom
+  stop strings use the short checks.
 - **Draft precision**: the draft layer's routed experts are 4-bit. On the review prompts they took the same number
   of windows as the 8-bit file on two prompts, and one more (81 against 80) on the third [M4]. Drafts are verified
   exactly, so draft precision affects speed only, never the output.
@@ -348,6 +352,8 @@ output and chunk size is free to follow memory. Per stage:
 
 - **Dense quantized products**: the int8 tensor cores (`kernels/gemm`, Q6_K, Q5_K, Q4_K, IQ4_XS, IQ4_NL, Q8_0). Each
   format's formula and its lane order are the one-column kernel's, so each column is bitwise `gemv_q8`.
+  For wide Q8_0 rows, a prompt with at least 64 columns reads each pair of weight blocks directly from memory.
+  The operation uses the existing prompt workspace and the same order of additions.
 - **BF16 x F32 products** (the hyper-connection mixers, the router and the other BF16 matrices): FP32 cores in the
   window order
   (`gemm_bf16`), bitwise `gemv_bf16`. An exact split onto the BF16 tensor cores measured too slow (82-2,695 us per
@@ -377,6 +383,17 @@ that is not indexed by position (each DeltaNet state, the convolution and PLE ro
 was after the last chunk: 0.11 GiB, its own budget line, outside the lent tail. An extending request rewinds to that
 point (`Model::rewind()`) and prefills the tokens generated since together with its new ones. Its state is then what
 a fresh prefill of the whole prompt gives, even once prefill and windows stop being bitwise equal.
+The server can also mark several prompt boundaries. For each retained boundary, the engine saves the recurrent
+state, the convolution histories, the raw indexer rings and the token ids. With a draft layer it saves the recent
+draft rows and the last trunk residual. On restore it recomputes the last draft row with the next request token.
+This also works when the two requests differ immediately after the boundary.
+
+Before another request overwrites attention rows, the engine copies the keys, values and completed pooled index
+blocks into the reserved memory pool or an optional disk file. A turn stores only its rows after its system
+block. Restoring a turn first restores any missing block rows. All transfers preserve the stored bytes.
+The disk path uses two 32 MiB pinned buffers and checks a CRC32 for each transfer block. Both buffers appear
+in the memory budget when disk caching is enabled.
+
 `Model::cancel()` stops a request between windows or chunks from any thread and leaves the sequence intact; the C API
 (M7) exposes it.
 

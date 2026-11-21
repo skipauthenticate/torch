@@ -253,7 +253,11 @@ void check_bf16(int rows, int cols, int columns, float silu_scale, uint32_t seed
                                 want.get() + static_cast<size_t>(c) * rows,
                                 want2.get() + static_cast<size_t>(c) * static_cast<size_t>(rows2), nullptr, silu_scale,
                                 1);
-    kernels::gemm_bf16(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2, got2.get());
+    const size_t weight_bytes = static_cast<size_t>((total + 63) / 64) * 64 * cols * 2;
+    const size_t input_bytes = static_cast<size_t>((columns + 63) / 64) * 64 * cols * sizeof(float);
+    DeviceBuffer<uint8_t> packed(columns >= 256 ? weight_bytes + input_bytes : 1);
+    kernels::gemm_bf16(dw.get(), rows, cols, x.get(), got.get(), columns, silu_scale, nullptr, w2, rows2, got2.get(),
+                       packed.get(), packed.bytes());
     std::vector<float> a = want.download(), b = got.download();
     if (rows2 > 0) {
         const std::vector<float> a2 = want2.download(), b2 = got2.download();
@@ -349,10 +353,11 @@ int main() {
         for (const Type t : {Type::IQ4_NL, Type::Q8_0})  // K = 640 (the shared expert's down): a short last octet
             for (const int columns : {9, 200})
                 check_shape(t, 32, 640, columns, 201u + static_cast<uint32_t>(columns));
-        // Q8_0 at the shapes of a file that stores them so (rows x cols): a hyper-connection mixer's up (K = 320: a
-        // short last octet), the PLE block's key and value, the shared expert's down. A mixer's down (K = 10,240) does
-        // not fit gemm_q8's shared memory; the model runs it with gemv_q8 (gemv_test).
+        // Long Q8_0 mixer rows keep each canonical lane's sum across all 320 weight blocks.
         CHECK(kernels::gemm_q8_fits(6144) && !kernels::gemm_q8_fits(10240));
+        CHECK(!kernels::gemm_q8_can_run(Type::Q8_0, 10240, 63) && !kernels::gemm_q8_can_run(Type::Q6_K, 10240, 64));
+        for (const int columns : {64, 65, 257})
+            check_shape(Type::Q8_0, 320, 10240, columns, 640u + static_cast<uint32_t>(columns));
         for (const auto& [rows, cols] : {std::pair{10240, 320}, {10240, 2560}, {2560, 2560}, {2560, 640}})
             for (const int columns : {9, 300})
                 check_shape(Type::Q8_0, rows, cols, columns, 221u + static_cast<uint32_t>(rows / 32 + columns));
@@ -369,6 +374,7 @@ int main() {
         check_bf16(10240, 320, 9, 0.0f, 502u);            // up (the short-row kernel's shape)
         check_bf16(512, 2560, 130, 0.0f, 503u);           // the router
         check_bf16(512, 2560, 70, 0.0f, 505u, 1);         // with the shared expert's gate row: one row past the tiles
+        check_bf16(78, 264, 257, 0.25f, 506u, 3);         // packed weights with incomplete tiles and a second matrix
         check_bf16(48, 264, 5, 0.0f, 504u);               // 33 chunks: lane 0's pass has two; rows short of a tile
         check_expert_h();
         check_bf16_tc(320, 10240, 37, 0.25f, 600u);     // --fast-prefill: a mixer's down projection, its SiLU

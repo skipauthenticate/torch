@@ -62,9 +62,10 @@ def last_params():
 
 
 class Running:
-    def __init__(self, delay_ms=0, window=4, queue=4, api_key=None, context=4096, prefill=64, max_tokens=1000):
+    def __init__(self, delay_ms=0, window=4, queue=4, api_key=None, context=4096, prefill=64, max_tokens=1000, prefix_memory_bytes=0):
         os.environ["TORCH_STUB_DELAY_MS"], os.environ["TORCH_STUB_WINDOW"] = str(delay_ms), str(window)
-        self.engine = E.Engine(LIBRARY, ANSWER, draft="draft", context=context, prefill_columns=prefill)
+        self.engine = E.Engine(LIBRARY, ANSWER, draft="draft", context=context, prefill_columns=prefill,
+                               prefix_memory_bytes=prefix_memory_bytes)
         self.server = Server(("127.0.0.1", 0), CHAT, self.engine, "test-model", api_key, queue, max_tokens)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -110,6 +111,63 @@ class Options(unittest.TestCase):
         STUB.torch_engine_close(handle)
         o.struct_size = E.Options.fast_prefill.offset - 4
         self.assertNotEqual(STUB.torch_engine_open(ctypes.byref(o), ctypes.byref(handle), error, len(error)), E.OK)
+
+
+class Prefixes(unittest.TestCase):
+    def test_interleaved_system_and_turn(self):
+        server = Running(prefix_memory_bytes=2**30)
+        self.addCleanup(server.close)
+        answer("OK")
+        system = {"role": "system", "content": "Give short answers."}
+        a = [system, {"role": "user", "content": "Explain attention."}]
+        b = [system, {"role": "user", "content": "Explain experts."}]
+        ids, stable = CHAT.prompt(a, False, None)
+        block = CHAT.system_boundary(ids, stable)
+        self.assertGreater(block, 0)
+        self.assertEqual(CHAT.system_boundary(ids, block - 1), 0)
+
+        def send(messages):
+            status, response = server.chat({"messages": messages, "reasoning_effort": "none"})
+            self.assertEqual(status, 200)
+            return response["torch"]
+
+        first = send(a)
+        other = send(b)
+        self.assertEqual(other["cached_tokens"], block)
+        self.assertIn(other["restored"], ("arena", "memory"))
+        title = [{"role": "user", "content": "Write a title."}]
+        send(title)
+        reply = {"role": "assistant", "content": "OK"}
+        resumed = send(a + [reply, {"role": "user", "content": "Give an example."}])
+        self.assertEqual(resumed["cached_tokens"], first["stable_tokens"])
+        self.assertEqual(resumed["restored"], "memory")
+        send(title)
+        edited = send(a + [reply, {"role": "user", "content": "Give two examples."}])
+        self.assertEqual(edited["cached_tokens"], first["stable_tokens"])
+        self.assertEqual(CHAT.system_boundary(*CHAT.prompt(title, False, None)), 0)
+        self.assertEqual(server.engine.forget(), E.OK)
+        self.assertEqual(send(b)["cached_tokens"], 0)
+
+    def test_older_struct_sizes(self):
+        engine = E.Engine(LIBRARY, ANSWER, context=4096, prefill_columns=512)
+        self.addCleanup(engine.close)
+        lib = engine._lib
+        old_size = E.Stats.restored_tier.offset
+        raw = (ctypes.c_ubyte * (old_size + 16))(*([0xa5] * (old_size + 16)))
+        old = ctypes.cast(raw, ctypes.POINTER(E.Stats))
+        old.contents.struct_size = old_size
+        prompt = (ctypes.c_int32 * 3)(1, 2, 3)
+        params = E.Params(E.Params.checkpoints.offset, 1)
+        answer("OK")
+        self.assertEqual(lib.torch_engine_generate(engine._handle, prompt, 3, 2, ctypes.byref(params),
+                         E.ON_TOKENS(lambda *_: 0), E.ON_PROGRESS(lambda *_: 0), None, old), E.OK)
+        self.assertEqual(bytes(raw)[old_size:], b"\xa5" * 16)
+        self.assertEqual(old.contents.struct_size, old_size)
+        options = E.Options(E.Options.prefix_memory_bytes.offset, str(ANSWER).encode(), None, None, 0, None,
+                            4096, 512, 0, 0, 1)
+        handle, error = ctypes.c_void_p(), ctypes.create_string_buffer(256)
+        self.assertEqual(lib.torch_engine_open(ctypes.byref(options), ctypes.byref(handle), error, len(error)), E.OK)
+        lib.torch_engine_close(handle)
 
 
 class Basic(unittest.TestCase):
@@ -228,6 +286,21 @@ class Basic(unittest.TestCase):
         _, r = self.s.chat({"reasoning_effort": "none", "torch": {"speculative": False, "token_ids": True}})
         self.assertEqual(last_params().speculative, 0)
         self.assertEqual(r["torch"]["token_ids"], CHAT.encode("x") + [IM_END])
+
+    def test_long_copy_for_buffered_greedy_text(self):
+        answer("x")
+        use = {"torch": {"long_copy": True}}
+        tool = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+        for fields, expected in [({}, 1), (use, 2), (use | {"stream": True}, 1), (use | {"stop": ["END"]}, 1),
+                                 (use | {"temperature": 0.7}, 1), (use | {"tools": [tool]}, 1),
+                                 ({"torch": {"long_copy": True, "speculative": False}}, 0)]:
+            with self.subTest(fields=fields):
+                status, _ = self.s.chat({"reasoning_effort": "none", "temperature": 0} | fields)
+                self.assertEqual(status, 200)
+                self.assertEqual(last_params().speculative, expected)
+        status, response = self.s.chat({"torch": {"long_copy": "false"}})
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["param"], "torch")
 
     def test_session(self):
         answer("Paris.")

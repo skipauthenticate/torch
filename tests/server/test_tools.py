@@ -200,7 +200,13 @@ class Server(unittest.TestCase):
                 body["reasoning_effort"] = kwargs["reasoning_effort"]
             status, r = self.s.chat(body)
             self.assertEqual(status, 200, (name, r))
-            self.assertEqual(last_ids(), goldens[name], name)
+            ids = goldens[name]
+            self.assertEqual(last_ids(), ids, name)
+            end = ids.index(248046)
+            self.assertEqual(ids[end:end + 2], [248046, 198], name)
+            marks = T.last_params()
+            self.assertEqual(marks.checkpoints[:marks.n_checkpoints], [end + 2], name)
+            self.assertEqual(marks.checkpoint_kinds[:marks.n_checkpoints], [1], name)
             n += 1
         self.assertEqual(n, 5)
 

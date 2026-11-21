@@ -6,6 +6,7 @@
 #include "kernels/gemv/dot_q8.cuh"
 #include "kernels/gemv/gemv.h"
 #include "kernels/gemv/q8.cuh"
+#include "kernels/hc/hc.h"
 
 namespace torch::kernels {
 namespace {
@@ -319,6 +320,53 @@ __device__ __forceinline__ void bf16_chunk(float& acc, uint4 v, float4 a, float4
     acc += bf16_high(v.z) * b.y;
     acc += bf16_low(v.w) * b.z;
     acc += bf16_high(v.w) * b.w;
+}
+
+// A warp reuses each weight across its columns. The inject rows use the original F32 input.
+template <int kColumns>
+__global__ void __launch_bounds__(kThreads)
+    mixer_down_q8_kernel(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols,
+                         const BlockQ8* xq, const float* x, float* low, float* skip, float scale, int columns) {
+    const int lane = threadIdx.x % kWarp, first = blockIdx.x * kColumns;
+    const int row = blockIdx.y * kRowsPerBlock + threadIdx.x / kWarp;
+    if (row >= rows + inject_rows)
+        return;
+    float sums[kColumns]{};
+    if (row < inject_rows) {
+        const auto* weights = reinterpret_cast<const uint4*>(inject + int64_t{row} * cols * 2);
+        for (int u = lane; u < cols / 8; u += kWarp) {
+            const uint4 weight = weights[u];
+#pragma unroll
+            for (int c = 0; c < kColumns; ++c) {
+                if (kColumns == 1 || first + c < columns) {
+                    const auto* input = reinterpret_cast<const float4*>(x + int64_t{first + c} * cols);
+                    bf16_chunk(sums[c], weight, input[2 * u], input[2 * u + 1]);
+                }
+            }
+        }
+    } else {
+        const int units = cols / 32;
+        const uint8_t* weight = w + int64_t{row - inject_rows} * units * 34;
+        for (int u = lane; u < units; u += kWarp) {
+            const Unit decoded = decode_unit<Type::Q8_0>(weight, u, nullptr);
+#pragma unroll
+            for (int c = 0; c < kColumns; ++c)
+                if (kColumns == 1 || first + c < columns)
+                    sums[c] += apply_unit<Type::Q8_0>(decoded, act_of<Type::Q8_0>(xq[(first + c) * units + u]));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kColumns; ++c) {
+        if (kColumns == 1 || first + c < columns) {
+            const float sum = warp_sum(sums[c]);
+            if (lane == 0) {
+                if (row < inject_rows)
+                    skip[int64_t{first + c} * inject_rows + row] = sum;
+                else
+                    low[int64_t{first + c} * rows + row - inject_rows] = silu(sum * scale);
+            }
+        }
+    }
 }
 
 // Rows r < rows come from w into y, rows r >= rows from w2 into y2: two matrices with one input share a launch.
@@ -898,6 +946,58 @@ __global__ void __launch_bounds__(kThreads)
 // hc_collapse_kernel does.
 constexpr int kCollapseSteps = 4;  // 8 warps x 4 lane groups x 4 steps = 128 rows
 
+__device__ void finish_collapse(const float* gate, const float* xn, float* mixed, BlockQ8* q8, int e0, int n,
+                                int columns) {
+    __syncthreads();
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
+    if (warp < columns) {
+        const int64_t t = warp;
+        const int e = e0 + lane;
+        float sum = 0.0f;
+        for (int s = 0; s < 4; ++s)
+            sum += xn[(t * 4 + s) * n + e] * sigmoid(gate[(warp * 4 + s) * kWarp + lane]);
+        const float m = sum * 0.25f;
+        mixed[t * n + e] = m;
+        quantize_q8_block(m, q8 + t * (n / 32) + e0 / 32);
+    }
+}
+
+template <int kCols>
+__global__ void __launch_bounds__(kThreads)
+    mixer_up_q8_kernel(const uint8_t* w, int n, const float* low, const float* xn, float* mixed, BlockQ8* q8,
+                       int columns) {
+    constexpr int kUnits = 10, kLanes = 8;
+    __shared__ BlockQ8 x[kCols * kUnits];
+    __shared__ float gate[kCols][4 * kWarp];
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp, j = lane % kLanes;
+    const int e0 = blockIdx.x * kWarp;
+    for (int i = warp; i < columns * kUnits; i += kRowsPerBlock)
+        quantize_q8_block(low[i * kWarp + lane], &x[i]);
+    __syncthreads();
+#pragma unroll
+    for (int step = 0; step < kCollapseSteps; ++step) {
+        const int i = (warp * kCollapseSteps + step) * (kWarp / kLanes) + lane / kLanes;
+        const uint8_t* row = w + (int64_t{i / kWarp} * n + e0 + i % kWarp) * (kUnits * 34);
+        const Unit first = decode<Type::Q8_0>(row, j, nullptr);
+        Unit last{};
+        if (j + kLanes < kUnits)
+            last = decode<Type::Q8_0>(row, j + kLanes, nullptr);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (c >= columns)
+                continue;
+            float acc[kWarp / kLanes] = {};
+            acc[0] += apply<Type::Q8_0>(first, act_of<Type::Q8_0>(x[c * kUnits + j]));
+            if (j + kLanes < kUnits)
+                acc[1] += apply<Type::Q8_0>(last, act_of<Type::Q8_0>(x[c * kUnits + j + kLanes]));
+            const float v = row_sum<kLanes>(acc);
+            if (j == 0)
+                gate[c][i] = v;
+        }
+    }
+    finish_collapse(&gate[0][0], xn, mixed, q8, e0, n, columns);
+}
+
 template <int kCols>
 __global__ void __launch_bounds__(kThreads)
     gemv_bf16_collapse_kernel(const uint8_t* w, int n, int chunks, const float* x, const float* xn, float* mixed,
@@ -940,17 +1040,7 @@ __global__ void __launch_bounds__(kThreads)
                 gate[c][(warp * kCollapseSteps + s) * kGroups + lane / kShortLanes] = sum;
         }
     }
-    __syncthreads();
-    if (warp >= columns)
-        return;  // the whole warp
-    const int64_t t = warp;
-    const int e = e0 + lane;
-    float acc = 0.0f;
-    for (int s = 0; s < kHc; ++s)
-        acc += xn[(t * kHc + s) * n + e] * sigmoid(gate[warp][s * kWarp + lane]);
-    const float m = acc * (1.0f / static_cast<float>(kHc));
-    mixed[t * n + e] = m;
-    quantize_q8_block(m, q8 + t * (n / 32) + e0 / 32);
+    finish_collapse(&gate[0][0], xn, mixed, q8, e0, n, columns);
 }
 
 // gemv_bf16_kernel for several columns, its activations read directly (L1-resident for rows of up to 4,096 values): one
@@ -1381,6 +1471,37 @@ bool gemv_bf16_collapse(const uint8_t* w, int n, int hc, int cols, const float* 
     else
         with_columns(columns, run);
     return true;
+}
+
+void mixer_down_q8(const uint8_t* w, const uint8_t* inject, int rows, int inject_rows, int cols, const BlockQ8* xq,
+                   const float* x, float* low, float* skip, float scale, int columns, cudaStream_t stream) {
+    if (!mixer_down_q8_fuses(columns, inject_rows > 0)) {
+        gemv_q8(Type::Q8_0, w, rows, cols, xq, low, stream, columns);
+        silu_scale(low, rows, scale, stream, columns);
+        return;
+    }
+    const auto run = [&]<int C>() {
+        mixer_down_q8_kernel<C>
+            <<<dim3(blocks_for(columns, C), blocks_for(rows + inject_rows, kRowsPerBlock)), kThreads, 0, stream>>>(
+                w, inject, rows, inject_rows, cols, xq, x, low, skip, scale, columns);
+    };
+    if (columns == 1)
+        run.template operator()<1>();
+    else if (columns == 2 || (inject_rows > 0 && columns <= 4))
+        run.template operator()<2>();
+    else
+        run.template operator()<4>();
+}
+
+void mixer_up_q8(const uint8_t* w, int n, const float* low, const float* xn, float* mixed, BlockQ8* q8, int columns,
+                 cudaStream_t stream) {
+    auto run = [&]<int C>() {
+        mixer_up_q8_kernel<C><<<n / kWarp, kThreads, 0, stream>>>(w, n, low, xn, mixed, q8, columns);
+    };
+    if (columns == 1)
+        run.template operator()<1>();
+    else
+        with_columns(columns, run);
 }
 
 void gemv_q8_experts(Type type, const uint8_t* const* table, const uint8_t* const* up_table, int slots, int rows,

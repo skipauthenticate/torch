@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(torch VERSION 0.4.0 LANGUAGES CXX)
+project(torch VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -101,6 +101,8 @@ if(TORCH_CUDA)
     src/runtime/expert_gate.cu
     src/runtime/expert_store.cpp
     src/runtime/prefill_reads.cpp
+    src/runtime/prefix_storage.cpp
+    src/runtime/prefix_cache.cpp
     src/runtime/generator.cpp)
   target_link_libraries(torch_engine PUBLIC torch_core CUDA::cudart)
   # One build of the engine for the static command line and the shared library (the C API): position-independent

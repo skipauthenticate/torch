@@ -69,6 +69,8 @@ class Chat:
         d = Path(tokenizer_dir)
         self.tokenizer_file = d / "tokenizer.json"
         self.tokenizer = Tokenizer.from_file(str(self.tokenizer_file))
+        self.system_start = self.encode("<|im_start|>system\n")
+        self.system_end = self.encode("<|im_end|>\n")
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = _tojson
         env.globals["raise_exception"] = _raise
@@ -133,6 +135,16 @@ class Chat:
         ids = encode(self.render(sent, enable_thinking, reasoning_effort, True, tools))
         bare = encode(self.render(sent, enable_thinking, reasoning_effort, False, tools))
         return ids, common_prefix(ids, bare)
+
+    def system_boundary(self, ids, stable):
+        """The token after the rendered system and tool block, if the full delimiter is stable."""
+        if ids[:len(self.system_start)] != self.system_start:
+            return 0
+        width = len(self.system_end)
+        for i in range(len(self.system_start), stable - width + 1):
+            if ids[i] == self.system_end[0] and ids[i:i + width] == self.system_end:
+                return i + width
+        return 0
 
     def decode(self, ids):
         return b"".join(self.bytes[i] if 0 <= i < len(self.bytes) else b"" for i in ids).decode("utf-8", "replace")

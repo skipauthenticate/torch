@@ -63,7 +63,8 @@ There is no `/v1/completions`.
 | `reasoning_effort` | `none` turns thinking off; `minimal` and `low` give the template's low, `medium` medium, `high` and `xhigh` its xhigh |
 | `reasoning.enabled`, `reasoning.effort` | Another spelling some clients send: `enabled: false` or `effort: "none"` turns thinking off, and an effort maps as `reasoning_effort`'s does; `reasoning_effort` wins when both are given |
 | `chat_template_kwargs.enable_thinking` | true or false; wins over `reasoning_effort` and `reasoning` |
-| `torch.speculative` (extension) | false: decode one token at a time for this request (default: speculative when the server has a draft file; the tokens are the same either way) |
+| `torch.speculative` (extension) | false: decode one token at a time for this request (default: speculative when the server has a draft file; the tokens are the same either way). A speculative greedy request also checks copies of up to 7 tokens of earlier text in its windows; they are verified like drafts, so the tokens are the same |
+| `torch.long_copy` (extension) | Set to `true` to check up to 256 positions at once when the answer copies an earlier passage. The default is `false`. This option applies to buffered greedy text with speculation enabled. Streaming, tools, custom stops, and sampling use short checks. |
 | `torch.token_ids` (extension) | true: the answer's token ids in `torch.token_ids` |
 
 The defaults are the model file's recommended sampling (temperature 1.0, top_k 20, top_p 0.95). Thinking is on unless
@@ -137,28 +138,50 @@ Answers:
 - Stop strings match the content before the first call, never inside a call.
 - A `<tool_call>` the model writes inside its reasoning stays reasoning text.
 
-Sessions: the tools sit at the top of the system message, so they are part of the stable prefix, and the follow-up
-turn with the tool results keeps the previous request's prompt (`cached_tokens`); the answer with its calls and the
-results are fed again. What changes the prompt before that point costs the whole conversation again: other tools, another `reasoning_effort` or
-`enable_thinking` (the template puts the reasoning instruction at the top of the system message), an edited earlier
-turn, or a side request (a title or a summary) in between.
+The template puts tool definitions and reasoning instructions in the system block. Conversations with identical
+tokens in that block can share it. Changing a tool definition or a reasoning setting can change the prefix.
+A follow-up with tool results can reuse the previous stable turn. The engine feeds the answer, the tool calls
+and the results that follow the saved position.
 
-For agent clients: give the server `--context 65536` or more (some agents refuse a smaller window, and read it from
-`/v1/models`). Many send no `max_tokens`; the answer, thinking included, may then use what the context has left. A
-client's side requests (titles, summaries, compaction) reset the session like any other request, so the next turn
-pays for the whole conversation again: route them to another model where the client allows it.
+Some agent clients require `--context 65536` or more. They read the limit from `/v1/models`. Many send no
+`max_tokens`. In that case the answer, including reasoning, can use the remaining context.
 
 Text leaves the server through a table of each token's bytes and an incremental UTF-8 decoder, so a character split
 across tokens is never cut; control tokens never appear as text.
 
 ## Sessions
 
-The engine holds one sequence. Each request sends the whole conversation; the server also sends `stable`, the
-length its ids share with the same messages rendered without the generation prompt. When the next request's ids start
-with those `stable` tokens, the engine goes back there instead of feeding the conversation again, and
-`cached_tokens` says how many it kept. The previous answer is fed again with the new message. Any other request (a
-title or summary a client sends between turns, for example) starts the sequence again, and the next turn pays for
-the whole conversation: watch `cached_tokens`.
+Send the whole conversation with each request. The server marks the end of the system and tools block and the end
+of the stable conversation history. A checkpoint saves the model state at one of these token positions. The engine
+uses the longest saved prefix that exactly matches the request's token ids. It feeds the remaining tokens.
+
+By default, the server keeps the immediately preceding stable turn. It reserves no extra memory for checkpoints.
+Set `--prefix-memory-gib 2` to reserve 2 GiB for multiple conversations. A new conversation can then reuse a system
+block. After a title request, the next conversation turn can restore its saved history. The engine keeps the current
+and previous turn while space permits. It gives shared blocks priority when it needs to free space.
+
+The reservation comes out of the memory that holds experts. With `--prefix-memory-gib 2` the server held about 1,040
+fewer resident experts (16,508 instead of 17,548, -5.9%), and generation on fresh prompts was 0.44 to 0.86 tokens per
+second slower: code review 36.94 -> 36.50, prose 33.50 -> 32.70, repetition 51.08 -> 50.22 (medians of three
+requests each, [performance](performance.md)). Leave it at 0 if conversations rarely share a prefix.
+
+The response's `torch.cached_tokens` counts the tokens the engine skipped. `torch.restored` is null for a fresh
+prompt. It is `arena` when the required rows are still in place, `memory` for rows copied back from memory, or
+`disk` when the restore read a checkpoint file. `torch.restore_seconds` measures the selected restore.
+`torch.parked_bytes` counts positional row bytes saved before this request would overwrite them.
+`torch.checkpoints_memory` and `torch.checkpoints_disk` count retained entries by storage location.
+
+Disk caching requires `--prefix-disk DIR`. The directory must belong to the server user and have mode 0700.
+The server can create it. It must be on a file system that takes unnamed direct-I/O files, such as a local ext4 or
+XFS file system: the server writes and reads one page there at start and refuses to start otherwise (tmpfs on many
+kernels, overlay and network file systems do not take them). The default limit with disk enabled is 8 GiB. Set `--prefix-disk-gib N` to change it.
+The files contain conversation state. They are private to the process and disappear when its file descriptors
+close. A failed read or checksum makes the engine try a shorter prefix or feed the whole prompt.
+See [Security](../SECURITY.md).
+
+With `--lend-kv`, the engine uses idle attention rows to hold experts. It limits extra checkpoints to the first
+16,384 tokens. Later positions are fed again. With both extra tiers off, the original single-turn slot still
+supports an immediate follow-up.
 
 ## Limits and cancelling
 

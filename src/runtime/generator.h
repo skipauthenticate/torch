@@ -4,11 +4,12 @@
 // time, or speculatively as windows of the last token and the draft layer's drafts, keeping the longest prefix the
 // model's own argmax agrees with, so the tokens are the same either way. A request whose prompt extends the sequence so
 // far reuses it (sessions): with prefill it goes back to the end of the last prefill chunk (Model::rewind) and prefills
-// the tokens fed since with its new ones; without, it feeds only its new tokens. Any other prompt resets the sequence.
-// Generation stops after max_tokens, after a stop id, or when the caller's on_tokens returns false; Model::cancel()
-// stops it between windows from any thread. Tokens are the greedy argmax, or sampled (kernels/sampling/sample.h): a
-// sampled request draws each token at its position with its seed, so speculation gives the same tokens as one token at
-// a time, and its penalties count only the tokens this request generated.
+// the tokens fed since with its new ones; without, it feeds only its new tokens. A configured prefix cache can instead
+// restore the deepest saved boundary across requests. Generation stops after max_tokens, after a stop id, or when the
+// caller's on_tokens returns false; Model::cancel() stops it between windows from any thread. Tokens are the greedy
+// argmax, or sampled (kernels/sampling/sample.h): a sampled request draws each token at its position with its seed, so
+// speculation gives the same tokens as one token at a time, and its penalties count only the tokens this request
+// generated.
 //
 // `torch run` (tools/run.cpp) is a command line over this class; tests/model and the M6 checks drive it there.
 #pragma once
@@ -25,6 +26,7 @@
 #include "model/draft.h"
 #include "model/model.h"
 #include "model/window_policy.h"
+#include "runtime/prefix_cache.h"
 
 namespace torch::runtime {
 
@@ -35,6 +37,7 @@ struct Request {
     // Speculation: up to `spec` drafts per verify window (0: one token at a time; needs the draft layer) and how many a
     // window verifies: "fixed" (all), "adaptive", "adaptive-stop" or "adaptive-tight" (model/window_policy.h).
     int spec = 0;
+    int copy_depth = 0;  // A greedy server request can verify more copied tokens than the draft layer predicts.
     std::string policy = "adaptive-stop";
     // The adaptive policy keeps what it learned (acceptance by draft probability, window costs) from the last request
     // with the same spec on this generator, instead of starting from its seeds.
@@ -53,6 +56,7 @@ struct Request {
     // there (0: the whole prompt), the rest as windows; a turn that renders the history the same way rewinds to it.
     // rewind_only: a request rewinds to the end of the last prefill or starts again, never extends.
     size_t stable = 0;
+    std::vector<std::pair<size_t, PrefixKind>> checkpoints;
     bool rewind_only = false;
     int cancel_after = 0;         // tests: Model::cancel() after this many generated windows (0: never)
     int cancel_prompt_after = 0;  // tests: Model::cancel() after this many prompt windows or chunks (0: never)
@@ -76,6 +80,7 @@ struct DraftStats {
 struct Result {
     std::vector<int32_t> sequence;  // the prompt and the generated tokens
     Resume resume;
+    PrefixStats prefix;
     bool cancelled = false;                 // Model::cancel() stopped the request between windows
     bool stopped = false;                   // a stop id or the caller's on_tokens ended it
     int stop_window = 0, stop_column = -1;  // the tokens of the window it stopped in, and the stop token's place
@@ -109,7 +114,9 @@ class Generator {
 public:
     // `draft` may be null (no speculation); its first `variants` variants run after every window (the caller may keep
     // more for its own checks). prefill_columns is the model's Options::prefill_columns.
-    Generator(model::Model& model, model::Draft* draft, int variants, int prefill_columns);
+    Generator(model::Model& model, model::Draft* draft, int variants, int prefill_columns,
+              const PrefixOptions& options = {});
+    void forget();
 
     // Runs one request. Throws Error when the model fails; a cancel returns with Result::cancelled.
     Result generate(const Request& request, const Observer& observer = {});
@@ -122,6 +129,7 @@ private:
     model::Draft* draft_;
     int variants_, prefill_columns_;
     std::vector<int32_t> sequence_;
+    std::unique_ptr<PrefixCache> prefix_;
     std::optional<model::WindowPolicy> policy_;  // the last request's, for Request::carry_policy
 };
 

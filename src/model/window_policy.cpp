@@ -17,6 +17,44 @@ constexpr int kProbeEvery = 32;  // windows of no drafts after which one draft i
 
 }  // namespace
 
+std::span<const int32_t> matching_continuation(std::span<const int32_t> history, int depth, size_t generated) {
+    constexpr size_t suffix = 8;
+    const auto recent = history.last(std::min<size_t>(history.size(), 16384));
+    if (depth <= 0 || recent.size() < suffix + static_cast<size_t>(depth))
+        return {};
+    const auto key = recent.last(suffix);
+    const auto past = recent.first(recent.size() - static_cast<size_t>(depth));
+    std::span<const int32_t> result;
+    auto start = past.begin();
+    while (start != past.end()) {
+        const auto match = std::search(start, past.end(), key.begin(), key.end());
+        if (match == past.end())
+            break;
+        const auto next =
+            recent.subspan(static_cast<size_t>(match - past.begin()) + suffix, static_cast<size_t>(depth));
+        if (!result.empty() && !std::equal(result.begin(), result.end(), next.begin()))
+            return {};
+        result = next;
+        start = match + 1;
+    }
+    if (generated && !result.empty()) {
+        const size_t from = static_cast<size_t>(result.data() - history.data());
+        const size_t lookback = std::min({generated, from, size_t{128}});
+        const auto earlier = history.subspan(from - lookback, lookback);
+        const auto output = history.last(lookback);
+        size_t equal = 0;
+        for (size_t i = 0; i < lookback; ++i) {
+            if (output[i] == earlier[i])
+                ++equal;
+            else if (equal >= suffix)
+                return {};  // an established copy already diverged
+            else
+                equal = 0;
+        }
+    }
+    return result;
+}
+
 WindowPolicy::WindowPolicy(int max_drafts, std::vector<double> seed_costs, bool tight)
     : max_drafts_(max_drafts), tight_(tight), cost_(std::move(seed_costs)) {
     if (max_drafts < 0 || max_drafts > 7)

@@ -1,13 +1,10 @@
 /* The engine's C API (milestone M7): token ids in, token ids out, for torch_server and other callers.
  *
- * One handle holds one loaded model and one sequence, and runs one request at a time. A request's prompt goes as
- * prefill chunks up to its `stable` length and as windows after it; when the next request's prompt starts with the same
- * tokens up to that length, the model goes back there (a session) instead of feeding the conversation again, and
- * stats.cached_tokens says how many tokens it kept. Greedy or sampled, with or without speculation: a sampled request
- * with a seed draws the same tokens either way. Calls return a status; nothing throws across this boundary, and
- * torch_engine_error() describes the last failure. Every struct starts with its own size, set by the caller with
- * sizeof, so a library and a caller built from different versions of this header refuse each other instead of
- * misreading.
+ * One handle holds one loaded model and runs one request at a time. It feeds chunks up to the stable prompt length
+ * and windows after it. With checkpoint storage, it can restore the longest matching prefix from an earlier request.
+ * Without extra storage it can rewind the previous stable prompt. stats.cached_tokens counts the tokens it restored.
+ * Sampling with a seed gives the same tokens with or without speculation. Calls return a status. torch_engine_error()
+ * describes the last failure. Each struct starts with its size. The library accepts the sizes from ABI 1, 2 and 3.
  *
  * Thread safety: torch_engine_cancel() may be called from any thread; every other call on a handle must come from one
  * thread at a time. Callbacks run on the thread that called torch_engine_generate(). */
@@ -27,7 +24,8 @@ extern "C" {
 #define TORCH_ENGINE_API
 #endif
 
-#define TORCH_ENGINE_ABI_VERSION 2
+#define TORCH_ENGINE_ABI_VERSION 3
+#define TORCH_ENGINE_SPECULATIVE_BUFFERED 2
 
 typedef enum torch_engine_status {
     TORCH_ENGINE_OK = 0,
@@ -62,12 +60,16 @@ typedef struct torch_engine_options {
                                * BF16 (ABI 2): a shorter time to the first token, but prefill is then not bitwise the
                                * one-token path, so a greedy answer can differ. A caller built for ABI 1 passes
                                * struct_size = offsetof(torch_engine_options, fast_prefill) and gets the exact path. */
+    uint64_t prefix_memory_bytes; /* ABI 3: extra device memory for saved prefixes. Zero keeps the single turn slot. */
+    const char* prefix_disk_dir;  /* optional private directory owned by the server user, mode 0700 */
+    uint64_t prefix_disk_bytes;   /* maximum disk bytes. Give both directory and size to enable disk copies. */
 } torch_engine_options;
 
 typedef struct torch_engine_params {
     uint32_t struct_size; /* sizeof(torch_engine_params) */
     int32_t max_tokens;   /* tokens to generate, at least 1 */
-    int32_t speculative;  /* nonzero: windows of up to 5 drafts (needs a draft file); the tokens are the same */
+    int32_t speculative;  /* nonzero enables the draft. TORCH_ENGINE_SPECULATIVE_BUFFERED also checks long copied
+                           * passages, for callers that pass the ABI 3 size; with an older size any nonzero is "on". */
     int32_t sample;       /* zero: greedy (the argmax); nonzero: sampled with the fields below */
     float temperature;    /* 0 is greedy; penalties still apply */
     int32_t top_k;        /* 0: off */
@@ -78,12 +80,15 @@ typedef struct torch_engine_params {
     uint64_t seed;
     const int32_t* stop_ids; /* generation stops after any of these (kept in the output) */
     int32_t n_stop_ids;
+    const int32_t* checkpoints; /* ABI 3: additional prompt positions in (0, stable], in any order */
+    int32_t n_checkpoints;
+    const uint8_t* checkpoint_kinds; /* 1 for a shared system/tools block, 2 for a turn */
 } torch_engine_params;
 
 typedef struct torch_engine_stats {
     uint32_t struct_size; /* sizeof(torch_engine_stats) */
     int32_t prompt_tokens;
-    int32_t cached_tokens; /* prompt tokens kept from the previous request (the session), not fed again */
+    int32_t cached_tokens; /* prompt tokens restored from a saved prefix */
     int32_t generated_tokens;
     int32_t finish;           /* torch_engine_finish */
     uint64_t seed;            /* the seed a sampled request used */
@@ -92,6 +97,10 @@ typedef struct torch_engine_stats {
     double tokens_per_window; /* speculative: generated tokens per verify window */
     int32_t resident_experts, total_experts;
     uint64_t expert_hits, expert_misses; /* routed experts found resident or read from the SSD, over the handle */
+    int32_t restored_tier;               /* ABI 3: 0 none, 1 active rows, 2 memory, 3 disk */
+    double restore_seconds;
+    uint64_t parked_bytes; /* saved positional rows before this request overwrote them */
+    int32_t checkpoints_memory, checkpoints_disk;
 } torch_engine_stats;
 
 /* New tokens of the running request; returning nonzero stops it after them (finish STOP). */
@@ -119,8 +128,13 @@ TORCH_ENGINE_API torch_engine_status torch_engine_generate(torch_engine* engine,
  * Without a running request it does nothing. */
 TORCH_ENGINE_API void torch_engine_cancel(torch_engine* engine);
 
-/* Starts a new, empty sequence: the next request feeds its whole prompt. */
+/* Starts a new, empty sequence and drops every saved prefix: the checkpoints in memory and on disk (their files
+ * close and disappear) and the previous turn's. The next request feeds its whole prompt. Returns BUSY while a
+ * request runs on this handle. */
 TORCH_ENGINE_API torch_engine_status torch_engine_reset(torch_engine* engine);
+
+/* ABI 3: the same as torch_engine_reset(), under a name that says what it drops. */
+TORCH_ENGINE_API torch_engine_status torch_engine_forget(torch_engine* engine);
 
 /* The last failure on this handle, or "". Valid until the next call on it. */
 TORCH_ENGINE_API const char* torch_engine_error(const torch_engine* engine);
