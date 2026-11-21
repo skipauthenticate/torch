@@ -187,6 +187,13 @@ EOF
 # ---- build ----------------------------------------------------------------------------------------------------------
 if step build; then
     echo "building into $SHARE/build"
+    # A build folder configured from another clone makes CMake stop ("does not match the source"). The folder holds
+    # only this installer's build cache, so it starts again.
+    cache_src=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$SHARE/build/CMakeCache.txt" 2>/dev/null || true)
+    if [ -n "$cache_src" ] && [ "$(cd "$cache_src" 2>/dev/null && pwd -P)" != "$(cd "$SRC" && pwd -P)" ]; then
+        rm -rf "${SHARE:?}/build"
+        echo "removed $SHARE/build: it was configured from $cache_src"
+    fi
     nice -n 10 cmake -S "$SRC" -B "$SHARE/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="$NVCC" >/dev/null
     wrapped nice -n 10 cmake --build "$SHARE/build" --target torch torch_engine_shared -j "$JOBS"
     for f in "bin/torch:$SHARE/build/torch:755" "lib/libtorch_engine.so:$SHARE/build/libtorch_engine.so:644" \
